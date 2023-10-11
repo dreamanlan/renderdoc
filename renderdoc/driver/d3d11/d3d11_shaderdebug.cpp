@@ -2019,8 +2019,8 @@ struct PSInitialData
   PSInput IN;
   PSInput INddx;
   PSInput INddy;
-  PSInput INddxfine;
-  PSInput INddyfine;
+  //PSInput INddxfine;
+  //PSInput INddyfine;
 };
 
 )";
@@ -2073,8 +2073,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position,
   extractHlsl += "  PSInitialBuffer[idx].derivValid = ddx(debug_pixelPos.x);\n";
   extractHlsl += "  PSInitialBuffer[idx].INddx = (PSInput)0;\n";
   extractHlsl += "  PSInitialBuffer[idx].INddy = (PSInput)0;\n";
-  extractHlsl += "  PSInitialBuffer[idx].INddxfine = (PSInput)0;\n";
-  extractHlsl += "  PSInitialBuffer[idx].INddyfine = (PSInput)0;\n";
+  //extractHlsl += "  PSInitialBuffer[idx].INddxfine = (PSInput)0;\n";
+  //extractHlsl += "  PSInitialBuffer[idx].INddyfine = (PSInput)0;\n";
 
   if(!evalSampleCacheData.empty())
   {
@@ -2144,8 +2144,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position,
     const rdcstr &name = floatInputs[i];
     extractHlsl += "  PSInitialBuffer[idx].INddx." + name + " = ddx(IN." + name + ");\n";
     extractHlsl += "  PSInitialBuffer[idx].INddy." + name + " = ddy(IN." + name + ");\n";
-    extractHlsl += "  PSInitialBuffer[idx].INddxfine." + name + " = ddx_fine(IN." + name + ");\n";
-    extractHlsl += "  PSInitialBuffer[idx].INddyfine." + name + " = ddy_fine(IN." + name + ");\n";
+    //extractHlsl += "  PSInitialBuffer[idx].INddxfine." + name + " = ddx_fine(IN." + name + ");\n";
+    //extractHlsl += "  PSInitialBuffer[idx].INddyfine." + name + " = ddy_fine(IN." + name + ");\n";
   }
   extractHlsl += "\n}";
 
@@ -2153,14 +2153,14 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position,
       m_pDevice->GetShaderCache()->MakePShader(extractHlsl.c_str(), "ExtractInputsPS", "ps_5_0");
 
   uint32_t structStride = sizeof(uint32_t)       // uint hit;
-                          + sizeof(float) * 3    // float3 pos;
-                          + sizeof(uint32_t)     // uint prim;
-                          + sizeof(uint32_t)     // uint fface;
-                          + sizeof(uint32_t)     // uint sample;
-                          + sizeof(uint32_t)     // uint covge;
-                          + sizeof(float)        // float derivValid;
-                          +
-                          structureStride * 5;    // PSInput IN, INddx, INddy, INddxfine, INddyfine;
+      + sizeof(float) * 3    // float3 pos;
+      + sizeof(uint32_t)     // uint prim;
+      + sizeof(uint32_t)     // uint fface;
+      + sizeof(uint32_t)     // uint sample;
+      + sizeof(uint32_t)     // uint covge;
+      + sizeof(float)        // float derivValid;
+      +
+      structureStride * 3;// 5;    // PSInput IN, INddx, INddy, INddxfine, INddyfine;
 
   HRESULT hr = S_OK;
 

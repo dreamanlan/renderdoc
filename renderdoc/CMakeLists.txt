@@ -59,6 +59,15 @@ elseif(UNIX)
         PRIVATE -ldl
         PRIVATE -lrt)
 
+    if(FREEBSD)
+        list(APPEND RDOC_LIBRARIES
+            PRIVATE -L/usr/local/lib
+            PRIVATE -liconv
+            PRIVATE -lexecinfo
+            PRIVATE -lutil
+        )
+    endif()
+
     if(ENABLE_XLIB)
         find_package(X11 REQUIRED)
 
@@ -329,6 +338,23 @@ elseif(ENABLE_GGP)
         os/posix/posix_stringio.cpp
         os/posix/posix_threading.cpp
         os/posix/posix_specific.h)
+elseif(FREEBSD)
+    list(APPEND sources
+        data/embedded_files.h
+        os/posix/bsd/bsd_stringio.cpp
+        os/posix/bsd/bsd_callstack.cpp
+        os/posix/bsd/bsd_threading.cpp
+        os/posix/bsd/bsd_process.cpp
+        os/posix/bsd/bsd_hook.cpp
+        os/posix/bsd/bsd_network.cpp
+        3rdparty/plthook/plthook.h
+        3rdparty/plthook/plthook_elf.c
+        os/posix/posix_network.h
+        os/posix/posix_network.cpp
+        os/posix/posix_process.cpp
+        os/posix/posix_stringio.cpp
+        os/posix/posix_threading.cpp
+        os/posix/posix_specific.h)
 elseif(UNIX)
     list(APPEND sources
         data/embedded_files.h
@@ -418,6 +444,8 @@ endif()
 set(data
     data/glsl/blit.vert
     data/glsl/checkerboard.frag
+    data/glsl/depth_copy.frag
+    data/glsl/depth_copyms.frag
     data/glsl/glsl_ubos.h
     data/glsl/glsl_globals.h
     data/glsl/fixedcol.frag

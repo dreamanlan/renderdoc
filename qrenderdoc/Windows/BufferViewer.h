@@ -128,8 +128,11 @@ private slots:
   void on_showPadding_toggled(bool checked);
   void on_resourceDetails_clicked();
   void on_highlightVerts_toggled(bool checked);
+  void on_vtxExploderSlider_valueChanged(int value);
+  void on_exploderReset_clicked();
+  void on_exploderScale_valueChanged(double value);
   void on_wireframeRender_toggled(bool checked);
-  void on_solidShading_currentIndexChanged(int index);
+  void on_visualisation_currentIndexChanged(int index);
   void on_drawRange_currentIndexChanged(int index);
   void on_controlType_currentIndexChanged(int index);
   void on_camSpeed_valueChanged(double value);
@@ -141,6 +144,7 @@ private slots:
   void on_axisMappingCombo_currentIndexChanged(int index);
   void on_axisMappingButton_clicked();
   void on_setFormat_toggled(bool checked);
+  void on_resetMeshFilterButton_clicked();
 
   // manual slots
   void render_mouseMove(QMouseEvent *e);
@@ -169,7 +173,7 @@ private:
 
   IReplayOutput *m_Output;
 
-  void updateWindowTitle();
+  void updateLabelsAndLayout();
 
   void configureDrawRange();
 
@@ -183,12 +187,12 @@ private:
   MeshDataStage m_CurStage;
 
   // cached data from PostVS data
-  MeshFormat m_PostVS, m_PostGS;
+  MeshFormat m_Out1Data, m_Out2Data;
 
   // the configurations for 3D preview
-  MeshFormat m_VSInPosition, m_VSInSecondary;
-  MeshFormat m_PostVSPosition, m_PostVSSecondary;
-  MeshFormat m_PostGSPosition, m_PostGSSecondary;
+  MeshFormat m_InPosition, m_InSecondary;
+  MeshFormat m_Out1Position, m_Out1Secondary;
+  MeshFormat m_Out2Position, m_Out2Secondary;
 
   QMutex m_BBoxLock;
   QMap<uint32_t, BBoxData> m_BBoxes;
@@ -198,6 +202,8 @@ private:
   void UI_UpdateBoundingBox(const CalcBoundingBoxData &bbox);
   void UI_UpdateBoundingBoxLabels(int compCount = 0);
 
+  void UI_AddTaskPayloads(RDTreeWidgetItem *root, size_t baseOffset,
+                          const rdcarray<ShaderConstant> &consts, BufferData *buffer);
   void UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOffset,
                             const rdcarray<ShaderConstant> &consts,
                             const rdcarray<ShaderVariable> &vars);
@@ -207,6 +213,8 @@ private:
   void exportCSV(QTextStream &ts, const QString &prefix, RDTreeWidgetItem *item);
 
   void FillScrolls(PopulateBufferData *bufdata);
+
+  void GetIndicesForMeshRow(uint32_t row, uint32_t &taskIndex, uint32_t &meshletIndex);
 
   void UI_ResetArcball();
 
@@ -242,9 +250,35 @@ private:
 
   bool m_MeshView;
 
-  BufferItemModel *m_ModelVSIn;
-  BufferItemModel *m_ModelVSOut;
-  BufferItemModel *m_ModelGSOut;
+  // for ease of reading, these stages are named as in, out1, and out2. Note however that this does
+  // NOT correspond to which table widgets these fill out. Since it is most common to look at VS In
+  // and VS Out for classic vertex pipeline draws, and Task Out and Mesh Out for mesh shader draws
+  // (and because mesh shader input visualisation is not natively available) we pair up VS In and
+  // Task Out on the same control, VS Out and Mesh Out on the same control, and GS/Tess Out and Mesh
+  // In on the same control.
+
+  // the input stage
+  BufferItemModel *m_ModelIn;
+  // the first output stage (vertex, or task)
+  BufferItemModel *m_ModelOut1;
+  // the second output stage (geometry, or mesh)
+  BufferItemModel *m_ModelOut2;
+
+  // the container widgets for each stage which are remapped depending on the draw type to one of
+  // the above. This may mean 1:1 for traditional draws or [0] being out1 (task out), [1] being out2
+  // (mesh out) and [2] being in
+  QWidget *m_Containers[3] = {};
+
+  enum class MeshFilter
+  {
+    None,
+    TaskGroup,
+    Mesh,
+  };
+
+  MeshFilter m_CurMeshFilter = MeshFilter::None;
+  uint32_t m_FilteredTaskGroup = ~0U, m_FilteredMeshGroup = ~0U;
+  uint32_t m_TaskFilterRowOffset = 0, m_MeshFilterRowOffset = 0;
 
   PopulateBufferData *m_Scrolls = NULL;
 
@@ -289,6 +323,9 @@ private:
   QAction *m_ExportCSV = NULL;
   QAction *m_ExportBytes = NULL;
   QAction *m_DebugVert = NULL;
+  QAction *m_FilterMesh = NULL;
+  QAction *m_RemoveFilter = NULL;
+  QAction *m_GotoTask = NULL;
 
   RDSpinBox64 *byteRangeStart = NULL;
   RDSpinBox64 *byteRangeLength = NULL;
@@ -300,9 +337,12 @@ private:
   BufferItemModel *currentBufferModel() { return modelForStage(m_CurStage); }
   bool isCurrentRasterOut();
   int currentStageIndex();
+  bool isMeshDraw();
 
   void SetupMeshView();
   void SetupRawView();
+
+  void SetMeshFilter(MeshFilter filter, uint32_t taskGroup = ~0U, uint32_t meshGroup = ~0U);
 
   void stageRowMenu(MeshDataStage stage, QMenu *menu, const QPoint &pos);
   void meshHeaderMenu(MeshDataStage stage, const QPoint &pos);
@@ -311,7 +351,9 @@ private:
 
   void ClearModels();
 
-  void UI_CalculateMeshFormats();
+  void UI_ConfigureFormats();
+  void UI_ConfigureVertexPipeFormats();
+  void UI_ConfigureMeshPipeFormats();
 
   void UpdateCurrentMeshConfig();
   void EnableCameraGuessControls();

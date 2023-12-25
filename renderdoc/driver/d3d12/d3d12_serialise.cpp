@@ -339,7 +339,7 @@ void DoSerialise(SerialiserType &ser, D3D12BufferLocation &el)
     buffer = rm->GetOriginalID(buffer);
 
   ser.Serialise("Buffer"_lit, buffer).Important();
-  ser.Serialise("Offset"_lit, offs);
+  ser.Serialise("Offset"_lit, offs).OffsetOrSize();
 
   if(ser.IsReading() && !ser.IsStructurising())
   {
@@ -503,6 +503,13 @@ void DoSerialise(SerialiserType &ser, D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC 
   SERIALISE_MEMBER(DS);
   SERIALISE_MEMBER(HS);
   SERIALISE_MEMBER(GS);
+
+  if(ser.VersionAtLeast(0x11))
+  {
+    SERIALISE_MEMBER(AS);
+    SERIALISE_MEMBER(MS);
+  }
+
   SERIALISE_MEMBER(StreamOutput);
   SERIALISE_MEMBER(BlendState);
   SERIALISE_MEMBER(SampleMask);
@@ -557,6 +564,8 @@ void Deserialise(const D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC &el)
   FreeAlignedBuffer((byte *)(el.DS.pShaderBytecode));
   FreeAlignedBuffer((byte *)(el.HS.pShaderBytecode));
   FreeAlignedBuffer((byte *)(el.GS.pShaderBytecode));
+  FreeAlignedBuffer((byte *)(el.AS.pShaderBytecode));
+  FreeAlignedBuffer((byte *)(el.MS.pShaderBytecode));
   FreeAlignedBuffer((byte *)(el.CS.pShaderBytecode));
 }
 
@@ -796,7 +805,7 @@ void DoSerialise(SerialiserType &ser, D3D12_INPUT_ELEMENT_DESC &el)
   SERIALISE_MEMBER(SemanticIndex);
   SERIALISE_MEMBER(Format);
   SERIALISE_MEMBER(InputSlot);
-  SERIALISE_MEMBER(AlignedByteOffset);
+  SERIALISE_MEMBER(AlignedByteOffset).OffsetOrSize();
   SERIALISE_MEMBER(InputSlotClass);
   SERIALISE_MEMBER(InstanceDataStepRate);
 }
@@ -818,6 +827,7 @@ void DoSerialise(SerialiserType &ser, D3D12_INDIRECT_ARGUMENT_DESC &el)
     case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
     case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
     case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+    case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
     case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
       // nothing to serialise
       break;
@@ -845,7 +855,7 @@ void DoSerialise(SerialiserType &ser, D3D12_INDIRECT_ARGUMENT_DESC &el)
 template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12_COMMAND_SIGNATURE_DESC &el)
 {
-  SERIALISE_MEMBER(ByteStride);
+  SERIALISE_MEMBER(ByteStride).OffsetOrSize();
   SERIALISE_MEMBER(NumArgumentDescs);
   SERIALISE_MEMBER_ARRAY(pArgumentDescs, NumArgumentDescs).Important();
   SERIALISE_MEMBER(NodeMask);
@@ -937,15 +947,15 @@ template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12_VERTEX_BUFFER_VIEW &el)
 {
   SERIALISE_MEMBER_TYPED(D3D12BufferLocation, BufferLocation).Important();
-  SERIALISE_MEMBER(SizeInBytes);
-  SERIALISE_MEMBER(StrideInBytes);
+  SERIALISE_MEMBER(SizeInBytes).OffsetOrSize();
+  SERIALISE_MEMBER(StrideInBytes).OffsetOrSize();
 }
 
 template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12_INDEX_BUFFER_VIEW &el)
 {
   SERIALISE_MEMBER_TYPED(D3D12BufferLocation, BufferLocation).Important();
-  SERIALISE_MEMBER(SizeInBytes);
+  SERIALISE_MEMBER(SizeInBytes).OffsetOrSize();
   SERIALISE_MEMBER(Format);
 }
 
@@ -953,7 +963,7 @@ template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12_STREAM_OUTPUT_BUFFER_VIEW &el)
 {
   SERIALISE_MEMBER_TYPED(D3D12BufferLocation, BufferLocation);
-  SERIALISE_MEMBER(SizeInBytes);
+  SERIALISE_MEMBER(SizeInBytes).OffsetOrSize();
   SERIALISE_MEMBER_TYPED(D3D12BufferLocation, BufferFilledSizeLocation);
 }
 
@@ -969,7 +979,7 @@ void DoSerialise(SerialiserType &ser, D3D12_BUFFER_SRV &el)
 {
   SERIALISE_MEMBER(FirstElement);
   SERIALISE_MEMBER(NumElements);
-  SERIALISE_MEMBER(StructureByteStride);
+  SERIALISE_MEMBER(StructureByteStride).OffsetOrSize();
   SERIALISE_MEMBER(Flags);
 }
 
@@ -1223,8 +1233,8 @@ void DoSerialise(SerialiserType &ser, D3D12_BUFFER_UAV &el)
 {
   SERIALISE_MEMBER(FirstElement);
   SERIALISE_MEMBER(NumElements);
-  SERIALISE_MEMBER(StructureByteStride);
-  SERIALISE_MEMBER(CounterOffsetInBytes);
+  SERIALISE_MEMBER(StructureByteStride).OffsetOrSize();
+  SERIALISE_MEMBER(CounterOffsetInBytes).OffsetOrSize();
   SERIALISE_MEMBER(Flags);
 }
 
@@ -1414,7 +1424,7 @@ void DoSerialise(SerialiserType &ser, D3D12_SUBRESOURCE_FOOTPRINT &el)
 template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12_PLACED_SUBRESOURCE_FOOTPRINT &el)
 {
-  SERIALISE_MEMBER(Offset);
+  SERIALISE_MEMBER(Offset).OffsetOrSize();
   SERIALISE_MEMBER(Footprint);
 }
 
@@ -1719,6 +1729,14 @@ void DoSerialise(SerialiserType &ser, D3D12_DISPATCH_ARGUMENTS &el)
 }
 
 template <class SerialiserType>
+void DoSerialise(SerialiserType &ser, D3D12_DISPATCH_MESH_ARGUMENTS &el)
+{
+  SERIALISE_MEMBER(ThreadGroupCountX).Important();
+  SERIALISE_MEMBER(ThreadGroupCountY).Important();
+  SERIALISE_MEMBER(ThreadGroupCountZ).Important();
+}
+
+template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12ResourceLayout &el)
 {
   RDCCOMPILE_ASSERT(sizeof(el) == sizeof(uint32_t),
@@ -1769,7 +1787,7 @@ void DoSerialise(SerialiserType &ser, D3D12_BUFFER_BARRIER &el)
   SERIALISE_MEMBER(AccessBefore);
   SERIALISE_MEMBER(AccessAfter);
   SERIALISE_MEMBER(pResource).Important();
-  SERIALISE_MEMBER(Offset);
+  SERIALISE_MEMBER(Offset).OffsetOrSize();
   SERIALISE_MEMBER(Size);
 }
 
@@ -1881,3 +1899,4 @@ INSTANTIATE_SERIALISE_TYPE(D3D12ResourceLayout);
 INSTANTIATE_SERIALISE_TYPE(D3D12_DRAW_ARGUMENTS);
 INSTANTIATE_SERIALISE_TYPE(D3D12_DRAW_INDEXED_ARGUMENTS);
 INSTANTIATE_SERIALISE_TYPE(D3D12_DISPATCH_ARGUMENTS);
+INSTANTIATE_SERIALISE_TYPE(D3D12_DISPATCH_MESH_ARGUMENTS);

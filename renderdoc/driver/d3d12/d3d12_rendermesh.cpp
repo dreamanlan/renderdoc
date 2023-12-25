@@ -38,6 +38,16 @@
 
 RDOC_EXTERN_CONFIG(bool, D3D12_Debug_SingleSubmitFlushing);
 
+static uint32_t VisModeToMeshDisplayFormat(const MeshDisplay &cfg)
+{
+  switch(cfg.visualisationMode)
+  {
+    default: return (uint32_t)cfg.visualisationMode;
+    case Visualisation::Secondary:
+      return cfg.second.showAlpha ? MESHDISPLAY_SECONDARY_ALPHA : MESHDISPLAY_SECONDARY;
+  }
+}
+
 MeshDisplayPipelines D3D12DebugManager::CacheMeshDisplayPipelines(const MeshFormat &primary,
                                                                   const MeshFormat &secondary)
 {
@@ -93,7 +103,7 @@ MeshDisplayPipelines D3D12DebugManager::CacheMeshDisplayPipelines(const MeshForm
 
   MeshDisplayPipelines &cache = m_CachedMeshPipelines[key];
 
-  if(cache.pipes[(uint32_t)SolidShade::NoSolid] != NULL)
+  if(cache.pipes[(uint32_t)Visualisation::NoSolid] != NULL)
     return cache;
 
   cache.rootsig = m_MeshRootSig;
@@ -106,6 +116,7 @@ MeshDisplayPipelines D3D12DebugManager::CacheMeshDisplayPipelines(const MeshForm
   pipeDesc.pRootSignature = m_MeshRootSig;
   pipeDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
   pipeDesc.RasterizerState.AntialiasedLineEnable = TRUE;
+  pipeDesc.RasterizerState.MultisampleEnable = TRUE;
   pipeDesc.SampleMask = 0xFFFFFFFF;
   pipeDesc.SampleDesc.Count = D3D12_MSAA_SAMPLECOUNT;
   pipeDesc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
@@ -275,6 +286,13 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
   vertexData.ModelViewProj = projMat.Mul(camMat.Mul(axisMapMat));
   vertexData.SpriteSize = Vec2f();
   vertexData.homogenousInput = cfg.position.unproject;
+  vertexData.vtxExploderSNorm = cfg.vtxExploderSliderSNorm;
+  vertexData.exploderCentre =
+      Vec3f((cfg.minBounds.x + cfg.maxBounds.x) * 0.5f, (cfg.minBounds.y + cfg.maxBounds.y) * 0.5f,
+            (cfg.minBounds.z + cfg.maxBounds.z) * 0.5f);
+  vertexData.exploderScale =
+      (cfg.visualisationMode == Visualisation::Explode) ? cfg.exploderScale : 0.0f;
+  vertexData.vertMeshDisplayFormat = MESHDISPLAY_SOLID;
 
   MeshPixelCBuffer pixelData;
 
@@ -305,8 +323,15 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
     vertexData.ModelViewProj = projMat.Mul(camMat.Mul(guessProjInv));
   }
 
+  memcpy(&vertexData.meshletColours[0].x, uniqueColors, sizeof(uniqueColors));
+  RDCCOMPILE_ASSERT(sizeof(vertexData.meshletColours) == sizeof(uniqueColors),
+                    "Unique colors array is wrongly sized");
+
   D3D12_GPU_VIRTUAL_ADDRESS vsCB =
       GetDebugManager()->UploadConstants(&vertexData, sizeof(vertexData));
+
+  D3D12_GPU_VIRTUAL_ADDRESS meshletBuf = GetDebugManager()->UploadMeshletSizes(
+      cfg.position.meshletIndexOffset, cfg.position.meshletSizes);
 
   if(!secondaryDraws.empty())
   {
@@ -329,6 +354,7 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
           list->SetGraphicsRootSignature(rootSig);
           list->SetGraphicsRootConstantBufferView(0, vsCB);
           list->SetGraphicsRootConstantBufferView(1, vsCB);    // geometry - dummy fill
+          list->SetGraphicsRootShaderResourceView(3, meshletBuf);
         }
 
         pixelData.MeshColour.x = fmt.meshColor.x;
@@ -415,13 +441,13 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
   }
 
-  SolidShade solidShadeMode = cfg.solidShadeMode;
-
   // can't support secondary shading without a buffer - no pipeline will have been created
-  if(solidShadeMode == SolidShade::Secondary && cfg.second.vertexResourceId == ResourceId())
-    solidShadeMode = SolidShade::NoSolid;
+  const Visualisation finalVisualisation = (cfg.visualisationMode == Visualisation::Secondary &&
+                                            cfg.second.vertexResourceId == ResourceId())
+                                               ? Visualisation::NoSolid
+                                               : cfg.visualisationMode;
 
-  if(solidShadeMode == SolidShade::Secondary)
+  if(finalVisualisation == Visualisation::Secondary)
   {
     D3D12MarkerRegion::Set(list, "Secondary");
 
@@ -444,35 +470,53 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
   }
 
   // solid render
-  if(solidShadeMode != SolidShade::NoSolid && cfg.position.topology < Topology::PatchList)
+  if(finalVisualisation != Visualisation::NoSolid && cfg.position.topology < Topology::PatchList)
   {
     D3D12MarkerRegion region(list, "Solid render");
 
     ID3D12PipelineState *pipe = NULL;
-    switch(solidShadeMode)
+    switch(finalVisualisation)
     {
       default:
-      case SolidShade::Solid: pipe = cache.pipes[MeshDisplayPipelines::ePipe_SolidDepth]; break;
-      case SolidShade::Lit:
+      case Visualisation::Solid: pipe = cache.pipes[MeshDisplayPipelines::ePipe_SolidDepth]; break;
+      case Visualisation::Lit:
+      case Visualisation::Explode:
         pipe = cache.pipes[MeshDisplayPipelines::ePipe_Lit];
         // point list topologies don't have lighting obvious, just render them as solid
         if(!pipe)
           pipe = cache.pipes[MeshDisplayPipelines::ePipe_SolidDepth];
         break;
-      case SolidShade::Secondary: pipe = cache.pipes[MeshDisplayPipelines::ePipe_Secondary]; break;
+      case Visualisation::Secondary:
+        pipe = cache.pipes[MeshDisplayPipelines::ePipe_Secondary];
+        break;
+      case Visualisation::Meshlet:
+        pipe = cache.pipes[MeshDisplayPipelines::ePipe_SolidDepth];
+        break;
     }
 
-    pixelData.MeshDisplayFormat = (int)cfg.solidShadeMode;
-    if(cfg.solidShadeMode == SolidShade::Secondary && cfg.second.showAlpha)
-      pixelData.MeshDisplayFormat = MESHDISPLAY_SECONDARY_ALPHA;
+    pixelData.MeshDisplayFormat = VisModeToMeshDisplayFormat(cfg);
+
     pixelData.MeshColour = Vec3f(0.8f, 0.8f, 0.0f);
 
     list->SetPipelineState(pipe);
     list->SetGraphicsRootSignature(cache.rootsig);
 
-    list->SetGraphicsRootConstantBufferView(0, vsCB);
+    size_t numMeshlets = RDCMIN(cfg.position.meshletSizes.size(), (size_t)MAX_NUM_MESHLETS);
 
-    if(solidShadeMode == SolidShade::Lit)
+    if(finalVisualisation == Visualisation::Meshlet)
+    {
+      vertexData.meshletCount = (uint32_t)numMeshlets;
+      vertexData.meshletOffset = (uint32_t)cfg.position.meshletOffset;
+
+      vertexData.vertMeshDisplayFormat = MESHDISPLAY_MESHLET;
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS vsCBSolid =
+        GetDebugManager()->UploadConstants(&vertexData, sizeof(vertexData));
+
+    list->SetGraphicsRootConstantBufferView(0, vsCBSolid);
+
+    if(finalVisualisation == Visualisation::Lit || finalVisualisation == Visualisation::Explode)
     {
       MeshGeometryCBuffer geomData;
       geomData.InvProj = projMat.Inverse();
@@ -484,6 +528,7 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
     {
       list->SetGraphicsRootConstantBufferView(1, vsCB);    // dummy fill for geometry
     }
+    list->SetGraphicsRootShaderResourceView(3, meshletBuf);
 
     Vec4f colour(0.8f, 0.8f, 0.0f, 1.0f);
     list->SetGraphicsRoot32BitConstants(2, 4, &pixelData, 0);
@@ -515,7 +560,7 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
   }
 
   // wireframe render
-  if(solidShadeMode == SolidShade::NoSolid || cfg.wireframeDraw ||
+  if(finalVisualisation == Visualisation::NoSolid || cfg.wireframeDraw ||
      cfg.position.topology >= Topology::PatchList)
   {
     D3D12MarkerRegion region(list, "Wireframe render");
@@ -530,6 +575,7 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
 
     list->SetGraphicsRootConstantBufferView(0, vsCB);
     list->SetGraphicsRootConstantBufferView(1, vsCB);
+    list->SetGraphicsRootShaderResourceView(3, meshletBuf);
 
     pixelData.MeshColour.x = cfg.position.meshColor.x;
     pixelData.MeshColour.y = cfg.position.meshColor.y;
@@ -577,6 +623,8 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
   pixelData.MeshDisplayFormat = MESHDISPLAY_SOLID;
 
   vertexData.homogenousInput = 0U;
+  vertexData.vtxExploderSNorm = 0.0f;
+  vertexData.exploderScale = 0.0f;
 
   vsCB = GetDebugManager()->UploadConstants(&vertexData, sizeof(vertexData));
 
@@ -625,6 +673,7 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
 
     list->SetGraphicsRootConstantBufferView(0, vsCB);
     list->SetGraphicsRootConstantBufferView(1, vsCB);
+    list->SetGraphicsRootShaderResourceView(3, meshletBuf);
 
     list->DrawInstanced(24, 1, 0, 0);
   }
@@ -652,6 +701,7 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
 
     list->SetGraphicsRootConstantBufferView(0, vsCB);
     list->SetGraphicsRootConstantBufferView(1, vsCB);
+    list->SetGraphicsRootShaderResourceView(3, meshletBuf);
 
     pixelData.MeshColour = Vec3f(1.0f, 0.0f, 0.0f);
     list->SetGraphicsRoot32BitConstants(2, 4, &pixelData, 0);
@@ -706,6 +756,7 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
 
     list->SetGraphicsRootConstantBufferView(0, vsCB);
     list->SetGraphicsRootConstantBufferView(1, vsCB);
+    list->SetGraphicsRootShaderResourceView(3, meshletBuf);
 
     list->DrawInstanced(24, 1, 0, 0);
   }
@@ -776,6 +827,7 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
 
       list->SetGraphicsRootConstantBufferView(
           0, GetDebugManager()->UploadConstants(&vertexData, sizeof(vertexData)));
+      list->SetGraphicsRootShaderResourceView(3, meshletBuf);
 
       list->SetPipelineState(cache.pipes[MeshDisplayPipelines::ePipe_Solid]);
 

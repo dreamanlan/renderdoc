@@ -23,6 +23,8 @@
  ******************************************************************************/
 
 #include "replay_driver.h"
+#include <float.h>
+#include <math.h>
 #include "compressonator/CMP_Core.h"
 #include "maths/formatpacking.h"
 #include "maths/half_convert.h"
@@ -1343,6 +1345,17 @@ const Vec4f colorRamp[22] = {
     Vec4f(1.000000f, 0.878431f, 1.000000f, 1.0f), Vec4f(1.000000f, 1.000000f, 1.000000f, 1.0f),
 };
 
+// unique colors generated from https://mokole.com/palette.html
+const uint32_t uniqueColors[48] = {
+    0xff00008b, 0xff32cd32, 0xff8fbc8f, 0xff8b008b, 0xffb03060, 0xffd2b48c, 0xff9932cc, 0xffff0000,
+    0xffff8c00, 0xffffd700, 0xff00ff00, 0xff00ff7f, 0xff4169e1, 0xffe9967a, 0xffdc143c, 0xff00ffff,
+    0xff00bfff, 0xff0000ff, 0xffa020f0, 0xffadff2f, 0xffff6347, 0xffda70d6, 0xffff00ff, 0xfff0e68c,
+    0xffffff54, 0xff6495ed, 0xffdda0dd, 0xff90ee90, 0xff87ceeb, 0xffff1493, 0xff7fffd4, 0xffff69b4,
+    0xff808080, 0xffc0c0c0, 0xff2f4f4f, 0xff556b2f, 0xff8b4513, 0xff6b8e23, 0xff2e8b57, 0xff8b0000,
+    0xff483d8b, 0xff008000, 0xffb8860b, 0xff008b8b, 0xff4682b4, 0xffd2691e, 0xff9acd32, 0xffcd5c5c,
+
+};
+
 bytebuf GetDiscardPattern(DiscardType type, const ResourceFormat &fmt, uint32_t rowPitch, bool invert)
 {
   static const rdcliteral patterns[] = {
@@ -1801,4 +1814,46 @@ bytebuf GetDiscardPattern(DiscardType type, const ResourceFormat &fmt, uint32_t 
   }
 
   return ret;
+}
+
+void DeriveNearFar(Vec4f pos, Vec4f pos0, float &nearp, float &farp, bool &found)
+{
+  //////////////////////////////////////////////////////////////////////////////////
+  // derive near/far, assuming a standard perspective matrix
+  //
+  // the transformation from from pre-projection {Z,W} to post-projection {Z,W}
+  // is linear. So we can say Zpost = Zpre*m + c . Here we assume Wpre = 1
+  // and we know Wpost = Zpre from the perspective matrix.
+  // we can then see from the perspective matrix that
+  // m = F/(F-N)
+  // c = -(F*N)/(F-N)
+  //
+  // with re-arranging and substitution, we then get:
+  // N = -c/m
+  // F = c/(1-m)
+  //
+  // so if we can derive m and c then we can determine N and F. We can do this with
+  // two points, and we pick them reasonably distinct on z to reduce floating-point
+  // error
+
+  // skip invalid vertices (w=0)
+  if(pos.w != 0.0f && fabsf(pos.w - pos0.w) > 0.01f && fabsf(pos.z - pos0.z) > 0.01f)
+  {
+    Vec2f A(pos0.w, pos0.z);
+    Vec2f B(pos.w, pos.z);
+
+    float m = (B.y - A.y) / (B.x - A.x);
+    float c = B.y - B.x * m;
+
+    if(m == 1.0f || c == 0.0f)
+      return;
+
+    if(-c / m <= 0.000001f)
+      return;
+
+    nearp = -c / m;
+    farp = c / (1 - m);
+
+    found = true;
+  }
 }

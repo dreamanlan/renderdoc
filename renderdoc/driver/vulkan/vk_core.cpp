@@ -155,8 +155,6 @@ WrappedVulkan::WrappedVulkan()
   m_QueueFamilyIdx = 0;
   m_DbgReportCallback = VK_NULL_HANDLE;
 
-  m_HeaderChunk = NULL;
-
   if(!RenderDoc::Inst().IsReplayApp())
   {
     m_FrameCaptureRecord = GetResourceManager()->AddResourceRecord(ResourceIDGen::GetNewUniqueID());
@@ -649,10 +647,10 @@ uint32_t WrappedVulkan::HandlePreCallback(VkCommandBuffer commandBuffer, ActionF
 
   eventId += multiDrawOffset;
 
-  if(type == ActionFlags::Drawcall)
-    m_ActionCallback->PreDraw(eventId, commandBuffer);
+  if(type == ActionFlags::MeshDispatch || type == ActionFlags::Drawcall)
+    m_ActionCallback->PreDraw(eventId, type, commandBuffer);
   else if(type == ActionFlags::Dispatch)
-    m_ActionCallback->PreDispatch(eventId, commandBuffer);
+    m_ActionCallback->PreDispatch(eventId, type, commandBuffer);
   else
     m_ActionCallback->PreMisc(eventId, type, commandBuffer);
 
@@ -1093,6 +1091,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME,
         VK_EXT_MEMORY_PRIORITY_SPEC_VERSION,
+    },
+    {
+        VK_EXT_MESH_SHADER_EXTENSION_NAME,
+        VK_EXT_MESH_SHADER_SPEC_VERSION,
     },
 #ifdef VK_EXT_metal_surface
     {
@@ -2543,15 +2545,16 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
       Serialise_CaptureScope(ser);
     }
 
+    Chunk *headerChunk = NULL;
     {
       WriteSerialiser &captureBeginSer = GetThreadSerialiser();
       ScopedChunk scope(captureBeginSer, SystemChunk::CaptureBegin);
 
       Serialise_BeginCaptureFrame(captureBeginSer);
 
-      m_HeaderChunk = scope.Get();
+      headerChunk = scope.Get();
     }
-    m_HeaderChunk->Write(ser);
+    headerChunk->Write(ser);
 
     // don't need to lock access to m_CmdBufferRecords as we are no longer
     // in capframe (the transition is thread-protected) so nothing will be
@@ -2613,9 +2616,6 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
          double(captureSectionSize) / (1024.0 * 1024.0), m_CaptureTimer.GetMilliseconds() / 1000.0);
 
   RenderDoc::Inst().FinishCaptureWriting(rdc, m_CapturedFrames.back().frameNumber);
-
-  m_HeaderChunk->Delete();
-  m_HeaderChunk = NULL;
 
   m_State = CaptureState::BackgroundCapturing;
 
@@ -2680,9 +2680,6 @@ bool WrappedVulkan::DiscardFrameCapture(DeviceOwnedWindow devWnd)
   }
 
   Atomic::Inc32(&m_ReuseEnabled);
-
-  m_HeaderChunk->Delete();
-  m_HeaderChunk = NULL;
 
   // delete cmd buffers now - had to keep them alive until after serialiser flush.
   for(size_t i = 0; i < m_CmdBufferRecords.size(); i++)
@@ -2929,7 +2926,8 @@ RDResult WrappedVulkan::ReadLogInitialisation(RDCFile *rdc, bool storeStructured
       else
       {
         extra +=
-            "\n\nMore debugging information may be available by enabling API validation on replay";
+            "\n\nMore debugging information may be available by enabling API validation on replay "
+            "via `File` -> `Open Capture with Options`";
       }
 
       SAFE_DELETE(sink);
@@ -3200,7 +3198,8 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
       else
       {
         extra +=
-            "\n\nMore debugging information may be available by enabling API validation on replay";
+            "\n\nMore debugging information may be available by enabling API validation on replay "
+            "via `File` -> `Open Capture with Options`";
       }
 
       m_FailedReplayResult.message = rdcstr(m_FailedReplayResult.message) + extra;
@@ -3915,6 +3914,13 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
     case VulkanChunk::vkCmdSetAttachmentFeedbackLoopEnableEXT:
       return Serialise_vkCmdSetAttachmentFeedbackLoopEnableEXT(ser, VK_NULL_HANDLE,
                                                                VK_IMAGE_ASPECT_NONE);
+    case VulkanChunk::vkCmdDrawMeshTasksEXT:
+      return Serialise_vkCmdDrawMeshTasksEXT(ser, VK_NULL_HANDLE, 0, 0, 0);
+    case VulkanChunk::vkCmdDrawMeshTasksIndirectEXT:
+      return Serialise_vkCmdDrawMeshTasksIndirectEXT(ser, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 0, 0);
+    case VulkanChunk::vkCmdDrawMeshTasksIndirectCountEXT:
+      return Serialise_vkCmdDrawMeshTasksIndirectCountEXT(ser, VK_NULL_HANDLE, VK_NULL_HANDLE, 0,
+                                                          VK_NULL_HANDLE, 0, 0, 0);
 
     case VulkanChunk::vkCmdSetAlphaToCoverageEnableEXT:
       return Serialise_vkCmdSetAlphaToCoverageEnableEXT(ser, VK_NULL_HANDLE, VK_FALSE);
@@ -4179,7 +4185,8 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
           {
             rpUnneeded = true;
           }
-          else if(!(action->flags & (ActionFlags::Drawcall | ActionFlags::Dispatch)))
+          else if(!(action->flags &
+                    (ActionFlags::MeshDispatch | ActionFlags::Drawcall | ActionFlags::Dispatch)))
           {
             rpUnneeded = true;
           }
@@ -4940,33 +4947,36 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
   VulkanCreationInfo &c = m_CreationInfo;
   uint32_t eid = action.eventId;
 
-  ActionFlags DrawMask = ActionFlags::Drawcall | ActionFlags::Dispatch;
+  ActionFlags DrawMask = ActionFlags::MeshDispatch | ActionFlags::Drawcall | ActionFlags::Dispatch;
   if(!(action.flags & DrawMask))
     return;
 
   //////////////////////////////
   // Vertex input
 
-  if(action.flags & ActionFlags::Indexed && state.ibuffer.buf != ResourceId())
-    actionNode.resourceUsage.push_back(
-        make_rdcpair(state.ibuffer.buf, EventUsage(eid, ResourceUsage::IndexBuffer)));
-
-  for(size_t i = 0; i < state.vbuffers.size(); i++)
+  if(action.flags & ActionFlags::Drawcall)
   {
-    if(state.vbuffers[i].buf != ResourceId())
-    {
+    if(action.flags & ActionFlags::Indexed && state.ibuffer.buf != ResourceId())
       actionNode.resourceUsage.push_back(
-          make_rdcpair(state.vbuffers[i].buf, EventUsage(eid, ResourceUsage::VertexBuffer)));
+          make_rdcpair(state.ibuffer.buf, EventUsage(eid, ResourceUsage::IndexBuffer)));
+
+    for(size_t i = 0; i < state.vbuffers.size(); i++)
+    {
+      if(state.vbuffers[i].buf != ResourceId())
+      {
+        actionNode.resourceUsage.push_back(
+            make_rdcpair(state.vbuffers[i].buf, EventUsage(eid, ResourceUsage::VertexBuffer)));
+      }
     }
-  }
 
-  for(uint32_t i = state.firstxfbcounter;
-      i < state.firstxfbcounter + state.xfbcounters.size() && i < state.xfbbuffers.size(); i++)
-  {
-    if(state.xfbbuffers[i].buf != ResourceId())
+    for(uint32_t i = state.firstxfbcounter;
+        i < state.firstxfbcounter + state.xfbcounters.size() && i < state.xfbbuffers.size(); i++)
     {
-      actionNode.resourceUsage.push_back(
-          make_rdcpair(state.xfbbuffers[i].buf, EventUsage(eid, ResourceUsage::StreamOut)));
+      if(state.xfbbuffers[i].buf != ResourceId())
+      {
+        actionNode.resourceUsage.push_back(
+            make_rdcpair(state.xfbbuffers[i].buf, EventUsage(eid, ResourceUsage::StreamOut)));
+      }
     }
   }
 
@@ -4975,20 +4985,21 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
 
   static bool hugeRangeWarned = false;
 
-  int shaderStart = 0;
-  int shaderEnd = 0;
+  rdcarray<int> shaderStages;
   if(action.flags & ActionFlags::Dispatch)
   {
-    shaderStart = 5;
-    shaderEnd = 6;
+    shaderStages = {5};
   }
   else if(action.flags & ActionFlags::Drawcall)
   {
-    shaderStart = 0;
-    shaderEnd = 5;
+    shaderStages = {0, 1, 2, 3, 4};
+  }
+  else if(action.flags & ActionFlags::MeshDispatch)
+  {
+    shaderStages = {4, 6, 7};
   }
 
-  for(int shad = shaderStart; shad < shaderEnd; shad++)
+  for(int shad : shaderStages)
   {
     bool compute = (shad == 5);
     ResourceId pipe = (compute ? state.compute.pipeline : state.graphics.pipeline);
@@ -5152,7 +5163,8 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
   //////////////////////////////
   // Framebuffer/renderpass
 
-  AddFramebufferUsage(actionNode, state);
+  if(!(action.flags & ActionFlags::Dispatch))
+    AddFramebufferUsage(actionNode, state);
 }
 
 void WrappedVulkan::AddFramebufferUsage(VulkanActionTreeNode &actionNode,
@@ -5416,7 +5428,10 @@ void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &act
   // if this isn't a multidraw (or it's the first action in a multidraw, it's fairly easy
   if(action.drawIndex == 0)
   {
-    if(action.flags & ActionFlags::Indexed)
+    if(action.flags & ActionFlags::MeshDispatch)
+      ObjDisp(cmd)->CmdDrawMeshTasksEXT(Unwrap(cmd), action.dispatchDimension[0],
+                                        action.dispatchDimension[1], action.dispatchDimension[2]);
+    else if(action.flags & ActionFlags::Indexed)
       ObjDisp(cmd)->CmdDrawIndexed(Unwrap(cmd), action.numIndices, action.numInstances,
                                    action.indexOffset, action.baseVertex, action.instanceOffset);
     else
@@ -5432,7 +5447,17 @@ void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &act
 
     bytebuf params;
 
-    if(action.flags & ActionFlags::Indexed)
+    if(action.flags & ActionFlags::MeshDispatch)
+    {
+      VkDrawMeshTasksIndirectCommandEXT drawParams;
+      drawParams.groupCountX = action.dispatchDimension[0];
+      drawParams.groupCountY = action.dispatchDimension[1];
+      drawParams.groupCountZ = action.dispatchDimension[2];
+
+      params.resize(sizeof(drawParams));
+      memcpy(params.data(), &drawParams, sizeof(drawParams));
+    }
+    else if(action.flags & ActionFlags::Indexed)
     {
       VkDrawIndexedIndirectCommand drawParams;
       drawParams.indexCount = action.numIndices;
@@ -5498,7 +5523,11 @@ void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &act
 
     DoPipelineBarrier(cmd, 1, &bufBarrier);
 
-    if(action.flags & ActionFlags::Indexed)
+    if(action.flags & ActionFlags::MeshDispatch)
+      ObjDisp(cmd)->CmdDrawMeshTasksIndirectEXT(Unwrap(cmd), Unwrap(m_IndirectBuffer.buf),
+                                                m_IndirectBufferSize, action.drawIndex + 1,
+                                                (uint32_t)params.size());
+    else if(action.flags & ActionFlags::Indexed)
       ObjDisp(cmd)->CmdDrawIndexedIndirect(Unwrap(cmd), Unwrap(m_IndirectBuffer.buf),
                                            m_IndirectBufferSize, action.drawIndex + 1,
                                            (uint32_t)params.size());

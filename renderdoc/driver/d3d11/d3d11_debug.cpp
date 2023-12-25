@@ -403,17 +403,20 @@ void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11Resource 
         if(desc.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE)
         {
           D3D11_MAPPED_SUBRESOURCE mapped = {};
-          HRESULT hr = m_pImmediateContext->Map(res, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+          D3D11_MAP mapping =
+              (desc.Usage == D3D11_USAGE_DYNAMIC) ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE;
+          HRESULT hr = m_pImmediateContext->Map(res, 0, mapping, 0, &mapped);
           m_pDevice->CheckHRESULT(hr);
 
           if(SUCCEEDED(hr))
           {
             byte *dst = (byte *)mapped.pData;
             dst += pRect[r].left;
-            for(size_t i = 0; i < size; i++)
+            size_t copyStride = sizeof(uint32_t);
+            for(size_t i = 0; i < size; i += copyStride)
             {
               memcpy(dst, &value, RDCMIN(sizeof(uint32_t), size - i));
-              dst += sizeof(uint32_t);
+              dst += copyStride;
             }
 
             m_pImmediateContext->Unmap(res, 0);
@@ -1135,6 +1138,44 @@ void D3D11Replay::OverlayRendering::Init(WrappedID3D11Device *device)
     TriangleSizePS =
         shaderCache->MakePShader(meshhlsl.c_str(), "RENDERDOC_TriangleSizePS", "ps_4_0");
   }
+  {
+    rdcstr hlsl = GetEmbeddedResource(depth_copy_hlsl);
+
+    DepthCopyPS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DepthCopyPS", "ps_5_0");
+    DepthCopyArrayPS =
+        shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DepthCopyArrayPS", "ps_5_0");
+    DepthCopyMSPS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DepthCopyMSPS", "ps_5_0");
+    DepthCopyMSArrayPS =
+        shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DepthCopyMSArrayPS", "ps_5_0");
+  }
+  {
+    D3D11_BLEND_DESC blendDesc = {};
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    HRESULT hr = device->CreateBlendState(&blendDesc, &DepthBlendRTMaskZero);
+    if(FAILED(hr))
+    {
+      RDCERR("Failed to create depth overlay blend state HRESULT: %s", ToStr(hr).c_str());
+    }
+  }
+  {
+    D3D11_DEPTH_STENCIL_DESC dsDesc = {};
+    dsDesc.DepthEnable = FALSE;
+    dsDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dsDesc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    dsDesc.StencilEnable = TRUE;
+    dsDesc.StencilReadMask = 0xff;
+    dsDesc.StencilWriteMask = 0x0;
+    dsDesc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+    dsDesc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+    dsDesc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+    dsDesc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
+    dsDesc.BackFace = dsDesc.FrontFace;
+    HRESULT hr = device->CreateDepthStencilState(&dsDesc, &DepthResolveDS);
+    if(FAILED(hr))
+    {
+      RDCERR("Failed to create depth resolve depth stencil state HRESULT: %s", ToStr(hr).c_str());
+    }
+  }
 }
 
 void D3D11Replay::OverlayRendering::Release()
@@ -1144,6 +1185,13 @@ void D3D11Replay::OverlayRendering::Release()
   SAFE_RELEASE(QOResolvePS);
   SAFE_RELEASE(TriangleSizeGS);
   SAFE_RELEASE(TriangleSizePS);
+  SAFE_RELEASE(DepthCopyPS);
+  SAFE_RELEASE(DepthCopyArrayPS);
+  SAFE_RELEASE(DepthCopyMSPS);
+  SAFE_RELEASE(DepthCopyMSArrayPS);
+
+  SAFE_RELEASE(DepthResolveDS);
+  SAFE_RELEASE(DepthBlendRTMaskZero);
 
   SAFE_RELEASE(Texture);
 }

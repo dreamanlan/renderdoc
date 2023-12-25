@@ -83,6 +83,39 @@ float4 main() : SV_Target0
 
 )EOSHADER";
 
+  std::string depthWritePixel = R"EOSHADER(
+
+struct v2f
+{
+	float4 col : COLOR0;
+	float2 uv : TEXCOORD0;
+	float4 pos : SV_POSITION;
+};
+
+struct PixOut
+{
+	float4 colour : SV_Target0;
+	float depth : SV_Depth;
+};
+
+PixOut main(v2f IN)
+{
+  PixOut OUT;
+	OUT.colour  = IN.col;
+  if ((IN.pos.x > 180.0) && (IN.pos.x < 185.0) &&
+      (IN.pos.y > 155.0) && (IN.pos.y < 165.0))
+	{
+		OUT.depth = 0.0;
+	}
+	else
+	{
+		OUT.depth = IN.pos.z;
+	}
+  return OUT;
+}
+
+)EOSHADER";
+
   int main()
   {
     // initialise, create window, create device, etc
@@ -92,6 +125,7 @@ float4 main() : SV_Target0
     ID3DBlobPtr vsblob[3] = {};
     ID3DBlobPtr psblob[3] = {};
     ID3DBlobPtr whitepsblob[3] = {};
+    ID3DBlobPtr depthwritepsblob[3] = {};
 
     {
       int i = 0;
@@ -103,6 +137,7 @@ float4 main() : SV_Target0
         vsblob[i] = Compile(vertexEndPosVert, "main", "vs" + profile);
         psblob[i] = Compile(vertexEndPosPixel, "main", "ps" + profile);
         whitepsblob[i] = Compile(whitePixel, "main", "ps" + profile);
+        depthwritepsblob[i] = Compile(depthWritePixel, "main", "ps" + profile);
         i++;
       }
     }
@@ -192,6 +227,7 @@ float4 main() : SV_Target0
     ID3D12PipelineStatePtr stencilWritePipe[3][countFmts][2];
     ID3D12PipelineStatePtr backgroundPipe[3][countFmts][2];
     ID3D12PipelineStatePtr pipe[3][countFmts][2];
+    ID3D12PipelineStatePtr depthWritePixelShaderPipe[3][countFmts][2];
     ID3D12PipelineStatePtr whitepipe[3];
     ID3D12PipelineStatePtr sampleMaskPipe[3][countFmts];
 
@@ -265,6 +301,13 @@ float4 main() : SV_Target0
         creator.GraphicsDesc.SampleDesc = yesMSAA;
         pipe[i][f][1] = creator;
 
+        creator.PS(depthwritepsblob[i]);
+        creator.GraphicsDesc.SampleDesc = noMSAA;
+        depthWritePixelShaderPipe[i][f][0] = creator;
+        creator.GraphicsDesc.SampleDesc = yesMSAA;
+        depthWritePixelShaderPipe[i][f][1] = creator;
+
+        creator.PS(psblob[i]);
         creator.GraphicsDesc.SampleDesc = yesMSAA;
         sampleMaskPipe[i][f] = creator;
       }
@@ -373,6 +416,14 @@ float4 main() : SV_Target0
             ClearDepthStencilView(cmd, is_msaa ? msaadsvs[f] : dsvs[f],
                                   D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0);
 
+            D3D12_RECT stencilClearRect;
+            stencilClearRect.left = 32;
+            stencilClearRect.right = 38;
+            stencilClearRect.top = 32;
+            stencilClearRect.bottom = 38;
+            cmd->ClearDepthStencilView(m_DSV->GetCPUDescriptorHandleForHeapStart(),
+                                       D3D12_CLEAR_FLAG_STENCIL, 0.0f, 1, 1, &stencilClearRect);
+
             cmd->OMSetStencilRef(0x55);
 
             // draw the setup triangles
@@ -393,8 +444,9 @@ float4 main() : SV_Target0
             markerName += fmtName;
             setMarker(cmd, markerName);
 
-            cmd->SetPipelineState(pipe[pass][f][is_msaa ? 1 : 0]);
+            cmd->SetPipelineState(depthWritePixelShaderPipe[pass][f][is_msaa ? 1 : 0]);
             cmd->DrawInstanced(24, 1, 9, 0);
+            cmd->SetPipelineState(pipe[pass][f][is_msaa ? 1 : 0]);
 
             if(!is_msaa)
             {

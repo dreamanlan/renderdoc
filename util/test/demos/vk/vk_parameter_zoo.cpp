@@ -471,19 +471,23 @@ void main()
         {10, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, VK_SHADER_STAGE_VERTEX_BIT},
     }));
 
+    std::vector<VkDescriptorSetLayoutBinding> refsetlayoutbinds = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {4, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT},
+        {9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT},
+    };
+
     VkDescriptorSetLayout refsetlayout =
-        createDescriptorSetLayout(vkh::DescriptorSetLayoutCreateInfo({
-            {0, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {4, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {5, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT},
-            {9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT},
-        }));
+        createDescriptorSetLayout(vkh::DescriptorSetLayoutCreateInfo(refsetlayoutbinds));
+    VkDescriptorSetLayout refsetlayout_copy =
+        createDescriptorSetLayout(vkh::DescriptorSetLayoutCreateInfo(refsetlayoutbinds));
 
     VkSampler invalidSampler = (VkSampler)0x1234;
     VkSampler validSampler = createSampler(vkh::SamplerCreateInfo(VK_FILTER_LINEAR));
@@ -497,7 +501,7 @@ void main()
             {99, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_VERTEX_BIT, &invalidSampler},
         }));
 
-    VkPipelineLayout layout, reflayout;
+    VkPipelineLayout layout, layout_copy, reflayout;
 
     if(KHR_push_descriptor)
     {
@@ -510,6 +514,7 @@ void main()
           VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR));
 
       layout = createPipelineLayout(vkh::PipelineLayoutCreateInfo({setlayout, pushlayout}));
+      layout_copy = createPipelineLayout(vkh::PipelineLayoutCreateInfo({setlayout, pushlayout}));
 
       VkDescriptorSetLayout refpushlayout =
           createDescriptorSetLayout(vkh::DescriptorSetLayoutCreateInfo(
@@ -535,6 +540,7 @@ void main()
     else
     {
       layout = createPipelineLayout(vkh::PipelineLayoutCreateInfo({setlayout}));
+      layout_copy = createPipelineLayout(vkh::PipelineLayoutCreateInfo({setlayout}));
 
       if(KHR_descriptor_update_template)
         reflayout = createPipelineLayout(vkh::PipelineLayoutCreateInfo({refsetlayout, refsetlayout}));
@@ -1127,7 +1133,7 @@ void main()
            sizeof(data)},
       };
 
-      createInfo.descriptorSetLayout = refsetlayout;
+      createInfo.descriptorSetLayout = refsetlayout_copy;
       createInfo.descriptorUpdateEntryCount = (uint32_t)entries.size();
       createInfo.pDescriptorUpdateEntries = entries.data();
 
@@ -1156,7 +1162,7 @@ void main()
       createInfo.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR;
       createInfo.descriptorSetLayout = (VkDescriptorSetLayout)0x1234;
       createInfo.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-      createInfo.pipelineLayout = layout;
+      createInfo.pipelineLayout = layout_copy;
       createInfo.set = 1;
       vkCreateDescriptorUpdateTemplateKHR(device, &createInfo, NULL, &pushtempl);
 
@@ -1477,6 +1483,8 @@ void main()
       dynInfo.colorAttachmentCount = 1234;
 
       vkh::GraphicsPipelineCreateInfo libCreateInfo;
+
+      libCreateInfo.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
 
       libCreateInfo.layout = layout;
 

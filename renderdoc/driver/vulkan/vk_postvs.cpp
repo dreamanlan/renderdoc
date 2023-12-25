@@ -28,6 +28,7 @@
 #include "core/settings.h"
 #include "driver/shaders/spirv/spirv_editor.h"
 #include "driver/shaders/spirv/spirv_op_helpers.h"
+#include "replay/replay_driver.h"
 #include "vk_core.h"
 #include "vk_debug.h"
 #include "vk_replay.h"
@@ -74,7 +75,7 @@ enum StorageMode
 };
 
 static void ConvertToMeshOutputCompute(const ShaderReflection &refl,
-                                       const SPIRVPatchData &patchData, const char *entryName,
+                                       const SPIRVPatchData &patchData, const rdcstr &entryName,
                                        StorageMode storageMode, rdcarray<uint32_t> instDivisor,
                                        const ActionDescription *action, uint32_t numVerts,
                                        uint32_t numViews, uint32_t baseSpecConstant,
@@ -205,13 +206,6 @@ static void ConvertToMeshOutputCompute(const ShaderReflection &refl,
         // we don't have to do anything, the ID mapping is in the rdcspv::PatchData, so just discard
         // the location information
         editor.Remove(it);
-      }
-      // remove block decoration from input or output structs
-      else if(decorate.decoration == rdcspv::Decoration::Block)
-      {
-        if(outputs.find(decorate.target) != outputs.end() ||
-           inputs.find(decorate.target) != inputs.end())
-          editor.Remove(it);
       }
     }
 
@@ -1473,6 +1467,1331 @@ static void ConvertToMeshOutputCompute(const ShaderReflection &refl,
   }
 }
 
+struct OutSigLocation
+{
+  uint32_t offset;
+  uint32_t stride;
+};
+
+struct OutMeshletLayout
+{
+  rdcarray<OutSigLocation> sigLocations;
+  uint32_t meshletByteSize;
+  uint32_t indexCountPerPrim;
+  uint32_t vertArrayLength;
+  uint32_t primArrayLength;
+};
+
+static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConstant> &specInfo,
+                                rdcspv::SparseIdMap<rdcspv::Id> &outputTypeReplacements,
+                                const rdcspv::DataType &type, rdcspv::Id &structType,
+                                uint32_t &byteSize)
+{
+  rdcarray<rdcspv::Id> members;
+
+  structType = editor.MakeId();
+  outputTypeReplacements[type.id] = structType;
+  editor.SetName(structType, StringFormat::Fmt("layoutStruct%d", type.id.value()));
+
+  uint32_t offset = 0;
+  rdcarray<uint32_t> offsets;
+
+  for(uint32_t i = 0; i < type.children.size(); i++)
+  {
+    rdcspv::Id memberTypeId = type.children[i].type;
+
+    // port across any decorations that should remain from the existing struct
+    if(type.children[i].decorations.others.contains(rdcspv::Decoration::Invariant))
+      editor.AddDecoration(rdcspv::OpMemberDecorate(structType, i, rdcspv::Decoration::Invariant));
+
+    uint32_t size = 1;
+    const rdcspv::DataType &childType = editor.GetDataType(type.children[i].type);
+
+    if(childType.type == rdcspv::DataType::ArrayType)
+      memberTypeId = childType.InnerType();
+
+    if(childType.type == rdcspv::DataType::StructType)
+    {
+      offset = AlignUp16(offset);
+      LayOutStorageStruct(editor, specInfo, outputTypeReplacements, childType, memberTypeId, size);
+    }
+    else if(childType.type == rdcspv::DataType::ArrayType &&
+            editor.GetDataType(childType.InnerType()).type == rdcspv::DataType::StructType)
+    {
+      offset = AlignUp16(offset);
+      LayOutStorageStruct(editor, specInfo, outputTypeReplacements,
+                          editor.GetDataType(childType.InnerType()), memberTypeId, size);
+    }
+    else if(childType.type == rdcspv::DataType::ArrayType)
+    {
+      const rdcspv::DataType &arrayInnerType = editor.GetDataType(childType.InnerType());
+      size = VarTypeByteSize(arrayInnerType.scalar().Type());
+      offset = AlignUp(offset, size);
+      if(arrayInnerType.type == rdcspv::DataType::VectorType)
+        size *= arrayInnerType.vector().count;
+    }
+    else
+    {
+      size = VarTypeByteSize(childType.scalar().Type());
+      offset = AlignUp(offset, size);
+      if(childType.type == rdcspv::DataType::VectorType)
+        size *= childType.vector().count;
+
+      if(childType.scalar().type == rdcspv::Op::TypeBool)
+        memberTypeId = editor.GetType(rdcspv::scalar<uint32_t>());
+    }
+
+    offsets.push_back(offset);
+
+    if(childType.type == rdcspv::DataType::ArrayType)
+    {
+      // make a new array type so we can decorate it with a stride
+      memberTypeId =
+          editor.AddType(rdcspv::OpTypeArray(editor.MakeId(), memberTypeId, childType.length));
+      outputTypeReplacements[type.children[i].type] = memberTypeId;
+      editor.SetName(memberTypeId,
+                     StringFormat::Fmt("stridedArray%d", type.children[i].type.value()));
+
+      editor.AddDecoration(rdcspv::OpDecorate(
+          memberTypeId, rdcspv::DecorationParam<rdcspv::Decoration::ArrayStride>(size)));
+
+      offset += size * editor.EvaluateConstant(childType.length, specInfo).value.u32v[0];
+    }
+    else
+    {
+      offset += size;
+    }
+
+    members.push_back(memberTypeId);
+  }
+
+  editor.AddType(rdcspv::OpTypeStruct(structType, members));
+
+  for(uint32_t i = 0; i < offsets.size(); i++)
+    editor.AddDecoration(rdcspv::OpMemberDecorate(
+        structType, i, rdcspv::DecorationParam<rdcspv::Decoration::Offset>(offsets[i])));
+
+  byteSize = AlignUp16(offset);
+}
+
+static void AddTaskShaderPayloadStores(const rdcarray<SpecConstant> &specInfo,
+                                       const rdcstr &entryName, uint32_t outSpecConstant,
+                                       rdcarray<uint32_t> &modSpirv, uint32_t &payloadSize)
+{
+  rdcspv::Editor editor(modSpirv);
+
+  editor.Prepare();
+
+  rdcspv::Id boolType = editor.DeclareType(rdcspv::scalar<bool>());
+  rdcspv::Id uint32Type = editor.DeclareType(rdcspv::scalar<uint32_t>());
+  rdcspv::Id uvec3Type = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<uint32_t>(), 3));
+  rdcspv::Id uvec3PtrType =
+      editor.DeclareType(rdcspv::Pointer(uvec3Type, rdcspv::StorageClass::PhysicalStorageBuffer));
+  rdcspv::Id uint64Type = editor.DeclareType(rdcspv::scalar<uint64_t>());
+
+  rdcspv::Id entryID;
+
+  for(const rdcspv::EntryPoint &entry : editor.GetEntries())
+  {
+    if(entry.name == entryName && entry.executionModel == rdcspv::ExecutionModel::TaskEXT)
+      entryID = entry.id;
+  }
+
+  RDCASSERT(entryID);
+
+  rdcspv::Id payloadId;
+  rdcspv::Id payloadTaskStructType;
+  rdcspv::Id payloadBlockStructType;
+
+  rdcspv::Id baseAddrId;
+  rdcspv::Id outSlotAddr;
+
+  {
+    rdcspv::Id uint64ptrtype =
+        editor.DeclareType(rdcspv::Pointer(uint64Type, rdcspv::StorageClass::Private));
+
+    outSlotAddr = editor.AddVariable(
+        rdcspv::OpVariable(uint64ptrtype, editor.MakeId(), rdcspv::StorageClass::Private));
+    editor.SetName(outSlotAddr, "outSlot");
+  }
+
+  // set up BDA if it's not already used
+  {
+    editor.AddExtension("SPV_KHR_physical_storage_buffer");
+
+    rdcspv::Iter it = editor.Begin(rdcspv::Section::MemoryModel);
+    rdcspv::OpMemoryModel model(it);
+    model.addressingModel = rdcspv::AddressingModel::PhysicalStorageBuffer64;
+    it = model;
+
+    editor.AddCapability(rdcspv::Capability::PhysicalStorageBufferAddresses);
+    editor.AddCapability(rdcspv::Capability::Int64);
+
+    baseAddrId = editor.AddSpecConstantImmediate<uint64_t>(0U, outSpecConstant);
+    editor.SetName(baseAddrId, "baseAddr");
+  }
+
+  {
+    rdcspv::Iter it = editor.GetEntry(entryID);
+
+    RDCASSERT(it.opcode() == rdcspv::Op::EntryPoint);
+
+    rdcspv::OpEntryPoint entry(it);
+
+    for(rdcspv::Id id : entry.iface)
+    {
+      const rdcspv::DataType &type = editor.GetDataType(editor.GetIDType(id));
+
+      if(type.type == rdcspv::DataType::PointerType &&
+         type.pointerType.storage == rdcspv::StorageClass::TaskPayloadWorkgroupEXT)
+      {
+        payloadId = id;
+
+        payloadBlockStructType = payloadTaskStructType = type.InnerType();
+        rdcspv::SparseIdMap<rdcspv::Id> outputTypeReplacements;
+        LayOutStorageStruct(editor, specInfo, outputTypeReplacements,
+                            editor.GetDataType(payloadBlockStructType), payloadBlockStructType,
+                            payloadSize);
+        break;
+      }
+    }
+  }
+
+  rdcspv::Id payloadBDAPtrType;
+
+  if(payloadBlockStructType != rdcspv::Id())
+  {
+    payloadBDAPtrType = editor.DeclareType(
+        rdcspv::Pointer(payloadBlockStructType, rdcspv::StorageClass::PhysicalStorageBuffer));
+  }
+
+  rdcarray<rdcspv::Id> newGlobals;
+
+  newGlobals.push_back(outSlotAddr);
+
+  // ensure the local index variable is declared
+  {
+    rdcspv::OperationList ops;
+    rdcspv::Id threadIndex, newGlobal;
+    rdctie(threadIndex, newGlobal) = editor.AddBuiltinInputLoad(
+        ops, ShaderStage::Mesh, rdcspv::BuiltIn::LocalInvocationIndex, uint32Type);
+    if(newGlobal != rdcspv::Id())
+      newGlobals.push_back(newGlobal);
+  }
+
+  // calculate base address for our task group's data
+  {
+    rdcspv::OperationList locationCalculate;
+
+    {
+      rdcspv::Id uint3Type = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<uint32_t>(), 3));
+      rdcspv::Id groupIdx, dispatchSize, newGlobal;
+
+      rdctie(groupIdx, newGlobal) = editor.AddBuiltinInputLoad(
+          locationCalculate, ShaderStage::Mesh, rdcspv::BuiltIn::WorkgroupId, uint3Type);
+      if(newGlobal != rdcspv::Id())
+        newGlobals.push_back(newGlobal);
+      rdctie(dispatchSize, newGlobal) = editor.AddBuiltinInputLoad(
+          locationCalculate, ShaderStage::Mesh, rdcspv::BuiltIn::NumWorkgroups, uint3Type);
+      if(newGlobal != rdcspv::Id())
+        newGlobals.push_back(newGlobal);
+
+      // x + y * xsize + z * xsize * ysize
+
+      rdcspv::Id xsize = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), dispatchSize, {0}));
+      rdcspv::Id ysize = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), dispatchSize, {1}));
+
+      rdcspv::Id xflat = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {0}));
+      rdcspv::Id yflat = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {1}));
+      rdcspv::Id zflat = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {2}));
+
+      rdcspv::Id xysize =
+          locationCalculate.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), xsize, ysize));
+
+      yflat = locationCalculate.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), yflat, xsize));
+      zflat = locationCalculate.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), zflat, xysize));
+
+      rdcspv::Id flatIndex =
+          locationCalculate.add(rdcspv::OpIAdd(uint32Type, editor.MakeId(), xflat, yflat));
+      flatIndex =
+          locationCalculate.add(rdcspv::OpIAdd(uint32Type, editor.MakeId(), flatIndex, zflat));
+
+      rdcspv::Id total_stride = editor.AddConstantImmediate<uint64_t>(payloadSize + sizeof(Vec4u));
+
+      rdcspv::Id idx64 =
+          locationCalculate.add(rdcspv::OpUConvert(uint64Type, editor.MakeId(), flatIndex));
+
+      rdcspv::Id offset =
+          locationCalculate.add(rdcspv::OpIMul(uint64Type, editor.MakeId(), total_stride, idx64));
+
+      rdcspv::Id addr =
+          locationCalculate.add(rdcspv::OpIAdd(uint64Type, editor.MakeId(), baseAddrId, offset));
+
+      locationCalculate.add(rdcspv::OpStore(outSlotAddr, addr));
+    }
+
+    rdcspv::Iter it = editor.GetID(entryID);
+    RDCASSERT(it.opcode() == rdcspv::Op::Function);
+    ++it;
+
+    // continue to the first label so we can insert things at the start of the entry point
+    for(; it; ++it)
+    {
+      if(it.opcode() == rdcspv::Op::Label)
+      {
+        ++it;
+        break;
+      }
+    }
+
+    // skip past any local variables
+    while(it.opcode() == rdcspv::Op::Variable || it.opcode() == rdcspv::Op::Line ||
+          it.opcode() == rdcspv::Op::NoLine)
+      ++it;
+
+    editor.AddOperations(it, locationCalculate);
+  }
+
+  // add the globals we registered
+  {
+    rdcspv::Iter it = editor.GetEntry(entryID);
+
+    RDCASSERT(it.opcode() == rdcspv::Op::EntryPoint);
+
+    rdcspv::OpEntryPoint entry(it);
+
+    editor.Remove(it);
+
+    entry.iface.append(newGlobals);
+
+    editor.AddOperation(it, entry);
+  }
+
+  rdcspv::Id zeroU32 = editor.AddConstantImmediate<uint32_t>(0U);
+  rdcspv::Id workgroupScope =
+      editor.AddConstantImmediate<uint32_t>((uint32_t)rdcspv::Scope::Workgroup);
+  rdcspv::Id acqRelWorkgroupSem = editor.AddConstantImmediate<uint32_t>(
+      (uint32_t)(rdcspv::MemorySemantics::WorkgroupMemory | rdcspv::MemorySemantics::AcquireRelease));
+  rdcspv::Id sixteenU64 = editor.AddConstantImmediate<uint64_t>(16);
+
+  for(rdcspv::Iter it = editor.Begin(rdcspv::Section::Functions);
+      it < editor.End(rdcspv::Section::Functions); ++it)
+  {
+    if(it.opcode() == rdcspv::Op::EmitMeshTasksEXT)
+    {
+      rdcspv::OpEmitMeshTasksEXT emit(it);
+      // only patch emits to our payload. Other shaders may reference other payloads
+      if(emit.payload == payloadId)
+      {
+        rdcspv::OperationList ops;
+
+        // insert a barrier first before the emit
+        ops.add(rdcspv::OpControlBarrier(workgroupScope, workgroupScope, acqRelWorkgroupSem));
+
+        rdcspv::Id threadIndex, newGlobal;
+        rdctie(threadIndex, newGlobal) = editor.AddBuiltinInputLoad(
+            ops, ShaderStage::Mesh, rdcspv::BuiltIn::LocalInvocationIndex, uint32Type);
+
+        rdcspv::Id threadIndexIsZero =
+            ops.add(rdcspv::OpIEqual(boolType, editor.MakeId(), threadIndex, zeroU32));
+
+        rdcspv::Id mergeLabel = editor.MakeId();
+        rdcspv::Id writeCase = editor.MakeId();
+        ops.add(rdcspv::OpSelectionMerge(mergeLabel, rdcspv::SelectionControl::None));
+        ops.add(rdcspv::OpBranchConditional(threadIndexIsZero, writeCase, mergeLabel));
+        ops.add(rdcspv::OpLabel(writeCase));
+
+        rdcspv::Id sizeAddr = ops.add(rdcspv::OpLoad(uint64Type, editor.MakeId(), outSlotAddr));
+
+        rdcspv::Id ptr = ops.add(rdcspv::OpConvertUToPtr(uvec3PtrType, editor.MakeId(), sizeAddr));
+
+        rdcspv::MemoryAccessAndParamDatas memoryAccess;
+        memoryAccess.setAligned(sizeof(uint32_t));
+
+        rdcspv::Id vals = ops.add(rdcspv::OpCompositeConstruct(
+            uvec3Type, editor.MakeId(), {emit.groupCountX, emit.groupCountY, emit.groupCountZ}));
+        ops.add(rdcspv::OpStore(ptr, vals, memoryAccess));
+
+        if(emit.HasPayload())
+        {
+          rdcspv::Id payloadAddr =
+              ops.add(rdcspv::OpIAdd(uint64Type, editor.MakeId(), sizeAddr, sixteenU64));
+
+          ptr = ops.add(rdcspv::OpConvertUToPtr(payloadBDAPtrType, editor.MakeId(), payloadAddr));
+
+          rdcspv::Id payloadStruct =
+              ops.add(rdcspv::OpLoad(payloadTaskStructType, editor.MakeId(), emit.payload));
+          rdcspv::Id logicalledPayload =
+              ops.add(rdcspv::OpCopyLogical(payloadBlockStructType, editor.MakeId(), payloadStruct));
+          ops.add(rdcspv::OpStore(ptr, logicalledPayload, memoryAccess));
+        }
+
+        ops.add(rdcspv::OpBranch(mergeLabel));
+        ops.add(rdcspv::OpLabel(mergeLabel));
+
+        it = editor.AddOperations(it, ops);
+
+        // don't do any actual emitting
+        emit.groupCountX = zeroU32;
+        emit.groupCountY = zeroU32;
+        emit.groupCountZ = zeroU32;
+
+        editor.PreModify(it);
+        it = emit;
+        editor.PostModify(it);
+      }
+    }
+  }
+}
+
+static void ConvertToFixedTaskFeeder(const rdcarray<SpecConstant> &specInfo,
+                                     const rdcstr &entryName, uint32_t inSpecConstant,
+                                     uint32_t payloadSize, rdcarray<uint32_t> &modSpirv)
+{
+  rdcspv::Editor editor(modSpirv);
+
+  editor.Prepare();
+
+  // remove all debug names that exist currently as they may name instructions we're going to remove
+  for(rdcspv::Iter it = editor.Begin(rdcspv::Section::DebugNames),
+                   end2 = editor.End(rdcspv::Section::DebugNames);
+      it < end2; ++it)
+  {
+    editor.Remove(it);
+  }
+
+  rdcspv::Id uint32Type = editor.DeclareType(rdcspv::scalar<uint32_t>());
+  rdcspv::Id uvec4Type = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<uint32_t>(), 4));
+  rdcspv::Id uvec4PtrType =
+      editor.DeclareType(rdcspv::Pointer(uvec4Type, rdcspv::StorageClass::PhysicalStorageBuffer));
+  rdcspv::Id uint64Type = editor.DeclareType(rdcspv::scalar<uint64_t>());
+
+  rdcspv::Id baseAddrId;
+
+  // set up BDA if it's not already used
+  {
+    editor.AddExtension("SPV_KHR_physical_storage_buffer");
+
+    rdcspv::Iter it = editor.Begin(rdcspv::Section::MemoryModel);
+    rdcspv::OpMemoryModel model(it);
+    model.addressingModel = rdcspv::AddressingModel::PhysicalStorageBuffer64;
+    it = model;
+
+    editor.AddCapability(rdcspv::Capability::PhysicalStorageBufferAddresses);
+    editor.AddCapability(rdcspv::Capability::Int64);
+
+    baseAddrId = editor.AddSpecConstantImmediate<uint64_t>(0U, inSpecConstant);
+    editor.SetName(baseAddrId, "baseAddr");
+  }
+
+  rdcarray<rdcspv::Id> newGlobals;
+
+  rdcspv::Id entryID;
+
+  for(const rdcspv::EntryPoint &entry : editor.GetEntries())
+  {
+    if(entry.name == entryName && entry.executionModel == rdcspv::ExecutionModel::TaskEXT)
+      entryID = entry.id;
+  }
+
+  RDCASSERT(entryID);
+
+  rdcspv::Id payloadId;
+  rdcspv::Id payloadTaskStructType;
+  rdcspv::Id payloadBlockStructType;
+  uint32_t taskOffsetIndex = 0;
+
+  rdcspv::Id func;
+
+  {
+    rdcspv::Iter it = editor.GetEntry(entryID);
+
+    RDCASSERT(it.opcode() == rdcspv::Op::EntryPoint);
+
+    rdcspv::OpEntryPoint entry(it);
+
+    func = entry.entryPoint;
+
+    for(rdcspv::Id id : entry.iface)
+    {
+      const rdcspv::DataType &type = editor.GetDataType(editor.GetIDType(id));
+
+      if(type.type == rdcspv::DataType::PointerType &&
+         type.pointerType.storage == rdcspv::StorageClass::TaskPayloadWorkgroupEXT)
+      {
+        payloadId = id;
+
+        payloadBlockStructType = payloadTaskStructType = type.InnerType();
+
+        // append the uint offset to the payload struct type. This should not interfere with any
+        // other definitions used anywhere else
+        {
+          it = editor.GetID(payloadTaskStructType);
+
+          rdcspv::OpTypeStruct structType(it);
+          taskOffsetIndex = (uint32_t)structType.members.size();
+          structType.members.push_back(uint32Type);
+
+          // this is a bit of a hack, we use AddOperation to ensure the struct is in the same order
+          // rather than AddType which adds it at the end of the types
+          editor.Remove(it);
+          editor.AddOperation(it, structType);
+          editor.PostModify(it);
+        }
+
+        uint32_t byteSize = 0;
+        rdcspv::SparseIdMap<rdcspv::Id> outputTypeReplacements;
+        LayOutStorageStruct(editor, specInfo, outputTypeReplacements,
+                            editor.GetDataType(payloadBlockStructType), payloadBlockStructType,
+                            byteSize);
+
+        break;
+      }
+    }
+  }
+
+  // if there was no payload, create our own with just the offset
+  if(payloadSize == 0)
+  {
+    payloadTaskStructType = editor.AddType(rdcspv::OpTypeStruct(editor.MakeId(), {uint32Type}));
+    payloadBlockStructType = editor.AddType(rdcspv::OpTypeStruct(editor.MakeId(), {uint32Type}));
+    editor.AddDecoration(rdcspv::OpMemberDecorate(
+        payloadBlockStructType, 0, rdcspv::DecorationParam<rdcspv::Decoration::Offset>(0)));
+
+    rdcspv::Id taskPtrType = editor.DeclareType(
+        rdcspv::Pointer(payloadTaskStructType, rdcspv::StorageClass::TaskPayloadWorkgroupEXT));
+
+    payloadId = editor.AddVariable(rdcspv::OpVariable(
+        taskPtrType, editor.MakeId(), rdcspv::StorageClass::TaskPayloadWorkgroupEXT));
+
+    newGlobals.push_back(payloadId);
+  }
+
+  rdcspv::Id payloadBDAPtrType = editor.DeclareType(
+      rdcspv::Pointer(payloadBlockStructType, rdcspv::StorageClass::PhysicalStorageBuffer));
+
+  // find the group size execution mode and remove it, we'll insert our own that's 1,1,1.
+  // we remove this in case it's an ExecutionModeId, in which case it would need to expand to be a
+  // plain ExecutionMode
+  for(rdcspv::Iter it = editor.Begin(rdcspv::Section::ExecutionMode),
+                   end = editor.End(rdcspv::Section::ExecutionMode);
+      it < end; ++it)
+  {
+    // this can also handle ExecutionModeId and we don't care about the difference
+    rdcspv::OpExecutionMode execMode(it);
+
+    if(execMode.entryPoint == entryID && (execMode.mode == rdcspv::ExecutionMode::LocalSize ||
+                                          execMode.mode == rdcspv::ExecutionMode::LocalSizeId))
+    {
+      editor.Remove(it);
+      break;
+    }
+  }
+
+  // Add our own localsize execution mode
+  editor.AddExecutionMode(rdcspv::OpExecutionMode(
+      entryID, rdcspv::ExecutionModeParam<rdcspv::ExecutionMode::LocalSize>(1, 1, 1)));
+
+  rdcspv::Id sixteenU64 = editor.AddConstantImmediate<uint64_t>(16);
+
+  rdcspv::OperationList ops;
+
+  rdcspv::MemoryAccessAndParamDatas memoryAccess;
+  memoryAccess.setAligned(sizeof(uint32_t));
+
+  // create our new function to read the payload, count, and offset, and emit mesh tasks for it
+  {
+    rdcspv::Id uint3Type = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<uint32_t>(), 3));
+    rdcspv::Id groupIdx, dispatchSize, newGlobal;
+
+    rdctie(groupIdx, newGlobal) =
+        editor.AddBuiltinInputLoad(ops, ShaderStage::Mesh, rdcspv::BuiltIn::WorkgroupId, uint3Type);
+    if(newGlobal != rdcspv::Id())
+      newGlobals.push_back(newGlobal);
+    rdctie(dispatchSize, newGlobal) = editor.AddBuiltinInputLoad(
+        ops, ShaderStage::Mesh, rdcspv::BuiltIn::NumWorkgroups, uint3Type);
+    if(newGlobal != rdcspv::Id())
+      newGlobals.push_back(newGlobal);
+
+    // x + y * xsize + z * xsize * ysize
+
+    rdcspv::Id xsize =
+        ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), dispatchSize, {0}));
+    rdcspv::Id ysize =
+        ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), dispatchSize, {1}));
+
+    rdcspv::Id xflat =
+        ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {0}));
+    rdcspv::Id yflat =
+        ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {1}));
+    rdcspv::Id zflat =
+        ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {2}));
+
+    rdcspv::Id xysize = ops.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), xsize, ysize));
+
+    yflat = ops.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), yflat, xsize));
+    zflat = ops.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), zflat, xysize));
+
+    rdcspv::Id flatIndex = ops.add(rdcspv::OpIAdd(uint32Type, editor.MakeId(), xflat, yflat));
+    flatIndex = ops.add(rdcspv::OpIAdd(uint32Type, editor.MakeId(), flatIndex, zflat));
+
+    rdcspv::Id total_stride = editor.AddConstantImmediate<uint64_t>(payloadSize + sizeof(Vec4u));
+
+    rdcspv::Id idx64 = ops.add(rdcspv::OpUConvert(uint64Type, editor.MakeId(), flatIndex));
+
+    rdcspv::Id offset = ops.add(rdcspv::OpIMul(uint64Type, editor.MakeId(), total_stride, idx64));
+
+    rdcspv::Id addr = ops.add(rdcspv::OpIAdd(uint64Type, editor.MakeId(), baseAddrId, offset));
+
+    rdcspv::Id ptr = ops.add(rdcspv::OpConvertUToPtr(uvec4PtrType, editor.MakeId(), addr));
+
+    rdcspv::Id sizeOffset = ops.add(rdcspv::OpLoad(uvec4Type, editor.MakeId(), ptr, memoryAccess));
+
+    rdcspv::Id meshDispatchSizeX =
+        ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), sizeOffset, {0}));
+    rdcspv::Id meshDispatchSizeY =
+        ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), sizeOffset, {1}));
+    rdcspv::Id meshDispatchSizeZ =
+        ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), sizeOffset, {2}));
+    offset = ops.add(rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), sizeOffset, {3}));
+
+    rdcspv::Id patchedPayload;
+    if(payloadSize)
+    {
+      rdcspv::Id payloadAddr = ops.add(rdcspv::OpIAdd(uint64Type, editor.MakeId(), addr, sixteenU64));
+
+      ptr = ops.add(rdcspv::OpConvertUToPtr(payloadBDAPtrType, editor.MakeId(), payloadAddr));
+
+      rdcspv::Id payloadStruct =
+          ops.add(rdcspv::OpLoad(payloadBlockStructType, editor.MakeId(), ptr, memoryAccess));
+      rdcspv::Id logicalledPayload =
+          ops.add(rdcspv::OpCopyLogical(payloadTaskStructType, editor.MakeId(), payloadStruct));
+      patchedPayload = ops.add(rdcspv::OpCompositeInsert(
+          payloadTaskStructType, editor.MakeId(), offset, logicalledPayload, {taskOffsetIndex}));
+    }
+    else
+    {
+      patchedPayload =
+          ops.add(rdcspv::OpCompositeConstruct(payloadTaskStructType, editor.MakeId(), {offset}));
+    }
+    ops.add(rdcspv::OpStore(payloadId, patchedPayload));
+    ops.add(rdcspv::OpEmitMeshTasksEXT(meshDispatchSizeX, meshDispatchSizeY, meshDispatchSizeZ,
+                                       payloadId));
+  }
+
+  {
+    rdcspv::Iter it = editor.GetID(func);
+    RDCASSERT(it.opcode() == rdcspv::Op::Function);
+    ++it;
+
+    // continue to the first label so we can remove and replace the function
+    for(; it; ++it)
+    {
+      if(it.opcode() == rdcspv::Op::Label)
+      {
+        ++it;
+        break;
+      }
+    }
+
+    // erase the rest of the function
+    while(it.opcode() != rdcspv::Op::FunctionEnd)
+    {
+      editor.Remove(it);
+      ++it;
+    }
+
+    it = editor.AddOperations(it, ops);
+  }
+
+  // remove all decorations that no longer refer to valid IDs (e.g. instructions in functions we deleted).
+  for(rdcspv::Iter it = editor.Begin(rdcspv::Section::Annotations),
+                   end2 = editor.End(rdcspv::Section::Annotations);
+      it < end2; ++it)
+  {
+    if(it.opcode() == rdcspv::Op::Decorate)
+    {
+      rdcspv::OpDecorate dec(it);
+
+      if(!editor.GetID(dec.target))
+      {
+        editor.Remove(it);
+      }
+    }
+    if(it.opcode() == rdcspv::Op::DecorateId)
+    {
+      rdcspv::OpDecorateId dec(it);
+
+      if(!editor.GetID(dec.target))
+      {
+        editor.Remove(it);
+      }
+    }
+  }
+
+  // add the globals we registered
+  {
+    rdcspv::Iter it = editor.GetEntry(entryID);
+
+    RDCASSERT(it.opcode() == rdcspv::Op::EntryPoint);
+
+    rdcspv::OpEntryPoint entry(it);
+
+    editor.Remove(it);
+
+    entry.iface.append(newGlobals);
+
+    editor.AddOperation(it, entry);
+  }
+}
+
+static void AddMeshShaderOutputStores(const ShaderReflection &refl,
+                                      const rdcarray<SpecConstant> &specInfo,
+                                      const SPIRVPatchData &patchData, const rdcstr &entryName,
+                                      uint32_t outSpecConstant, rdcarray<uint32_t> &modSpirv,
+                                      bool readTaskOffset, OutMeshletLayout &layout)
+{
+  rdcspv::Editor editor(modSpirv);
+
+  editor.Prepare();
+
+  rdcspv::Id baseAddrId;
+  rdcspv::Id outSlotAddr;
+  rdcspv::Id boolType = editor.DeclareType(rdcspv::scalar<bool>());
+  rdcspv::Id uint32Type = editor.DeclareType(rdcspv::scalar<uint32_t>());
+  rdcspv::Id uint32PayloadPtrType =
+      editor.DeclareType(rdcspv::Pointer(uint32Type, rdcspv::StorageClass::TaskPayloadWorkgroupEXT));
+  rdcspv::Id uvec2Type = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<uint32_t>(), 2));
+  rdcspv::Id uvec3Type = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<uint32_t>(), 3));
+  rdcspv::Id uvec2PtrType =
+      editor.DeclareType(rdcspv::Pointer(uvec2Type, rdcspv::StorageClass::PhysicalStorageBuffer));
+  rdcspv::Id uint64Type = editor.DeclareType(rdcspv::scalar<uint64_t>());
+
+  rdcspv::Id zeroU32 = editor.AddConstantImmediate<uint32_t>(0);
+  rdcspv::Id oneU32 = editor.AddConstantImmediate<uint32_t>(1);
+  rdcspv::Id zeroU64 = editor.AddConstantImmediate<uint64_t>(0);
+  rdcspv::Id sixteenU64 = editor.AddConstantImmediate<uint64_t>(16);
+
+  {
+    rdcspv::Id uint64ptrtype =
+        editor.DeclareType(rdcspv::Pointer(uint64Type, rdcspv::StorageClass::Private));
+
+    outSlotAddr = editor.AddVariable(
+        rdcspv::OpVariable(uint64ptrtype, editor.MakeId(), rdcspv::StorageClass::Private));
+    editor.SetName(outSlotAddr, "outSlot");
+  }
+
+  // set up BDA if it's not already used
+  {
+    editor.AddExtension("SPV_KHR_physical_storage_buffer");
+
+    rdcspv::Iter it = editor.Begin(rdcspv::Section::MemoryModel);
+    rdcspv::OpMemoryModel model(it);
+    model.addressingModel = rdcspv::AddressingModel::PhysicalStorageBuffer64;
+    it = model;
+
+    editor.AddCapability(rdcspv::Capability::PhysicalStorageBufferAddresses);
+    editor.AddCapability(rdcspv::Capability::Int64);
+
+    baseAddrId = editor.AddSpecConstantImmediate<uint64_t>(0U, outSpecConstant);
+    editor.SetName(baseAddrId, "baseAddr");
+  }
+
+  rdcarray<rdcspv::Id> newGlobals;
+
+  newGlobals.push_back(outSlotAddr);
+
+  rdcspv::Id indextype;
+  uint32_t indexCount = 3;
+  for(const SigParameter &sig : refl.outputSignature)
+  {
+    if(sig.systemValue == ShaderBuiltin::OutputIndices)
+    {
+      indexCount = sig.compCount;
+      indextype = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<float>(), sig.compCount));
+    }
+  }
+
+  rdcspv::Id entryID;
+
+  for(const rdcspv::EntryPoint &entry : editor.GetEntries())
+  {
+    if(entry.name == entryName && entry.executionModel == rdcspv::ExecutionModel::MeshEXT)
+      entryID = entry.id;
+  }
+
+  RDCASSERT(entryID);
+
+  rdcspv::Id payloadId;
+  rdcspv::Id payloadStructId;
+  uint32_t taskOffsetIndex = 0;
+
+  if(readTaskOffset)
+  {
+    rdcspv::Iter it = editor.GetEntry(entryID);
+
+    RDCASSERT(it.opcode() == rdcspv::Op::EntryPoint);
+
+    rdcspv::OpEntryPoint entry(it);
+
+    for(rdcspv::Id id : entry.iface)
+    {
+      const rdcspv::DataType &type = editor.GetDataType(editor.GetIDType(id));
+
+      if(type.type == rdcspv::DataType::PointerType &&
+         type.pointerType.storage == rdcspv::StorageClass::TaskPayloadWorkgroupEXT)
+      {
+        payloadId = id;
+        payloadStructId = type.InnerType();
+        break;
+      }
+    }
+
+    // append the uint offset to the payload struct type. This should not interfere with any other
+    // definitions used anywhere else
+    if(payloadId != rdcspv::Id())
+    {
+      it = editor.GetID(payloadStructId);
+
+      rdcspv::OpTypeStruct structType(it);
+      taskOffsetIndex = (uint32_t)structType.members.size();
+      structType.members.push_back(uint32Type);
+
+      // this is a bit of a hack, we use AddOperation to ensure the struct is in the same order
+      // rather than AddType which adds it at the end of the types
+      editor.Remove(it);
+      editor.AddOperation(it, structType);
+      editor.PostModify(it);
+    }
+    else
+    {
+      // if there was no payload, create our own with just the offset
+      payloadStructId = editor.AddType(rdcspv::OpTypeStruct(editor.MakeId(), {uint32Type}));
+
+      rdcspv::Id taskPtrType = editor.DeclareType(
+          rdcspv::Pointer(payloadStructId, rdcspv::StorageClass::TaskPayloadWorkgroupEXT));
+
+      payloadId = editor.AddVariable(rdcspv::OpVariable(
+          taskPtrType, editor.MakeId(), rdcspv::StorageClass::TaskPayloadWorkgroupEXT));
+
+      newGlobals.push_back(payloadId);
+    }
+  }
+
+  uint32_t primOutByteCount = 0;
+  uint32_t vertOutByteCount = 0;
+
+  struct OutputGlobal
+  {
+    uint32_t offset;
+    bool perPrim;
+    bool indices;
+    uint32_t arrayStride;
+  };
+  rdcspv::SparseIdMap<OutputGlobal> outputGlobals;
+  rdcspv::SparseIdMap<rdcspv::Id> outputTypeReplacements;
+
+  // iterate over all output variables and assign locations in the output data stream, as well as
+  // creating correctly typed structures (with offsets) and a BDA pointer type to use instead
+  // whenever any of these variables are referenced.
+  for(const rdcspv::Variable &var : editor.GetGlobals())
+  {
+    if(var.storage != rdcspv::StorageClass::Output)
+      continue;
+
+    const rdcspv::Decorations &d = editor.GetDecorations(var.id);
+    // global variables are all pointers
+    const rdcspv::DataType &pointerType = editor.GetDataType(editor.GetIDType(var.id));
+    RDCASSERT(pointerType.type == rdcspv::DataType::PointerType);
+
+    // in mesh shaders, all output vairables are arrays
+    const rdcspv::DataType &arrayType = editor.GetDataType(pointerType.InnerType());
+
+    RDCASSERT(arrayType.type == rdcspv::DataType::ArrayType);
+    const rdcspv::DataType &type = editor.GetDataType(arrayType.InnerType());
+
+    uint32_t arrayLength = editor.EvaluateConstant(arrayType.length, specInfo).value.u32v[0];
+
+    rdcspv::Id arrayInnerType = arrayType.InnerType();
+
+    uint32_t byteSize = 1;
+    uint32_t stride = 1;
+
+    if(type.type == rdcspv::DataType::StructType)
+    {
+      LayOutStorageStruct(editor, specInfo, outputTypeReplacements, type, arrayInnerType, byteSize);
+
+      stride = byteSize;
+
+      byteSize *= arrayLength;
+
+      uint32_t offset = 0;
+      bool perPrim = false;
+
+      if(d.others.contains(rdcspv::Decoration::PerPrimitiveEXT))
+      {
+        primOutByteCount = AlignUp16(primOutByteCount);
+        offset = primOutByteCount;
+        perPrim = true;
+        primOutByteCount += byteSize;
+      }
+      else
+      {
+        vertOutByteCount = AlignUp16(vertOutByteCount);
+        offset = vertOutByteCount;
+        perPrim = false;
+        vertOutByteCount += byteSize;
+      }
+
+      outputGlobals[var.id] = {
+          offset,
+          perPrim,
+          false,
+          stride,
+      };
+    }
+    else
+    {
+      // loose variable
+      const uint32_t scalarAlign = VarTypeByteSize(type.scalar().Type());
+      byteSize = scalarAlign;
+      if(type.type == rdcspv::DataType::VectorType)
+        byteSize = scalarAlign * type.vector().count;
+
+      stride = byteSize;
+
+      uint32_t offset = 0;
+      bool perPrim = false;
+      bool indices = false;
+
+      if(d.builtIn == rdcspv::BuiltIn::PrimitivePointIndicesEXT ||
+         d.builtIn == rdcspv::BuiltIn::PrimitiveLineIndicesEXT ||
+         d.builtIn == rdcspv::BuiltIn::PrimitiveTriangleIndicesEXT)
+      {
+        indices = true;
+      }
+      else if(d.others.contains(rdcspv::Decoration::PerPrimitiveEXT))
+      {
+        primOutByteCount = AlignUp(primOutByteCount, scalarAlign);
+        offset = primOutByteCount;
+        perPrim = true;
+        primOutByteCount += byteSize * arrayLength;
+      }
+      else
+      {
+        vertOutByteCount = AlignUp(vertOutByteCount, scalarAlign);
+        offset = vertOutByteCount;
+        perPrim = false;
+        vertOutByteCount += byteSize * arrayLength;
+      }
+
+      outputGlobals[var.id] = {
+          offset,
+          perPrim,
+          indices,
+          stride,
+      };
+    }
+
+    // redeclare the array so we can decorate it with a stride
+    rdcspv::Id stridedArrayType =
+        editor.AddType(rdcspv::OpTypeArray(editor.MakeId(), arrayInnerType, arrayType.length));
+    editor.SetName(stridedArrayType, StringFormat::Fmt("stridedArray%d", arrayType.id.value()));
+
+    editor.AddDecoration(rdcspv::OpDecorate(
+        stridedArrayType, rdcspv::DecorationParam<rdcspv::Decoration::ArrayStride>(stride)));
+
+    outputTypeReplacements[arrayType.id] = stridedArrayType;
+  }
+
+  // for every output pointer type, declare an equivalent BDA pointer type
+  for(rdcspv::Iter it = editor.Begin(rdcspv::Section::Types),
+                   end = editor.End(rdcspv::Section::Types);
+      it < end; ++it)
+  {
+    if(it.opcode() == rdcspv::Op::TypePointer)
+    {
+      rdcspv::OpTypePointer ptr(it);
+
+      if(ptr.storageClass == rdcspv::StorageClass::Output)
+      {
+        rdcspv::Id inner = ptr.type;
+        auto replace = outputTypeReplacements.find(ptr.type);
+        if(replace != outputTypeReplacements.end())
+          inner = replace->second;
+
+        if(editor.GetDataType(inner).scalar().type == rdcspv::Op::TypeBool)
+          inner = editor.GetType(rdcspv::scalar<uint32_t>());
+
+        outputTypeReplacements[ptr.result] =
+            editor.DeclareType(rdcspv::Pointer(inner, rdcspv::StorageClass::PhysicalStorageBuffer));
+      }
+    }
+  }
+
+  primOutByteCount = AlignUp16(primOutByteCount);
+  vertOutByteCount = AlignUp16(vertOutByteCount);
+
+  for(auto &it : outputGlobals)
+  {
+    // prim/vert counts
+    it.second.offset += 32;
+
+    // indices
+    if(!it.second.indices)
+      it.second.offset +=
+          AlignUp16(patchData.maxPrimitives * indexCount * (uint32_t)sizeof(uint32_t));
+
+    // per-vertex data
+    if(it.second.perPrim)
+    {
+      it.second.offset += vertOutByteCount;
+    }
+  }
+
+  layout.sigLocations.resize(refl.outputSignature.size());
+  for(size_t i = 0; i < refl.outputSignature.size(); i++)
+  {
+    const SigParameter &sig = refl.outputSignature[i];
+    const SPIRVInterfaceAccess &iface = patchData.outputs[i];
+
+    auto glob = outputGlobals.find(iface.ID);
+
+    if(glob == outputGlobals.end())
+    {
+      RDCERR("Couldn't find global for out signature '%s' (location %u)", sig.varName.c_str(),
+             sig.regIndex);
+      continue;
+    }
+
+    layout.sigLocations[i].offset = glob->second.offset;
+    layout.sigLocations[i].stride = glob->second.arrayStride;
+
+    rdcspv::DataType *type = &editor.GetDataType(editor.GetIDType(iface.ID));
+    RDCASSERT(type->type == rdcspv::DataType::PointerType);
+
+    type = &editor.GetDataType(type->InnerType());
+    RDCASSERT(type->type == rdcspv::DataType::ArrayType);
+
+    rdcspv::Id laidStruct = outputTypeReplacements[type->id];
+    RDCASSERT(laidStruct != rdcspv::Id());
+
+    type = &editor.GetDataType(laidStruct);
+    RDCASSERT(type->type == rdcspv::DataType::ArrayType);
+
+    // the access chain should always start with a 0 for the array for outputs, this will be
+    // effectively skipped below
+    rdcarray<uint32_t> memberChain = iface.accessChain;
+    while(!memberChain.empty())
+    {
+      uint32_t memberIdx = memberChain.takeAt(0);
+
+      if(type->type == rdcspv::DataType::ArrayType)
+      {
+        const rdcspv::Decorations &typeDec = editor.GetDecorations(type->id);
+        RDCASSERT(typeDec.flags & rdcspv::Decorations::HasArrayStride);
+        layout.sigLocations[i].offset += typeDec.arrayStride * memberIdx;
+        type = &editor.GetDataType(type->InnerType());
+        continue;
+      }
+
+      if(memberIdx >= type->children.size())
+      {
+        RDCERR(
+            "Encountered unexpected child list at type %u looking for member %u for "
+            "signature '%s' (location %u)",
+            type->id.value(), memberIdx, sig.varName.c_str(), sig.regIndex);
+        break;
+      }
+
+      RDCASSERT(type->children[memberIdx].decorations.flags & rdcspv::Decorations::HasOffset);
+      layout.sigLocations[i].offset += type->children[memberIdx].decorations.offset;
+      type = &editor.GetDataType(type->children[memberIdx].type);
+    }
+  }
+
+  layout.primArrayLength = patchData.maxPrimitives;
+  layout.vertArrayLength = patchData.maxVertices;
+  layout.indexCountPerPrim = indexCount;
+  layout.meshletByteSize =
+      // real and fake meshlet size (prim/vert count)
+      32 +
+      // indices
+      (uint32_t)AlignUp16(patchData.maxPrimitives * indexCount * sizeof(uint32_t)) +
+      // per-vertex data
+      vertOutByteCount +
+      // per-primitive data
+      primOutByteCount;
+
+  // calculate base address for our meshlet's data
+  {
+    rdcspv::OperationList locationCalculate;
+
+    {
+      rdcspv::Id uint3Type = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<uint32_t>(), 3));
+      rdcspv::Id groupIdx, dispatchSize, newGlobal;
+
+      rdctie(groupIdx, newGlobal) = editor.AddBuiltinInputLoad(
+          locationCalculate, ShaderStage::Mesh, rdcspv::BuiltIn::WorkgroupId, uint3Type);
+      if(newGlobal != rdcspv::Id())
+        newGlobals.push_back(newGlobal);
+      rdctie(dispatchSize, newGlobal) = editor.AddBuiltinInputLoad(
+          locationCalculate, ShaderStage::Mesh, rdcspv::BuiltIn::NumWorkgroups, uint3Type);
+      if(newGlobal != rdcspv::Id())
+        newGlobals.push_back(newGlobal);
+
+      // x + y * xsize + z * xsize * ysize
+
+      rdcspv::Id xsize = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), dispatchSize, {0}));
+      rdcspv::Id ysize = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), dispatchSize, {1}));
+
+      rdcspv::Id xflat = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {0}));
+      rdcspv::Id yflat = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {1}));
+      rdcspv::Id zflat = locationCalculate.add(
+          rdcspv::OpCompositeExtract(uint32Type, editor.MakeId(), groupIdx, {2}));
+
+      rdcspv::Id xysize =
+          locationCalculate.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), xsize, ysize));
+
+      yflat = locationCalculate.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), yflat, xsize));
+      zflat = locationCalculate.add(rdcspv::OpIMul(uint32Type, editor.MakeId(), zflat, xysize));
+
+      rdcspv::Id flatIndex =
+          locationCalculate.add(rdcspv::OpIAdd(uint32Type, editor.MakeId(), xflat, yflat));
+      flatIndex =
+          locationCalculate.add(rdcspv::OpIAdd(uint32Type, editor.MakeId(), flatIndex, zflat));
+
+      rdcspv::Id total_stride = editor.AddConstantImmediate<uint64_t>(layout.meshletByteSize);
+
+      rdcspv::Id idx64 =
+          locationCalculate.add(rdcspv::OpUConvert(uint64Type, editor.MakeId(), flatIndex));
+
+      if(readTaskOffset)
+      {
+        rdcspv::Id taskOffsetPtr = locationCalculate.add(
+            rdcspv::OpAccessChain(uint32PayloadPtrType, editor.MakeId(), payloadId,
+                                  {editor.AddConstantImmediate<uint32_t>(taskOffsetIndex)}));
+        rdcspv::Id taskOffset =
+            locationCalculate.add(rdcspv::OpLoad(uint32Type, editor.MakeId(), taskOffsetPtr));
+        taskOffset =
+            locationCalculate.add(rdcspv::OpUConvert(uint64Type, editor.MakeId(), taskOffset));
+        idx64 = locationCalculate.add(rdcspv::OpIAdd(uint64Type, editor.MakeId(), idx64, taskOffset));
+      }
+
+      rdcspv::Id offset =
+          locationCalculate.add(rdcspv::OpIMul(uint64Type, editor.MakeId(), total_stride, idx64));
+
+      rdcspv::Id addr =
+          locationCalculate.add(rdcspv::OpIAdd(uint64Type, editor.MakeId(), baseAddrId, offset));
+
+      locationCalculate.add(rdcspv::OpStore(outSlotAddr, addr));
+    }
+
+    rdcspv::Iter it = editor.GetID(entryID);
+    RDCASSERT(it.opcode() == rdcspv::Op::Function);
+    ++it;
+
+    // continue to the first label so we can insert things at the start of the entry point
+    for(; it; ++it)
+    {
+      if(it.opcode() == rdcspv::Op::Label)
+      {
+        ++it;
+        break;
+      }
+    }
+
+    // skip past any local variables
+    while(it.opcode() == rdcspv::Op::Variable || it.opcode() == rdcspv::Op::Line ||
+          it.opcode() == rdcspv::Op::NoLine)
+      ++it;
+
+    editor.AddOperations(it, locationCalculate);
+  }
+
+  // ensure the variable is declared
+  {
+    rdcspv::OperationList ops;
+    rdcspv::Id threadIndex, newGlobal;
+    rdctie(threadIndex, newGlobal) = editor.AddBuiltinInputLoad(
+        ops, ShaderStage::Mesh, rdcspv::BuiltIn::LocalInvocationIndex, uint32Type);
+    if(newGlobal != rdcspv::Id())
+      newGlobals.push_back(newGlobal);
+  }
+
+  // add the globals we registered
+  {
+    rdcspv::Iter it = editor.GetEntry(entryID);
+
+    RDCASSERT(it.opcode() == rdcspv::Op::EntryPoint);
+
+    rdcspv::OpEntryPoint entry(it);
+
+    editor.Remove(it);
+
+    entry.iface.append(newGlobals);
+
+    editor.AddOperation(it, entry);
+  }
+
+  // take every store or access chain to an output pointer and patch it
+  // also look for OpSetMeshOutputsEXT which will be called precisely once, and patch it to store
+  // the values to our data (and emit 0/0)
+  for(rdcspv::Iter it = editor.Begin(rdcspv::Section::Functions);
+      it < editor.End(rdcspv::Section::Functions); ++it)
+  {
+    if(it.opcode() == rdcspv::Op::SetMeshOutputsEXT)
+    {
+      rdcspv::OpSetMeshOutputsEXT setOuts(it);
+
+      rdcspv::OperationList ops;
+
+      rdcspv::Id threadIndex, newGlobal;
+      rdctie(threadIndex, newGlobal) = editor.AddBuiltinInputLoad(
+          ops, ShaderStage::Mesh, rdcspv::BuiltIn::LocalInvocationIndex, uint32Type);
+
+      rdcspv::Id threadIndexIsZero =
+          ops.add(rdcspv::OpIEqual(boolType, editor.MakeId(), threadIndex, zeroU32));
+
+      // to avoid messing up phi nodes in the application where this is called, we do this
+      // branchless by either writing to offset 0 (for threadIndex == 0) or offset 16 (for
+      // threadIndex > 0). Then we can ignore the second one
+      rdcspv::Id byteOffset = ops.add(
+          rdcspv::OpSelect(uint64Type, editor.MakeId(), threadIndexIsZero, zeroU64, sixteenU64));
+
+      rdcspv::Id baseAddr = ops.add(rdcspv::OpLoad(uint64Type, editor.MakeId(), outSlotAddr));
+
+      rdcspv::Id sizeAddr =
+          ops.add(rdcspv::OpIAdd(uint64Type, editor.MakeId(), baseAddr, byteOffset));
+      rdcspv::Id ptr = ops.add(rdcspv::OpConvertUToPtr(uvec2PtrType, editor.MakeId(), sizeAddr));
+
+      rdcspv::MemoryAccessAndParamDatas memoryAccess;
+      memoryAccess.setAligned(sizeof(uint32_t));
+
+      rdcspv::Id vals = ops.add(rdcspv::OpCompositeConstruct(
+          uvec2Type, editor.MakeId(), {setOuts.vertexCount, setOuts.primitiveCount}));
+      ops.add(rdcspv::OpStore(ptr, vals, memoryAccess));
+
+      it = editor.AddOperations(it, ops);
+
+      setOuts.primitiveCount = zeroU32;
+      setOuts.vertexCount = zeroU32;
+
+      editor.PreModify(it);
+      it = setOuts;
+      editor.PostModify(it);
+
+      continue;
+    }
+
+    rdcspv::Id ptr;
+
+    if(it.opcode() == rdcspv::Op::Store)
+    {
+      rdcspv::OpStore store(it);
+      ptr = store.pointer;
+    }
+    else if(it.opcode() == rdcspv::Op::AccessChain || it.opcode() == rdcspv::Op::InBoundsAccessChain)
+    {
+      rdcspv::OpAccessChain chain(it);
+      chain.op = it.opcode();
+      ptr = chain.base;
+
+      const rdcspv::DataType &ptrDataType = editor.GetDataType(chain.resultType);
+
+      // any access chains that produce an output pointer should instead produce a BDA ptr
+      if(ptrDataType.pointerType.storage == rdcspv::StorageClass::Output)
+      {
+        chain.resultType = outputTypeReplacements[chain.resultType];
+
+        editor.PreModify(it);
+        it = chain;
+        editor.PostModify(it);
+      }
+    }
+
+    auto glob = outputGlobals.find(ptr);
+    if(glob != outputGlobals.end())
+    {
+      rdcspv::Id baseAddr =
+          editor.AddOperation(it, rdcspv::OpLoad(uint64Type, editor.MakeId(), outSlotAddr));
+      ++it;
+      rdcspv::Id offsettedAddr = editor.AddOperation(
+          it, rdcspv::OpIAdd(uint64Type, editor.MakeId(), baseAddr,
+                             editor.AddConstantDeferred<uint64_t>(glob->second.offset)));
+      ++it;
+      ptr = editor.AddOperation(
+          it, rdcspv::OpConvertUToPtr(outputTypeReplacements[editor.GetIDType(ptr)],
+                                      editor.MakeId(), offsettedAddr));
+      ++it;
+
+      if(it.opcode() == rdcspv::Op::Store)
+      {
+        rdcspv::OpStore store(it);
+        store.pointer = ptr;
+
+        editor.PreModify(it);
+        it = store;
+        editor.PostModify(it);
+      }
+      else if(it.opcode() == rdcspv::Op::AccessChain || it.opcode() == rdcspv::Op::InBoundsAccessChain)
+      {
+        rdcspv::OpAccessChain chain(it);
+        chain.op = it.opcode();
+        chain.base = ptr;
+
+        editor.PreModify(it);
+        it = chain;
+        editor.PostModify(it);
+      }
+    }
+
+    if(it.opcode() == rdcspv::Op::Store)
+    {
+      rdcspv::OpStore store(it);
+
+      const rdcspv::DataType &ptrDataType = editor.GetDataType(editor.GetIDType(ptr));
+
+      // any OpStores to BDA pointers should have suitable alignment defined. Note that this store
+      // may not be one we patched above so we do this independently (though in many cases, it will
+      // be the one we patched above).
+      if(ptrDataType.pointerType.storage == rdcspv::StorageClass::PhysicalStorageBuffer)
+      {
+        if(editor.GetDataType(editor.GetIDType(store.object)).scalar().type == rdcspv::Op::TypeBool)
+        {
+          store.object = editor.AddOperation(
+              it, rdcspv::OpSelect(uint32Type, editor.MakeId(), store.object, oneU32, zeroU32));
+          ++it;
+        }
+
+        if(!(store.memoryAccess.flags & rdcspv::MemoryAccess::Aligned))
+        {
+          const rdcspv::DataType &pointeeDataType = editor.GetDataType(ptrDataType.InnerType());
+
+          // for structs, we align them to 16 bytes, scalar/vector types are aligned to the scalar size
+          if(pointeeDataType.scalar().type == rdcspv::Op::Max)
+            store.memoryAccess.setAligned(16);
+          else
+            store.memoryAccess.setAligned(VarTypeByteSize(pointeeDataType.scalar().Type()));
+
+          // remove and re-add as this may be larger than before
+          editor.Remove(it);
+          editor.AddOperation(it, store);
+        }
+      }
+    }
+  }
+}
+
 void VulkanReplay::ClearPostVSCache()
 {
   VkDevice dev = m_Device;
@@ -1497,6 +2816,1249 @@ void VulkanReplay::ClearPostVSCache()
   m_PostVS.Data.clear();
 }
 
+void VulkanReplay::FetchMeshOut(uint32_t eventId, VulkanRenderState &state)
+{
+  VulkanCreationInfo &creationInfo = m_pDriver->m_CreationInfo;
+
+  ActionDescription action = *m_pDriver->GetAction(eventId);
+
+  // for indirect dispatches, fetch up to date dispatch sizes in case they're non-deterministic
+  if(action.flags & ActionFlags::Indirect)
+  {
+    uint32_t chunkIdx = action.events.back().chunkIndex;
+
+    const SDFile *file = GetStructuredFile();
+
+    // it doesn't matter if this is an indirect sub command or an inlined 1-draw non-indirect count,
+    // either way the 'offset' is valid - either from the start, or updated for this particular draw
+    // when we originally patched (and fortunately that part doesn't change).
+    if(chunkIdx < file->chunks.size())
+    {
+      const SDChunk *chunk = file->chunks[chunkIdx];
+
+      ResourceId buf = chunk->FindChild("buffer")->AsResourceId();
+      uint64_t offs = chunk->FindChild("offset")->AsUInt64();
+
+      buf = GetResourceManager()->GetLiveID(buf);
+
+      bytebuf dispatchArgs;
+      GetBufferData(buf, offs, sizeof(VkDrawMeshTasksIndirectCommandEXT), dispatchArgs);
+
+      if(dispatchArgs.size() >= sizeof(VkDrawMeshTasksIndirectCommandEXT))
+      {
+        VkDrawMeshTasksIndirectCommandEXT *meshArgs =
+            (VkDrawMeshTasksIndirectCommandEXT *)dispatchArgs.data();
+
+        action.dispatchDimension[0] = meshArgs->groupCountX;
+        action.dispatchDimension[1] = meshArgs->groupCountY;
+        action.dispatchDimension[2] = meshArgs->groupCountZ;
+      }
+    }
+  }
+
+  uint32_t totalNumMeshlets =
+      action.dispatchDimension[0] * action.dispatchDimension[1] * action.dispatchDimension[2];
+
+  const VulkanCreationInfo::Pipeline &pipeInfo = creationInfo.m_Pipeline[state.graphics.pipeline];
+
+  const VulkanCreationInfo::Pipeline::Shader &meshShad = pipeInfo.shaders[7];
+
+  const VulkanCreationInfo::ShaderModule &meshInfo = creationInfo.m_ShaderModule[meshShad.module];
+  ShaderReflection *meshrefl = meshShad.refl;
+
+  VulkanPostVSData &ret = m_PostVS.Data[eventId];
+
+  // set defaults so that we don't try to fetch this output again if something goes wrong and the
+  // same event is selected again
+  {
+    ret.meshout.buf = VK_NULL_HANDLE;
+    ret.meshout.bufmem = VK_NULL_HANDLE;
+    ret.meshout.instStride = 0;
+    ret.meshout.vertStride = 0;
+    ret.meshout.numViews = 1;
+    ret.meshout.nearPlane = 0.0f;
+    ret.meshout.farPlane = 0.0f;
+    ret.meshout.useIndices = false;
+    ret.meshout.hasPosOut = false;
+    ret.meshout.flipY = false;
+    ret.meshout.idxbuf = VK_NULL_HANDLE;
+    ret.meshout.idxbufmem = VK_NULL_HANDLE;
+
+    ret.meshout.topo = meshShad.refl->outputTopology;
+
+    ret.taskout = ret.meshout;
+  }
+
+  if(meshShad.patchData->invalidTaskPayload)
+  {
+    ret.meshout.status = ret.taskout.status = "Invalid task payload, likely generated by dxc bug";
+    return;
+  }
+
+  if(meshrefl->outputSignature.empty())
+  {
+    ret.meshout.status = "mesh shader has no declared outputs";
+    return;
+  }
+
+  if(!m_pDriver->GetExtensions(NULL).ext_KHR_buffer_device_address ||
+     Vulkan_Debug_DisableBufferDeviceAddress())
+  {
+    ret.meshout.status =
+        "KHR_buffer_device_address extension not available, can't fetch mesh shader output";
+    return;
+  }
+
+  if(!m_pDriver->GetExtensions(NULL).ext_EXT_scalar_block_layout)
+  {
+    ret.meshout.status =
+        "EXT_scalar_block_layout extension not available, can't fetch mesh shader output";
+    return;
+  }
+
+  if(!m_pDriver->GetDeviceEnabledFeatures().shaderInt64)
+  {
+    ret.meshout.status = "int64 device feature not available, can't fetch mesh shader output";
+    return;
+  }
+
+  VkGraphicsPipelineCreateInfo pipeCreateInfo;
+
+  // get pipeline create info
+  m_pDriver->GetShaderCache()->MakeGraphicsPipelineInfo(pipeCreateInfo, state.graphics.pipeline);
+
+  uint32_t bufSpecConstant = 0;
+
+  bytebuf meshSpecData;
+  rdcarray<VkSpecializationMapEntry> meshSpecEntries;
+  bytebuf taskSpecData;
+  rdcarray<VkSpecializationMapEntry> taskSpecEntries;
+
+  // copy over specialization info
+  for(uint32_t s = 0; s < pipeCreateInfo.stageCount; s++)
+  {
+    if(pipeCreateInfo.pStages[s].stage == VK_SHADER_STAGE_MESH_BIT_EXT &&
+       pipeCreateInfo.pStages[s].pSpecializationInfo)
+    {
+      meshSpecData.append((const byte *)pipeCreateInfo.pStages[s].pSpecializationInfo->pData,
+                          pipeCreateInfo.pStages[s].pSpecializationInfo->dataSize);
+      meshSpecEntries.append(pipeCreateInfo.pStages[s].pSpecializationInfo->pMapEntries,
+                             pipeCreateInfo.pStages[s].pSpecializationInfo->mapEntryCount);
+    }
+    else if(pipeCreateInfo.pStages[s].stage == VK_SHADER_STAGE_TASK_BIT_EXT &&
+            pipeCreateInfo.pStages[s].pSpecializationInfo)
+    {
+      taskSpecData.append((const byte *)pipeCreateInfo.pStages[s].pSpecializationInfo->pData,
+                          pipeCreateInfo.pStages[s].pSpecializationInfo->dataSize);
+      taskSpecEntries.append(pipeCreateInfo.pStages[s].pSpecializationInfo->pMapEntries,
+                             pipeCreateInfo.pStages[s].pSpecializationInfo->mapEntryCount);
+    }
+  }
+
+  // don't overlap with existing pipeline constants
+  for(const VkSpecializationMapEntry &specConst : meshSpecEntries)
+    bufSpecConstant = RDCMAX(bufSpecConstant, specConst.constantID + 1);
+  for(const VkSpecializationMapEntry &specConst : taskSpecEntries)
+    bufSpecConstant = RDCMAX(bufSpecConstant, specConst.constantID + 1);
+
+  // forcibly set input assembly state to NULL, as AMD's driver still processes this and may crash
+  // if the contents are not sensible. Since this does nothing otherwise we don't make it conditional
+  pipeCreateInfo.pInputAssemblyState = NULL;
+
+  // use the load RP if an RP is specified
+  if(pipeCreateInfo.renderPass != VK_NULL_HANDLE)
+    pipeCreateInfo.renderPass =
+        creationInfo.m_RenderPass[GetResID(pipeCreateInfo.renderPass)].loadRPs[pipeCreateInfo.subpass];
+
+  const VkMemoryAllocateFlagsInfo memFlags = {
+      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      NULL,
+      VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+  };
+
+  // we go through the driver for all these creations since they need to be properly
+  // registered in order to be put in the partial replay state
+  VkResult vkr = VK_SUCCESS;
+  VkDevice dev = m_Device;
+
+  VkBuffer taskBuffer = VK_NULL_HANDLE, readbackTaskBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory taskMem = VK_NULL_HANDLE, readbackTaskMem = VK_NULL_HANDLE;
+
+  VkDeviceSize taskBufSize = 0;
+  uint32_t taskPayloadSize = 0;
+  VkDeviceAddress taskDataAddress = 0;
+
+  rdcarray<VulkanPostVSData::InstData> taskDispatchSizes;
+  const uint32_t totalNumTaskGroups = totalNumMeshlets;
+
+  // if we have a task shader, we fetch both outputs together as a necessary component.
+  // In order to properly pre-allocate the mesh output buffer we need to run the task shader, cache
+  // all of its payloads and mesh dispatches per-group, then run a dispatch for each task group that
+  // passes along the cached payloads. With a CPU sync point this ensures that any non-deterministic
+  // behaviour or ordering will remain consistent between both passes and still allow for the
+  // allocation after we know the average case. This is necessary because with task expansion the
+  // worst case buffer size could be massive
+  if(pipeInfo.shaders[(size_t)ShaderStage::Task].refl)
+  {
+    const VulkanCreationInfo::Pipeline::Shader &taskShad =
+        pipeInfo.shaders[(size_t)ShaderStage::Task];
+
+    if(taskShad.patchData->invalidTaskPayload)
+    {
+      ret.meshout.status = ret.taskout.status = "Invalid task payload, likely generated by dxc bug";
+      return;
+    }
+
+    const VulkanCreationInfo::ShaderModule &taskInfo = creationInfo.m_ShaderModule[taskShad.module];
+
+    rdcarray<uint32_t> taskSpirv = taskInfo.spirv.GetSPIRV();
+
+    if(!Vulkan_Debug_PostVSDumpDirPath().empty())
+      FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postts_before.spv", taskSpirv);
+
+    AddTaskShaderPayloadStores(taskShad.specialization, meshShad.entryPoint, bufSpecConstant + 1,
+                               taskSpirv, taskPayloadSize);
+
+    if(!Vulkan_Debug_PostVSDumpDirPath().empty())
+      FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postts_after.spv", taskSpirv);
+
+    {
+      // now that we know the stride, create buffer of sufficient size for the worst case (maximum
+      // generation) of the meshlets
+      VkBufferCreateInfo bufInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+
+      // we add an extra vec4u so that when feeding from this buffer we can load the oversized
+      // payload, read "out of bounds" into that padding with the extra uint offset, and then fix
+      // the uint offset with a composite insert
+      taskBufSize = bufInfo.size =
+          (taskPayloadSize + sizeof(Vec4u)) * totalNumTaskGroups + sizeof(Vec4u);
+
+      bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      bufInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      bufInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+      vkr = m_pDriver->vkCreateBuffer(dev, &bufInfo, NULL, &taskBuffer);
+      CheckVkResult(vkr);
+
+      bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+      vkr = m_pDriver->vkCreateBuffer(dev, &bufInfo, NULL, &readbackTaskBuffer);
+      CheckVkResult(vkr);
+
+      VkMemoryRequirements mrq = {0};
+      m_pDriver->vkGetBufferMemoryRequirements(dev, taskBuffer, &mrq);
+
+      VkMemoryAllocateInfo allocInfo = {
+          VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+          NULL,
+          mrq.size,
+          m_pDriver->GetGPULocalMemoryIndex(mrq.memoryTypeBits),
+      };
+
+      allocInfo.pNext = &memFlags;
+
+      vkr = m_pDriver->vkAllocateMemory(dev, &allocInfo, NULL, &taskMem);
+
+      if(vkr == VK_ERROR_OUT_OF_DEVICE_MEMORY || vkr == VK_ERROR_OUT_OF_HOST_MEMORY)
+      {
+        m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+        m_pDriver->vkDestroyBuffer(m_Device, readbackTaskBuffer, NULL);
+
+        RDCWARN("Failed to allocate %llu bytes for output", mrq.size);
+        ret.meshout.status = ret.taskout.status =
+            StringFormat::Fmt("Failed to allocate %llu bytes", mrq.size);
+        return;
+      }
+
+      CheckVkResult(vkr);
+
+      vkr = m_pDriver->vkBindBufferMemory(dev, taskBuffer, taskMem, 0);
+      CheckVkResult(vkr);
+
+      m_pDriver->vkGetBufferMemoryRequirements(dev, readbackTaskBuffer, &mrq);
+
+      allocInfo.pNext = NULL;
+      allocInfo.memoryTypeIndex = m_pDriver->GetReadbackMemoryIndex(mrq.memoryTypeBits);
+
+      vkr = m_pDriver->vkAllocateMemory(dev, &allocInfo, NULL, &readbackTaskMem);
+
+      if(vkr == VK_ERROR_OUT_OF_DEVICE_MEMORY || vkr == VK_ERROR_OUT_OF_HOST_MEMORY)
+      {
+        m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+        m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+        m_pDriver->vkDestroyBuffer(m_Device, readbackTaskBuffer, NULL);
+
+        RDCWARN("Failed to allocate %llu bytes for readback", mrq.size);
+        ret.meshout.status = ret.taskout.status =
+            StringFormat::Fmt("Failed to allocate %llu bytes", mrq.size);
+        return;
+      }
+
+      CheckVkResult(vkr);
+
+      vkr = m_pDriver->vkBindBufferMemory(dev, readbackTaskBuffer, readbackTaskMem, 0);
+      CheckVkResult(vkr);
+
+      // register address as specialisation constant
+
+      // ensure we're 64-bit aligned first
+      taskSpecData.resize(AlignUp(taskSpecData.size(), (size_t)8));
+
+      VkBufferDeviceAddressInfo getAddressInfo = {
+          VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+          NULL,
+          taskBuffer,
+      };
+
+      taskDataAddress = m_pDriver->vkGetBufferDeviceAddress(dev, &getAddressInfo);
+
+      VkSpecializationMapEntry entry;
+      entry.offset = (uint32_t)taskSpecData.size();
+      entry.constantID = bufSpecConstant + 1;
+      entry.size = sizeof(uint64_t);
+      taskSpecEntries.push_back(entry);
+      taskSpecData.append((const byte *)&taskDataAddress, sizeof(uint64_t));
+    }
+
+    VkSpecializationInfo taskSpecInfo = {};
+    taskSpecInfo.dataSize = taskSpecData.size();
+    taskSpecInfo.pData = taskSpecData.data();
+    taskSpecInfo.mapEntryCount = (uint32_t)taskSpecEntries.size();
+    taskSpecInfo.pMapEntries = taskSpecEntries.data();
+
+    // create mesh shader with modified code
+    VkShaderModuleCreateInfo moduleCreateInfo = {
+        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        NULL,
+        0,
+        taskSpirv.size() * sizeof(uint32_t),
+        taskSpirv.data(),
+    };
+
+    VkShaderModule taskModule;
+    vkr = m_pDriver->vkCreateShaderModule(dev, &moduleCreateInfo, NULL, &taskModule);
+    CheckVkResult(vkr);
+
+    for(uint32_t s = 0; s < pipeCreateInfo.stageCount; s++)
+    {
+      if(pipeCreateInfo.pStages[s].stage == VK_SHADER_STAGE_TASK_BIT_EXT)
+      {
+        VkPipelineShaderStageCreateInfo &taskStage =
+            (VkPipelineShaderStageCreateInfo &)pipeCreateInfo.pStages[s];
+        taskStage.module = taskModule;
+        taskStage.pSpecializationInfo = &taskSpecInfo;
+      }
+    }
+
+    // create new pipeline
+    VkPipeline taskPipe;
+    vkr = m_pDriver->vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipeCreateInfo, NULL,
+                                               &taskPipe);
+
+    // delete shader/shader module
+    m_pDriver->vkDestroyShaderModule(dev, taskModule, NULL);
+
+    if(vkr != VK_SUCCESS)
+    {
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkFreeMemory(m_Device, readbackTaskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackTaskBuffer, NULL);
+
+      ret.meshout.status = ret.taskout.status =
+          StringFormat::Fmt("Failed to create patched mesh shader pipeline: %s", ToStr(vkr).c_str());
+      RDCERR("%s", ret.meshout.status.c_str());
+      return;
+    }
+
+    // make copy of state to draw from
+    VulkanRenderState modifiedstate = state;
+
+    // bind created pipeline to partial replay state
+    modifiedstate.graphics.pipeline = GetResID(taskPipe);
+
+    VkCommandBuffer cmd = m_pDriver->GetNextCmd();
+
+    if(cmd == VK_NULL_HANDLE)
+    {
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkFreeMemory(m_Device, readbackTaskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackTaskBuffer, NULL);
+
+      m_pDriver->vkDestroyPipeline(dev, taskPipe, NULL);
+      return;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                          VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+
+    vkr = ObjDisp(dev)->BeginCommandBuffer(Unwrap(cmd), &beginInfo);
+    CheckVkResult(vkr);
+
+    // fill destination buffer with 0s to ensure unwritten vertices have sane data
+    ObjDisp(dev)->CmdFillBuffer(Unwrap(cmd), Unwrap(taskBuffer), 0, taskBufSize, 0);
+
+    VkBufferMemoryBarrier taskbufbarrier = {
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        NULL,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED,
+    };
+
+    taskbufbarrier.buffer = Unwrap(taskBuffer);
+    taskbufbarrier.size = taskBufSize;
+
+    // wait for the above fill to finish.
+    DoPipelineBarrier(cmd, 1, &taskbufbarrier);
+
+    modifiedstate.subpassContents = VK_SUBPASS_CONTENTS_INLINE;
+    modifiedstate.dynamicRendering.flags &= ~VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+
+    // do single draw
+    modifiedstate.BeginRenderPassAndApplyState(m_pDriver, cmd, VulkanRenderState::BindGraphics,
+                                               false);
+
+    m_pDriver->ReplayDraw(cmd, action);
+
+    modifiedstate.EndRenderPass(cmd);
+
+    // wait for task output writing to finish
+    taskbufbarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    taskbufbarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    DoPipelineBarrier(cmd, 1, &taskbufbarrier);
+
+    VkBufferCopy bufcopy = {
+        0,
+        0,
+        taskBufSize,
+    };
+
+    // copy to readback buffer
+    ObjDisp(dev)->CmdCopyBuffer(Unwrap(cmd), Unwrap(taskBuffer), Unwrap(readbackTaskBuffer), 1,
+                                &bufcopy);
+
+    taskbufbarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    taskbufbarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    taskbufbarrier.buffer = Unwrap(readbackTaskBuffer);
+
+    // wait for copy to finish
+    DoPipelineBarrier(cmd, 1, &taskbufbarrier);
+
+    vkr = ObjDisp(dev)->EndCommandBuffer(Unwrap(cmd));
+    CheckVkResult(vkr);
+
+    // submit & flush so that we don't have to keep pipeline around for a while
+    m_pDriver->SubmitCmds();
+    m_pDriver->FlushQ();
+
+    // delete pipeline
+    m_pDriver->vkDestroyPipeline(dev, taskPipe, NULL);
+
+    // readback task data
+    const byte *taskData = NULL;
+    vkr = m_pDriver->vkMapMemory(m_Device, readbackTaskMem, 0, VK_WHOLE_SIZE, 0, (void **)&taskData);
+    CheckVkResult(vkr);
+    if(vkr != VK_SUCCESS || !taskData)
+    {
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkFreeMemory(m_Device, readbackTaskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackTaskBuffer, NULL);
+
+      if(!taskData)
+      {
+        RDCERR("Manually reporting failed memory map");
+        CheckVkResult(VK_ERROR_MEMORY_MAP_FAILED);
+      }
+      ret.meshout.status = ret.taskout.status = "Couldn't read back task output data from GPU";
+      return;
+    }
+
+    VkMappedMemoryRange range = {
+        VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, readbackTaskMem, 0, VK_WHOLE_SIZE,
+    };
+
+    vkr = m_pDriver->vkInvalidateMappedMemoryRanges(m_Device, 1, &range);
+    CheckVkResult(vkr);
+
+    totalNumMeshlets = 0;
+    const byte *taskDataBegin = taskData;
+
+    cmd = m_pDriver->GetNextCmd();
+
+    if(cmd == VK_NULL_HANDLE)
+    {
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkFreeMemory(m_Device, readbackTaskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackTaskBuffer, NULL);
+      return;
+    }
+
+    vkr = ObjDisp(dev)->BeginCommandBuffer(Unwrap(cmd), &beginInfo);
+    CheckVkResult(vkr);
+
+    for(uint32_t taskGroup = 0; taskGroup < totalNumTaskGroups; taskGroup++)
+    {
+      Vec4u meshDispatchSize = *(Vec4u *)taskData;
+      RDCASSERT(meshDispatchSize.y <= 0xffff);
+      RDCASSERT(meshDispatchSize.z <= 0xffff);
+
+      // while we're going, we record writes into the real buffer with the cumulative sizes. This
+      // should in theory be better than updating it via a buffer copy since the count should be
+      // much smaller than the payload
+      ObjDisp(dev)->CmdUpdateBuffer(Unwrap(cmd), Unwrap(taskBuffer),
+                                    taskData - taskDataBegin + offsetof(Vec4u, w), 4,
+                                    &totalNumMeshlets);
+
+      totalNumMeshlets += meshDispatchSize.x * meshDispatchSize.y * meshDispatchSize.z;
+
+      VulkanPostVSData::InstData i;
+      i.taskDispatchSizeX = meshDispatchSize.x;
+      i.taskDispatchSizeYZ.y = meshDispatchSize.y & 0xffff;
+      i.taskDispatchSizeYZ.z = meshDispatchSize.z & 0xffff;
+      taskDispatchSizes.push_back(i);
+
+      taskData += sizeof(Vec4u) + taskPayloadSize;
+    }
+
+    m_pDriver->vkUnmapMemory(m_Device, readbackTaskMem);
+
+    taskbufbarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    taskbufbarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    taskbufbarrier.buffer = Unwrap(taskBuffer);
+
+    // wait for copy to finish
+    DoPipelineBarrier(cmd, 1, &taskbufbarrier);
+
+    vkr = ObjDisp(dev)->EndCommandBuffer(Unwrap(cmd));
+    CheckVkResult(vkr);
+  }
+
+  // clean up temporary memories
+  m_pDriver->vkDestroyBuffer(m_Device, readbackTaskBuffer, NULL);
+  m_pDriver->vkFreeMemory(m_Device, readbackTaskMem, NULL);
+
+  VkBuffer meshBuffer = VK_NULL_HANDLE, readbackBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory meshMem = VK_NULL_HANDLE, readbackMem = VK_NULL_HANDLE;
+
+  VkDeviceSize bufSize = 0;
+
+  uint32_t numViews = 1;
+
+  if(state.dynamicRendering.active)
+  {
+    numViews = RDCMAX(numViews, Log2Ceil(state.dynamicRendering.viewMask + 1));
+  }
+  else
+  {
+    const VulkanCreationInfo::RenderPass &rp = creationInfo.m_RenderPass[state.GetRenderPass()];
+
+    if(state.subpass < rp.subpasses.size())
+    {
+      numViews = RDCMAX(numViews, (uint32_t)rp.subpasses[state.subpass].multiviews.size());
+    }
+    else
+    {
+      RDCERR("Subpass is out of bounds to renderpass creation info");
+    }
+  }
+
+  rdcarray<uint32_t> modSpirv = meshInfo.spirv.GetSPIRV();
+
+  if(!Vulkan_Debug_PostVSDumpDirPath().empty())
+    FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postms_before.spv", modSpirv);
+
+  OutMeshletLayout layout;
+
+  AddMeshShaderOutputStores(*meshrefl, meshShad.specialization, *meshShad.patchData,
+                            meshShad.entryPoint, bufSpecConstant, modSpirv, taskDataAddress != 0,
+                            layout);
+
+  if(!Vulkan_Debug_PostVSDumpDirPath().empty())
+    FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postms_after.spv", modSpirv);
+
+  if(totalNumMeshlets > 0)
+  {
+    // now that we know the stride, create buffer of sufficient size for the worst case (maximum
+    // generation) of the meshlets
+    VkBufferCreateInfo bufInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+
+    bufSize = bufInfo.size = layout.meshletByteSize * totalNumMeshlets;
+
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+    vkr = m_pDriver->vkCreateBuffer(dev, &bufInfo, NULL, &meshBuffer);
+    CheckVkResult(vkr);
+
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    vkr = m_pDriver->vkCreateBuffer(dev, &bufInfo, NULL, &readbackBuffer);
+    CheckVkResult(vkr);
+
+    VkMemoryRequirements mrq = {0};
+    m_pDriver->vkGetBufferMemoryRequirements(dev, meshBuffer, &mrq);
+
+    VkMemoryAllocateInfo allocInfo = {
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        NULL,
+        mrq.size,
+        m_pDriver->GetGPULocalMemoryIndex(mrq.memoryTypeBits),
+    };
+
+    allocInfo.pNext = &memFlags;
+
+    vkr = m_pDriver->vkAllocateMemory(dev, &allocInfo, NULL, &meshMem);
+
+    if(vkr == VK_ERROR_OUT_OF_DEVICE_MEMORY || vkr == VK_ERROR_OUT_OF_HOST_MEMORY)
+    {
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackBuffer, NULL);
+
+      RDCWARN("Failed to allocate %llu bytes for output", mrq.size);
+      ret.meshout.status = StringFormat::Fmt("Failed to allocate %llu bytes", mrq.size);
+      return;
+    }
+
+    CheckVkResult(vkr);
+
+    vkr = m_pDriver->vkBindBufferMemory(dev, meshBuffer, meshMem, 0);
+    CheckVkResult(vkr);
+
+    m_pDriver->vkGetBufferMemoryRequirements(dev, readbackBuffer, &mrq);
+
+    allocInfo.pNext = NULL;
+    allocInfo.memoryTypeIndex = m_pDriver->GetReadbackMemoryIndex(mrq.memoryTypeBits);
+
+    vkr = m_pDriver->vkAllocateMemory(dev, &allocInfo, NULL, &readbackMem);
+
+    if(vkr == VK_ERROR_OUT_OF_DEVICE_MEMORY || vkr == VK_ERROR_OUT_OF_HOST_MEMORY)
+    {
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+      m_pDriver->vkFreeMemory(m_Device, meshMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackBuffer, NULL);
+
+      RDCWARN("Failed to allocate %llu bytes for readback", mrq.size);
+      ret.meshout.status = StringFormat::Fmt("Failed to allocate %llu bytes", mrq.size);
+      return;
+    }
+
+    CheckVkResult(vkr);
+
+    vkr = m_pDriver->vkBindBufferMemory(dev, readbackBuffer, readbackMem, 0);
+    CheckVkResult(vkr);
+
+    // register address as specialisation constant
+
+    // ensure we're 64-bit aligned first
+    meshSpecData.resize(AlignUp(meshSpecData.size(), (size_t)8));
+
+    VkBufferDeviceAddressInfo getAddressInfo = {
+        VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        NULL,
+        meshBuffer,
+    };
+
+    VkDeviceAddress address = m_pDriver->vkGetBufferDeviceAddress(dev, &getAddressInfo);
+
+    VkSpecializationMapEntry entry;
+    entry.offset = (uint32_t)meshSpecData.size();
+    entry.constantID = bufSpecConstant;
+    entry.size = sizeof(uint64_t);
+    meshSpecEntries.push_back(entry);
+    meshSpecData.append((const byte *)&address, sizeof(uint64_t));
+  }
+
+  VkSpecializationInfo meshSpecInfo = {};
+  meshSpecInfo.dataSize = meshSpecData.size();
+  meshSpecInfo.pData = meshSpecData.data();
+  meshSpecInfo.mapEntryCount = (uint32_t)meshSpecEntries.size();
+  meshSpecInfo.pMapEntries = meshSpecEntries.data();
+
+  VkSpecializationInfo taskSpecInfo = {};
+  taskSpecInfo.dataSize = taskSpecData.size();
+  taskSpecInfo.pData = taskSpecData.data();
+  taskSpecInfo.mapEntryCount = (uint32_t)taskSpecEntries.size();
+  taskSpecInfo.pMapEntries = taskSpecEntries.data();
+
+  // create mesh shader with modified code
+  VkShaderModuleCreateInfo moduleCreateInfo = {
+      VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL,         0,
+      modSpirv.size() * sizeof(uint32_t),          &modSpirv[0],
+  };
+
+  VkShaderModule module, taskFeedModule = VK_NULL_HANDLE;
+  vkr = m_pDriver->vkCreateShaderModule(dev, &moduleCreateInfo, NULL, &module);
+  CheckVkResult(vkr);
+
+  if(taskDataAddress != 0)
+  {
+    const VulkanCreationInfo::Pipeline::Shader &taskShad =
+        pipeInfo.shaders[(size_t)ShaderStage::Task];
+
+    const VulkanCreationInfo::ShaderModule &taskInfo = creationInfo.m_ShaderModule[taskShad.module];
+
+    modSpirv = taskInfo.spirv.GetSPIRV();
+
+    ConvertToFixedTaskFeeder(taskShad.specialization, taskShad.entryPoint, bufSpecConstant + 1,
+                             taskPayloadSize, modSpirv);
+
+    if(!Vulkan_Debug_PostVSDumpDirPath().empty())
+      FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postts_feeder.spv", modSpirv);
+
+    moduleCreateInfo.pCode = modSpirv.data();
+    moduleCreateInfo.codeSize = modSpirv.byteSize();
+
+    vkr = m_pDriver->vkCreateShaderModule(dev, &moduleCreateInfo, NULL, &taskFeedModule);
+    CheckVkResult(vkr);
+  }
+
+  for(uint32_t s = 0; s < pipeCreateInfo.stageCount; s++)
+  {
+    if(pipeCreateInfo.pStages[s].stage == VK_SHADER_STAGE_MESH_BIT_EXT)
+    {
+      VkPipelineShaderStageCreateInfo &meshStage =
+          (VkPipelineShaderStageCreateInfo &)pipeCreateInfo.pStages[s];
+      meshStage.module = module;
+      meshStage.pSpecializationInfo = &meshSpecInfo;
+    }
+    else if(pipeCreateInfo.pStages[s].stage == VK_SHADER_STAGE_TASK_BIT_EXT)
+    {
+      VkPipelineShaderStageCreateInfo &taskStage =
+          (VkPipelineShaderStageCreateInfo &)pipeCreateInfo.pStages[s];
+      taskStage.module = taskFeedModule;
+      taskStage.pSpecializationInfo = &taskSpecInfo;
+    }
+  }
+
+  // create new pipeline
+  VkPipeline pipe;
+  vkr = m_pDriver->vkCreateGraphicsPipelines(m_Device, VK_NULL_HANDLE, 1, &pipeCreateInfo, NULL,
+                                             &pipe);
+
+  // delete shader/shader module
+  m_pDriver->vkDestroyShaderModule(dev, module, NULL);
+
+  // delete shader/shader module
+  m_pDriver->vkDestroyShaderModule(dev, taskFeedModule, NULL);
+
+  if(vkr != VK_SUCCESS)
+  {
+    m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+    m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+    m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+    m_pDriver->vkFreeMemory(m_Device, meshMem, NULL);
+    m_pDriver->vkDestroyBuffer(m_Device, readbackBuffer, NULL);
+    m_pDriver->vkFreeMemory(m_Device, readbackMem, NULL);
+
+    ret.meshout.status =
+        StringFormat::Fmt("Failed to create patched mesh shader pipeline: %s", ToStr(vkr).c_str());
+    RDCERR("%s", ret.meshout.status.c_str());
+    return;
+  }
+
+  // make copy of state to draw from
+  VulkanRenderState modifiedstate = state;
+
+  // bind created pipeline to partial replay state
+  modifiedstate.graphics.pipeline = GetResID(pipe);
+
+  if(totalNumMeshlets > 0)
+  {
+    VkCommandBuffer cmd = m_pDriver->GetNextCmd();
+
+    if(cmd == VK_NULL_HANDLE)
+    {
+      m_pDriver->vkDestroyPipeline(dev, pipe, NULL);
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+      m_pDriver->vkFreeMemory(m_Device, meshMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackBuffer, NULL);
+      m_pDriver->vkFreeMemory(m_Device, readbackMem, NULL);
+
+      return;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                          VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+
+    vkr = ObjDisp(dev)->BeginCommandBuffer(Unwrap(cmd), &beginInfo);
+    CheckVkResult(vkr);
+
+    // fill destination buffer with 0s to ensure unwritten vertices have sane data
+    ObjDisp(dev)->CmdFillBuffer(Unwrap(cmd), Unwrap(meshBuffer), 0, bufSize, 0);
+
+    VkBufferMemoryBarrier meshbufbarrier = {
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        NULL,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED,
+    };
+
+    meshbufbarrier.buffer = Unwrap(meshBuffer);
+    meshbufbarrier.size = bufSize;
+
+    // wait for the above fill to finish.
+    DoPipelineBarrier(cmd, 1, &meshbufbarrier);
+
+    modifiedstate.subpassContents = VK_SUBPASS_CONTENTS_INLINE;
+    modifiedstate.dynamicRendering.flags &= ~VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+
+    // do single draw
+    modifiedstate.BeginRenderPassAndApplyState(m_pDriver, cmd, VulkanRenderState::BindGraphics,
+                                               false);
+
+    m_pDriver->ReplayDraw(cmd, action);
+
+    modifiedstate.EndRenderPass(cmd);
+
+    // wait for mesh output writing to finish
+    meshbufbarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    meshbufbarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    DoPipelineBarrier(cmd, 1, &meshbufbarrier);
+
+    VkBufferCopy bufcopy = {
+        0,
+        0,
+        bufSize,
+    };
+
+    // copy to readback buffer
+    ObjDisp(dev)->CmdCopyBuffer(Unwrap(cmd), Unwrap(meshBuffer), Unwrap(readbackBuffer), 1, &bufcopy);
+
+    meshbufbarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    meshbufbarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    meshbufbarrier.buffer = Unwrap(readbackBuffer);
+
+    // wait for copy to finish
+    DoPipelineBarrier(cmd, 1, &meshbufbarrier);
+
+    vkr = ObjDisp(dev)->EndCommandBuffer(Unwrap(cmd));
+    CheckVkResult(vkr);
+
+    // submit & flush so that we don't have to keep pipeline around for a while
+    m_pDriver->SubmitCmds();
+    m_pDriver->FlushQ();
+  }
+
+  // delete pipeline
+  m_pDriver->vkDestroyPipeline(dev, pipe, NULL);
+
+  rdcarray<VulkanPostVSData::InstData> meshletOffsets;
+
+  uint32_t baseIndex = 0;
+
+  rdcarray<uint32_t> rebasedIndices;
+  bytebuf compactedVertices;
+
+  float nearp = 0.1f;
+  float farp = 100.0f;
+
+  uint32_t totalVerts = 0, totalPrims = 0;
+  uint32_t totalVertStride = 0;
+  uint32_t totalPrimStride = 0;
+
+  if(totalNumMeshlets > 0)
+  {
+    // readback mesh data
+    const byte *meshletData = NULL;
+    vkr = m_pDriver->vkMapMemory(m_Device, readbackMem, 0, VK_WHOLE_SIZE, 0, (void **)&meshletData);
+    CheckVkResult(vkr);
+    if(vkr != VK_SUCCESS || !meshletData)
+    {
+      if(!meshletData)
+      {
+        RDCERR("Manually reporting failed memory map");
+        CheckVkResult(VK_ERROR_MEMORY_MAP_FAILED);
+      }
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+      m_pDriver->vkFreeMemory(m_Device, meshMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackBuffer, NULL);
+      m_pDriver->vkFreeMemory(m_Device, readbackMem, NULL);
+      ret.meshout.status = "Couldn't read back mesh output data from GPU";
+      return;
+    }
+
+    VkMappedMemoryRange range = {
+        VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, readbackMem, 0, VK_WHOLE_SIZE,
+    };
+
+    vkr = m_pDriver->vkInvalidateMappedMemoryRanges(m_Device, 1, &range);
+    CheckVkResult(vkr);
+
+    // do a super quick sum of the number of verts and prims
+    for(uint32_t m = 0; m < totalNumMeshlets; m++)
+    {
+      Vec4u *counts = (Vec4u *)(meshletData + m * layout.meshletByteSize);
+      totalVerts += counts->x;
+      totalPrims += counts->y;
+    }
+
+    if(totalPrims == 0)
+    {
+      m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+      m_pDriver->vkFreeMemory(m_Device, meshMem, NULL);
+      m_pDriver->vkDestroyBuffer(m_Device, readbackBuffer, NULL);
+      m_pDriver->vkFreeMemory(m_Device, readbackMem, NULL);
+      ret.meshout.status = "No mesh output data generated by GPU";
+      return;
+    }
+
+    for(size_t o = 0; o < layout.sigLocations.size(); o++)
+    {
+      if(meshrefl->outputSignature[o].systemValue == ShaderBuiltin::OutputIndices)
+        continue;
+
+      const SigParameter &sig = meshrefl->outputSignature[o];
+      const uint32_t byteSize = VarTypeByteSize(sig.varType) * sig.compCount;
+
+      if(meshrefl->outputSignature[o].perPrimitiveRate)
+        totalPrimStride += byteSize;
+      else
+        totalVertStride += byteSize;
+    }
+
+    rdcarray<uint32_t> sigOffsets;
+    sigOffsets.resize(meshrefl->outputSignature.size());
+
+    {
+      uint32_t vertOffset = 0;
+      uint32_t primOffset = 0;
+      for(size_t o = 0; o < meshrefl->outputSignature.size(); o++)
+      {
+        const SigParameter &sig = meshrefl->outputSignature[o];
+        const uint32_t byteSize = VarTypeByteSize(sig.varType) * sig.compCount;
+
+        if(sig.systemValue == ShaderBuiltin::OutputIndices)
+          continue;
+
+        // move position to the front when compacting
+        if(sig.systemValue == ShaderBuiltin::Position)
+        {
+          RDCASSERT(!sig.perPrimitiveRate);
+          sigOffsets[o] = 0;
+          vertOffset += byteSize;
+
+          // shift all previous signatures up
+          for(size_t prev = 0; prev < o; prev++)
+            sigOffsets[prev] += byteSize;
+
+          continue;
+        }
+
+        if(sig.perPrimitiveRate)
+        {
+          sigOffsets[o] = primOffset;
+          primOffset += byteSize;
+        }
+        else
+        {
+          sigOffsets[o] = vertOffset;
+          vertOffset += byteSize;
+        }
+      }
+
+      RDCASSERT(vertOffset == totalVertStride);
+      RDCASSERT(primOffset == totalPrimStride);
+    }
+
+    // now we reorganise and compact the data.
+    // Some arrays will need to be decomposed (any non-struct outputs will be SoA and we want full
+    // AoS). We also rebase indices so they can be used as a contiguous index buffer
+
+    rebasedIndices.reserve(totalPrims * layout.indexCountPerPrim);
+    compactedVertices.resize(totalVerts * totalVertStride + totalPrims * totalPrimStride);
+
+    byte *vertData = compactedVertices.begin();
+    byte *primData = vertData + totalVerts * totalVertStride;
+
+    // calculate near/far as we're going
+    bool found = false;
+    Vec4f pos0;
+
+    for(uint32_t meshlet = 0; meshlet < totalNumMeshlets; meshlet++)
+    {
+      Vec4u *counts = (Vec4u *)meshletData;
+      const uint32_t numVerts = counts->x;
+      const uint32_t numPrims = counts->y;
+
+      const uint32_t padding = counts->z;
+      const uint32_t padding2 = counts->w;
+      RDCASSERTEQUAL(padding, 0);
+      RDCASSERTEQUAL(padding2, 0);
+
+      if(numVerts > layout.vertArrayLength)
+      {
+        RDCERR("Meshlet returned invalid vertex count %u with declared max %u", numVerts,
+               layout.vertArrayLength);
+        ret.meshout.status = "Got corrupted mesh output data from GPU";
+      }
+
+      if(numPrims > layout.primArrayLength)
+      {
+        RDCERR("Meshlet returned invalid primitive count %u with declared max %u", numPrims,
+               layout.primArrayLength);
+        ret.meshout.status = "Got corrupted mesh output data from GPU";
+      }
+
+      if(!ret.meshout.status.empty())
+      {
+        m_pDriver->vkFreeMemory(m_Device, taskMem, NULL);
+        m_pDriver->vkDestroyBuffer(m_Device, taskBuffer, NULL);
+        m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+        m_pDriver->vkFreeMemory(m_Device, meshMem, NULL);
+        m_pDriver->vkDestroyBuffer(m_Device, readbackBuffer, NULL);
+        m_pDriver->vkFreeMemory(m_Device, readbackMem, NULL);
+        return;
+      }
+
+      VulkanPostVSData::InstData meshletOffsetData;
+      meshletOffsetData.numIndices = numPrims * layout.indexCountPerPrim;
+      meshletOffsetData.numVerts = numVerts;
+      meshletOffsets.push_back(meshletOffsetData);
+
+      uint32_t *indices = (uint32_t *)(counts + 2);
+
+      for(uint32_t p = 0; p < numPrims; p++)
+      {
+        for(uint32_t idx = 0; idx < layout.indexCountPerPrim; idx++)
+          rebasedIndices.push_back(indices[p * layout.indexCountPerPrim + idx] + baseIndex);
+      }
+
+      for(size_t o = 0; o < meshrefl->outputSignature.size(); o++)
+      {
+        const SigParameter &sig = meshrefl->outputSignature[o];
+        const uint32_t byteSize = VarTypeByteSize(sig.varType) * sig.compCount;
+
+        if(sig.systemValue == ShaderBuiltin::OutputIndices)
+          continue;
+
+        if(meshrefl->outputSignature[o].perPrimitiveRate)
+        {
+          for(uint32_t p = 0; p < numPrims; p++)
+          {
+            memcpy(primData + sigOffsets[o] + totalPrimStride * p,
+                   meshletData + layout.sigLocations[o].offset + layout.sigLocations[o].stride * p,
+                   byteSize);
+          }
+        }
+        else
+        {
+          for(uint32_t v = 0; v < numVerts; v++)
+          {
+            byte *dst = vertData + sigOffsets[o] + totalVertStride * v;
+
+            memcpy(dst,
+                   meshletData + layout.sigLocations[o].offset + layout.sigLocations[o].stride * v,
+                   byteSize);
+
+            if(!found && sig.systemValue == ShaderBuiltin::Position)
+            {
+              Vec4f pos = *(Vec4f *)dst;
+
+              if(v == 0)
+              {
+                pos0 = pos;
+              }
+              else
+              {
+                DeriveNearFar(pos, pos0, nearp, farp, found);
+              }
+            }
+          }
+        }
+      }
+
+      baseIndex += numVerts;
+      meshletData += layout.meshletByteSize;
+      vertData += totalVertStride * numVerts;
+      primData += totalPrimStride * numPrims;
+    }
+
+    RDCASSERT(vertData == compactedVertices.begin() + totalVerts * totalVertStride);
+    RDCASSERT(primData == compactedVertices.end());
+
+    // if we didn't find any near/far plane, all z's and w's were identical.
+    // If the z is positive and w greater for the first element then we detect this projection as
+    // reversed z with infinite far plane
+    if(!found && pos0.z > 0.0f && pos0.w > pos0.z)
+    {
+      nearp = pos0.z;
+      farp = FLT_MAX;
+    }
+
+    m_pDriver->vkUnmapMemory(m_Device, readbackMem);
+  }
+
+  // clean up temporary memories
+  m_pDriver->vkDestroyBuffer(m_Device, readbackBuffer, NULL);
+  m_pDriver->vkFreeMemory(m_Device, readbackMem, NULL);
+
+  // clean up temporary memories
+  m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+  m_pDriver->vkFreeMemory(m_Device, meshMem, NULL);
+
+  // fill out m_PostVS.Data
+  if(layout.indexCountPerPrim == 3)
+    ret.meshout.topo = Topology::TriangleList;
+  else if(layout.indexCountPerPrim == 2)
+    ret.meshout.topo = Topology::LineList;
+  else if(layout.indexCountPerPrim == 1)
+    ret.meshout.topo = Topology::PointList;
+
+  if(totalNumMeshlets > 0)
+  {
+    VkBufferCreateInfo bufInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+
+    bufInfo.size = AlignUp16(compactedVertices.byteSize()) + rebasedIndices.byteSize();
+
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo.usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bufInfo.usage |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+
+    vkr = m_pDriver->vkCreateBuffer(dev, &bufInfo, NULL, &meshBuffer);
+    CheckVkResult(vkr);
+
+    VkMemoryRequirements mrq = {0};
+    m_pDriver->vkGetBufferMemoryRequirements(dev, meshBuffer, &mrq);
+
+    VkMemoryAllocateInfo allocInfo = {
+        VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        NULL,
+        mrq.size,
+        m_pDriver->GetUploadMemoryIndex(mrq.memoryTypeBits),
+    };
+
+    vkr = m_pDriver->vkAllocateMemory(dev, &allocInfo, NULL, &meshMem);
+
+    if(vkr == VK_ERROR_OUT_OF_DEVICE_MEMORY || vkr == VK_ERROR_OUT_OF_HOST_MEMORY)
+    {
+      m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+      RDCWARN("Failed to allocate %llu bytes for output", mrq.size);
+      ret.meshout.status = StringFormat::Fmt("Failed to allocate %llu bytes", mrq.size);
+      return;
+    }
+
+    CheckVkResult(vkr);
+
+    vkr = m_pDriver->vkBindBufferMemory(dev, meshBuffer, meshMem, 0);
+    CheckVkResult(vkr);
+
+    byte *uploadData = NULL;
+    vkr = m_pDriver->vkMapMemory(m_Device, meshMem, 0, VK_WHOLE_SIZE, 0, (void **)&uploadData);
+    CheckVkResult(vkr);
+    if(vkr != VK_SUCCESS || !uploadData)
+    {
+      m_pDriver->vkDestroyBuffer(m_Device, meshBuffer, NULL);
+      m_pDriver->vkFreeMemory(m_Device, meshMem, NULL);
+      if(!uploadData)
+      {
+        RDCERR("Manually reporting failed memory map");
+        CheckVkResult(VK_ERROR_MEMORY_MAP_FAILED);
+      }
+      ret.meshout.status = "Couldn't upload mesh output data to GPU";
+      return;
+    }
+
+    memcpy(uploadData, compactedVertices.data(), compactedVertices.byteSize());
+    memcpy(uploadData + AlignUp16(compactedVertices.byteSize()), rebasedIndices.data(),
+           rebasedIndices.byteSize());
+
+    VkMappedMemoryRange range = {
+        VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, meshMem, 0, VK_WHOLE_SIZE,
+    };
+
+    vkr = m_pDriver->vkFlushMappedMemoryRanges(m_Device, 1, &range);
+    CheckVkResult(vkr);
+
+    m_pDriver->vkUnmapMemory(m_Device, meshMem);
+  }
+
+  ret.taskout.buf = taskBuffer;
+  ret.taskout.bufmem = taskMem;
+
+  if(!pipeInfo.shaders[6].refl)
+    ret.taskout.status = "No task shader bound";
+
+  ret.taskout.baseVertex = 0;
+
+  // TODO handle multiple views
+  ret.taskout.numViews = 1;
+
+  ret.taskout.dispatchSize = action.dispatchDimension;
+
+  ret.taskout.vertStride = taskPayloadSize + sizeof(Vec4u);
+  ret.taskout.nearPlane = 0.0f;
+  ret.taskout.farPlane = 1.0f;
+
+  ret.taskout.primStride = 0;
+  ret.taskout.primOffset = 0;
+
+  ret.taskout.useIndices = false;
+  ret.taskout.numVerts = totalNumTaskGroups;
+  ret.taskout.instData = taskDispatchSizes;
+
+  ret.taskout.instStride = 0;
+
+  ret.taskout.idxbuf = VK_NULL_HANDLE;
+  ret.taskout.idxOffset = 0;
+  ret.taskout.idxbufmem = VK_NULL_HANDLE;
+  ret.taskout.idxFmt = VK_INDEX_TYPE_UINT32;
+
+  ret.taskout.hasPosOut = false;
+  ret.taskout.flipY = state.views.empty() ? false : state.views[0].height < 0.0f;
+
+  ret.meshout.buf = meshBuffer;
+  ret.meshout.bufmem = meshMem;
+
+  ret.meshout.baseVertex = 0;
+
+  // TODO handle multiple views
+  ret.meshout.numViews = 1;
+
+  ret.meshout.dispatchSize = action.dispatchDimension;
+
+  ret.meshout.vertStride = totalVertStride;
+  ret.meshout.nearPlane = nearp;
+  ret.meshout.farPlane = farp;
+
+  ret.meshout.primStride = totalPrimStride;
+  ret.meshout.primOffset = totalVertStride * totalVerts;
+
+  ret.meshout.useIndices = true;
+  ret.meshout.numVerts = totalPrims * layout.indexCountPerPrim;
+  ret.meshout.instData = meshletOffsets;
+
+  ret.meshout.instStride = 0;
+
+  ret.meshout.idxbuf = meshBuffer;
+  ret.meshout.idxOffset = AlignUp16(compactedVertices.byteSize());
+  ret.meshout.idxbufmem = VK_NULL_HANDLE;
+  ret.meshout.idxFmt = VK_INDEX_TYPE_UINT32;
+
+  ret.meshout.hasPosOut = true;
+  ret.meshout.flipY = state.views.empty() ? false : state.views[0].height < 0.0f;
+}
+
 void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
 {
   VulkanCreationInfo &creationInfo = m_pDriver->m_CreationInfo;
@@ -1515,7 +4077,6 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   // set defaults so that we don't try to fetch this output again if something goes wrong and the
   // same event is selected again
   {
-    ret.vsin.topo = state.primitiveTopology;
     ret.vsout.buf = VK_NULL_HANDLE;
     ret.vsout.bufmem = VK_NULL_HANDLE;
     ret.vsout.instStride = 0;
@@ -1529,7 +4090,7 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
     ret.vsout.idxbuf = VK_NULL_HANDLE;
     ret.vsout.idxbufmem = VK_NULL_HANDLE;
 
-    ret.vsout.topo = state.primitiveTopology;
+    ret.vsout.topo = MakePrimitiveTopology(state.primitiveTopology, state.patchControlPoints);
   }
 
   // no outputs from this shader? unexpected but theoretically possible (dummy VS before
@@ -2467,9 +5028,9 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   if(!Vulkan_Debug_PostVSDumpDirPath().empty())
     FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postvs_vert.spv", modSpirv);
 
-  ConvertToMeshOutputCompute(*refl, *pipeInfo.shaders[0].patchData,
-                             pipeInfo.shaders[0].entryPoint.c_str(), storageMode, attrInstDivisor,
-                             action, numVerts, numViews, baseSpecConstant, modSpirv, bufStride);
+  ConvertToMeshOutputCompute(*refl, *pipeInfo.shaders[0].patchData, pipeInfo.shaders[0].entryPoint,
+                             storageMode, attrInstDivisor, action, numVerts, numViews,
+                             baseSpecConstant, modSpirv, bufStride);
 
   if(!Vulkan_Debug_PostVSDumpDirPath().empty())
     FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postvs_comp.spv", modSpirv);
@@ -2812,50 +5373,14 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   // and position is the first value
 
   for(uint32_t i = 1;
-      refl->outputSignature[0].systemValue == ShaderBuiltin::Position && i < numVerts; i++)
+      refl->outputSignature[0].systemValue == ShaderBuiltin::Position && !found && i < numVerts; i++)
   {
-    //////////////////////////////////////////////////////////////////////////////////
-    // derive near/far, assuming a standard perspective matrix
-    //
-    // the transformation from from pre-projection {Z,W} to post-projection {Z,W}
-    // is linear. So we can say Zpost = Zpre*m + c . Here we assume Wpre = 1
-    // and we know Wpost = Zpre from the perspective matrix.
-    // we can then see from the perspective matrix that
-    // m = F/(F-N)
-    // c = -(F*N)/(F-N)
-    //
-    // with re-arranging and substitution, we then get:
-    // N = -c/m
-    // F = c/(1-m)
-    //
-    // so if we can derive m and c then we can determine N and F. We can do this with
-    // two points, and we pick them reasonably distinct on z to reduce floating-point
-    // error
-
     Vec4f *pos = (Vec4f *)(byteData + i * bufStride);
 
-    // skip invalid vertices (w=0)
-    if(pos->w != 0.0f && fabs(pos->w - pos0->w) > 0.01f && fabs(pos->z - pos0->z) > 0.01f)
-    {
-      Vec2f A(pos0->w, pos0->z);
-      Vec2f B(pos->w, pos->z);
+    DeriveNearFar(*pos, *pos0, nearp, farp, found);
 
-      float m = (B.y - A.y) / (B.x - A.x);
-      float c = B.y - B.x * m;
-
-      if(m == 1.0f || c == 0.0f)
-        continue;
-
-      if(-c / m <= 0.000001f)
-        continue;
-
-      nearp = -c / m;
-      farp = c / (1 - m);
-
-      found = true;
-
+    if(found)
       break;
-    }
   }
 
   // if we didn't find anything, all z's and w's were identical.
@@ -2880,8 +5405,7 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   }
 
   // fill out m_PostVS.Data
-  ret.vsin.topo = state.primitiveTopology;
-  ret.vsout.topo = state.primitiveTopology;
+  ret.vsout.topo = MakePrimitiveTopology(state.primitiveTopology, state.patchControlPoints);
   ret.vsout.buf = meshBuffer;
   ret.vsout.bufmem = meshMem;
 
@@ -2992,21 +5516,20 @@ void VulkanReplay::FetchTessGSOut(uint32_t eventId, VulkanRenderState &state)
   uint32_t primitiveMultiplier = 1;
 
   // transform feedback expands strips to lists
-  switch(pipeInfo.shaders[stageIndex].patchData->outTopo)
+  switch(lastRefl->outputTopology)
   {
-    case Topology::PointList: ret.gsout.topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+    case Topology::PointList: ret.gsout.topo = Topology::PointList; break;
     case Topology::LineList:
     case Topology::LineStrip:
-      ret.gsout.topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+      ret.gsout.topo = Topology::LineList;
       primitiveMultiplier = 2;
       break;
     default:
-      RDCERR("Unexpected output topology %s",
-             ToStr(pipeInfo.shaders[stageIndex].patchData->outTopo).c_str());
+      RDCERR("Unexpected output topology %s", ToStr(lastRefl->outputTopology).c_str());
       DELIBERATE_FALLTHROUGH();
     case Topology::TriangleList:
     case Topology::TriangleStrip:
-      ret.gsout.topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      ret.gsout.topo = Topology::TriangleList;
       primitiveMultiplier = 3;
       break;
   }
@@ -3411,50 +5934,10 @@ void VulkanReplay::FetchTessGSOut(uint32_t eventId, VulkanRenderState &state)
     if(readbackoffset == 0)
       memcpy(&pos0, data.data(), sizeof(pos0));
 
-    for(uint32_t i = 0; i < data.size() / xfbStride; i++)
+    for(uint32_t i = 0; !found && i < data.size() / xfbStride; i++)
     {
-      //////////////////////////////////////////////////////////////////////////////////
-      // derive near/far, assuming a standard perspective matrix
-      //
-      // the transformation from from pre-projection {Z,W} to post-projection {Z,W}
-      // is linear. So we can say Zpost = Zpre*m + c . Here we assume Wpre = 1
-      // and we know Wpost = Zpre from the perspective matrix.
-      // we can then see from the perspective matrix that
-      // m = F/(F-N)
-      // c = -(F*N)/(F-N)
-      //
-      // with re-arranging and substitution, we then get:
-      // N = -c/m
-      // F = c/(1-m)
-      //
-      // so if we can derive m and c then we can determine N and F. We can do this with
-      // two points, and we pick them reasonably distinct on z to reduce floating-point
-      // error
-
       Vec4f *pos = (Vec4f *)(data.data() + xfbStride * i);
-
-      // skip invalid vertices (w=0)
-      if(pos->w != 0.0f && fabs(pos->w - pos0.w) > 0.01f && fabs(pos->z - pos0.z) > 0.01f)
-      {
-        Vec2f A(pos0.w, pos0.z);
-        Vec2f B(pos->w, pos->z);
-
-        float m = (B.y - A.y) / (B.x - A.x);
-        float c = B.y - B.x * m;
-
-        if(m == 1.0f || c == 0.0f)
-          continue;
-
-        if(-c / m <= 0.000001f)
-          continue;
-
-        nearp = -c / m;
-        farp = c / (1 - m);
-
-        found = true;
-
-        break;
-      }
+      DeriveNearFar(*pos, pos0, nearp, farp, found);
     }
 
     if(found)
@@ -3535,9 +6018,10 @@ void VulkanReplay::InitPostVSBuffers(uint32_t eventId, VulkanRenderState state)
 
   const VulkanCreationInfo::Pipeline &pipeInfo = creationInfo.m_Pipeline[state.graphics.pipeline];
 
-  if(pipeInfo.shaders[0].module == ResourceId())
+  if(pipeInfo.shaders[size_t(ShaderStage::Vertex)].module == ResourceId() &&
+     pipeInfo.shaders[size_t(ShaderStage::Mesh)].module == ResourceId())
   {
-    ret.gsout.status = ret.vsout.status = "No vertex shader in pipeline";
+    ret.gsout.status = ret.vsout.status = "No vertex or mesh shader in pipeline";
     return;
   }
 
@@ -3546,6 +6030,12 @@ void VulkanReplay::InitPostVSBuffers(uint32_t eventId, VulkanRenderState state)
   if(action == NULL)
   {
     ret.gsout.status = ret.vsout.status = "Invalid draw";
+    return;
+  }
+
+  if(action->flags & ActionFlags::MeshDispatch)
+  {
+    FetchMeshOut(eventId, state);
     return;
   }
 
@@ -3594,18 +6084,18 @@ struct VulkanInitPostVSCallback : public VulkanActionCallback
     m_pDriver->SetActionCB(this);
   }
   ~VulkanInitPostVSCallback() { m_pDriver->SetActionCB(NULL); }
-  void PreDraw(uint32_t eid, VkCommandBuffer cmd)
+  void PreDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(m_Events.contains(eid))
       m_pDriver->GetReplay()->InitPostVSBuffers(eid, m_pDriver->GetCmdRenderState());
   }
 
-  bool PostDraw(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedraw(uint32_t eid, VkCommandBuffer cmd) {}
+  bool PostDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   // Dispatches don't rasterize, so do nothing
-  void PreDispatch(uint32_t eid, VkCommandBuffer cmd) {}
-  bool PostDispatch(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedispatch(uint32_t eid, VkCommandBuffer cmd) {}
+  void PreDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
+  bool PostDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   // Ditto copy/etc
   void PreMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   bool PostMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
@@ -3701,7 +6191,7 @@ MeshFormat VulkanReplay::GetPostVSBuffers(uint32_t eventId, uint32_t instID, uin
     ret.indexResourceId = ResourceId();
     ret.indexByteStride = 0;
   }
-  ret.indexByteOffset = 0;
+  ret.indexByteOffset = s.idxOffset;
   ret.baseVertex = s.baseVertex;
 
   if(s.buf != VK_NULL_HANDLE)
@@ -3724,7 +6214,7 @@ MeshFormat VulkanReplay::GetPostVSBuffers(uint32_t eventId, uint32_t instID, uin
 
   ret.showAlpha = false;
 
-  ret.topology = MakePrimitiveTopology(s.topo, 1);
+  ret.topology = s.topo;
   ret.numIndices = s.numVerts;
 
   ret.unproject = s.hasPosOut;
@@ -3732,7 +6222,35 @@ MeshFormat VulkanReplay::GetPostVSBuffers(uint32_t eventId, uint32_t instID, uin
   ret.farPlane = s.farPlane;
   ret.flipY = s.flipY;
 
-  if(instID < s.instData.size())
+  if(action && (action->flags & ActionFlags::MeshDispatch))
+  {
+    ret.perPrimitiveStride = s.primStride;
+    ret.perPrimitiveOffset = s.primOffset;
+
+    ret.dispatchSize = s.dispatchSize;
+
+    if(stage == MeshDataStage::MeshOut)
+    {
+      ret.meshletSizes.resize(s.instData.size());
+      for(size_t i = 0; i < s.instData.size(); i++)
+        ret.meshletSizes[i] = {s.instData[i].numIndices, s.instData[i].numVerts};
+    }
+    else
+    {
+      // the buffer we're returning has the size vector. As long as the user respects our stride,
+      // offsetting the start will do the trick
+      ret.vertexByteOffset = sizeof(Vec4u);
+
+      ret.taskSizes.resize(s.instData.size());
+      for(size_t i = 0; i < s.instData.size(); i++)
+        ret.taskSizes[i] = {
+            s.instData[i].taskDispatchSizeX,
+            s.instData[i].taskDispatchSizeYZ.y,
+            s.instData[i].taskDispatchSizeYZ.z,
+        };
+    }
+  }
+  else if(instID < s.instData.size())
   {
     VulkanPostVSData::InstData inst = s.instData[instID];
 

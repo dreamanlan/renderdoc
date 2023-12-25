@@ -106,8 +106,18 @@ cbuffer MeshVertexCBuffer REG(b0)
   row_major float4x4 ModelViewProj;
 
   float2 SpriteSize;
-
   uint homogenousInput;
+  float vtxExploderSNorm;
+
+  float3 exploderCentre;
+  float exploderScale;    // Non-zero values imply use of the exploder visualisation.
+
+  uint vertMeshDisplayFormat;
+  uint meshletOffset;
+  uint meshletCount;
+  uint padding1;
+
+  uint4 meshletColours[12];
 };
 
 cbuffer MeshGeometryCBuffer REG(b0)
@@ -243,10 +253,17 @@ cbuffer DebugSampleOperation REG(b0)
 #define RESTYPE_DEPTH_STENCIL_MS 0x7
 #define RESTYPE_TEX2D_MS 0x9
 
+// first few match Visualisation enum
 #define MESHDISPLAY_SOLID 0x1
 #define MESHDISPLAY_FACELIT 0x2
 #define MESHDISPLAY_SECONDARY 0x3
-#define MESHDISPLAY_SECONDARY_ALPHA 0x4
+#define MESHDISPLAY_EXPLODE 0x4
+#define MESHDISPLAY_MESHLET 0x5
+
+// extra values below
+#define MESHDISPLAY_SECONDARY_ALPHA 0x6
+
+#define MAX_NUM_MESHLETS (512 * 1024)
 
 #define TEXDISPLAY_TYPEMASK 0xF
 #define TEXDISPLAY_NANS 0x0100

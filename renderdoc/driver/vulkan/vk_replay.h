@@ -158,15 +158,28 @@ struct VulkanPostVSData
 {
   struct InstData
   {
-    uint32_t numVerts = 0;
-    uint32_t bufOffset = 0;
+    union
+    {
+      uint32_t bufOffset;
+      uint32_t numIndices;
+      uint32_t taskDispatchSizeX;
+    };
+    union
+    {
+      uint32_t numVerts;
+      struct
+      {
+        uint16_t y;
+        uint16_t z;
+      } taskDispatchSizeYZ;
+    };
   };
 
   struct StageData
   {
     VkBuffer buf;
     VkDeviceMemory bufmem;
-    VkPrimitiveTopology topo;
+    Topology topo;
 
     int32_t baseVertex;
 
@@ -174,15 +187,22 @@ struct VulkanPostVSData
     uint32_t vertStride;
     uint32_t instStride;
 
-    // complex case - expansion per instance
+    // complex case - expansion per instance,
+    // also used for meshlet offsets and sizes
     rdcarray<InstData> instData;
+
+    uint32_t primStride = 0;
+    uint64_t primOffset = 0;
 
     uint32_t numViews;
 
     bool useIndices;
     VkBuffer idxbuf;
+    uint64_t idxOffset = 0;
     VkDeviceMemory idxbufmem;
     VkIndexType idxFmt;
+
+    rdcfixedarray<uint32_t, 3> dispatchSize;
 
     bool hasPosOut;
     bool flipY;
@@ -191,13 +211,14 @@ struct VulkanPostVSData
     float farPlane;
 
     rdcstr status;
-  } vsin, vsout, gsout;
+  } vsout, gsout, taskout, meshout;
 
   VulkanPostVSData()
   {
-    RDCEraseEl(vsin);
     RDCEraseEl(vsout);
     RDCEraseEl(gsout);
+    RDCEraseEl(taskout);
+    RDCEraseEl(meshout);
   }
 
   const StageData &GetStage(MeshDataStage type)
@@ -206,10 +227,14 @@ struct VulkanPostVSData
       return vsout;
     else if(type == MeshDataStage::GSOut)
       return gsout;
+    else if(type == MeshDataStage::TaskOut)
+      return taskout;
+    else if(type == MeshDataStage::MeshOut)
+      return meshout;
     else
       RDCERR("Unexpected mesh data stage!");
 
-    return vsin;
+    return vsout;
   }
 };
 
@@ -459,6 +484,7 @@ private:
 
   void FetchVSOut(uint32_t eventId, VulkanRenderState &state);
   void FetchTessGSOut(uint32_t eventId, VulkanRenderState &state);
+  void FetchMeshOut(uint32_t eventId, VulkanRenderState &state);
   void ClearPostVSCache();
 
   void RefreshDerivedReplacements();
@@ -646,10 +672,22 @@ private:
     VkPipelineLayout m_QuadResolvePipeLayout = VK_NULL_HANDLE;
     VkPipeline m_QuadResolvePipeline[8] = {VK_NULL_HANDLE};
 
+    VkDescriptorSetLayout m_DepthCopyDescSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_DepthCopyDescSet = VK_NULL_HANDLE;
+    VkPipelineLayout m_DepthCopyPipeLayout = VK_NULL_HANDLE;
+    VkPipeline m_DepthCopyPipeline[2][5];
+
+    VkPipelineLayout m_DepthResolvePipeLayout = VK_NULL_HANDLE;
+    VkPipeline m_DepthResolvePipeline[2][5];
+
+    GPUBuffer m_DummyMeshletSSBO;
     GPUBuffer m_TriSizeUBO;
     VkDescriptorSetLayout m_TriSizeDescSetLayout = VK_NULL_HANDLE;
     VkDescriptorSet m_TriSizeDescSet = VK_NULL_HANDLE;
     VkPipelineLayout m_TriSizePipeLayout = VK_NULL_HANDLE;
+
+    VkSampler m_PointSampler = VK_NULL_HANDLE;
+    VkFormat m_DefaultDepthStencilFormat;
   } m_Overlay;
 
   struct MeshRendering
@@ -658,6 +696,7 @@ private:
     void Destroy(WrappedVulkan *driver);
 
     GPUBuffer UBO;
+    GPUBuffer MeshletSSBO;
     GPUBuffer BBoxVB;
     GPUBuffer AxisFrustumVB;
 

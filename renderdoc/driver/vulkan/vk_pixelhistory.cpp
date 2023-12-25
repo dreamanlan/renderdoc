@@ -456,7 +456,8 @@ private:
             }
 
             // skip past any local variables
-            while(it.opcode() == rdcspv::Op::Variable)
+            while(it.opcode() == rdcspv::Op::Variable || it.opcode() == rdcspv::Op::Line ||
+                  it.opcode() == rdcspv::Op::NoLine)
               ++it;
 
             rdcspv::Id structPtr = editor.AddOperation(
@@ -827,11 +828,10 @@ protected:
     memcpy(stages.data(), pipeCreateInfo.pStages, stages.byteSize());
 
     EventFlags eventFlags = m_pDriver->GetEventFlags(eid);
-    VkShaderModule replacementShaders[5] = {};
+    VkShaderModule replacementShaders[NumShaderStages] = {};
 
     // Clean shaders
-    uint32_t numberOfStages = 5;
-    for(size_t i = 0; i < numberOfStages; i++)
+    for(size_t i = 0; i < NumShaderStages; i++)
     {
       if((eventFlags & PipeStageRWEventFlags(StageFromIndex(i))) != EventFlags::NoFlags)
         replacementShaders[i] = m_ShaderCache->GetShaderWithoutSideEffects(
@@ -1510,7 +1510,7 @@ struct VulkanOcclusionCallback : public VulkanPixelHistoryCallback
       m_pDriver->vkDestroyPipeline(m_pDriver->GetDev(), it->second, NULL);
   }
 
-  void PreDraw(uint32_t eid, VkCommandBuffer cmd)
+  void PreDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(!m_Events.contains(eid))
       return;
@@ -1534,11 +1534,11 @@ struct VulkanOcclusionCallback : public VulkanPixelHistoryCallback
                                                 false);
   }
 
-  bool PostDraw(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedraw(uint32_t eid, VkCommandBuffer cmd) {}
-  void PreDispatch(uint32_t eid, VkCommandBuffer cmd) { return; }
-  bool PostDispatch(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedispatch(uint32_t eid, VkCommandBuffer cmd) {}
+  bool PostDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
+  void PreDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return; }
+  bool PostDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   void PreMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return; }
   bool PostMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
   void PostRemisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
@@ -1652,7 +1652,7 @@ struct VulkanColorAndStencilCallback : public VulkanPixelHistoryCallback
     }
   }
 
-  void PreDraw(uint32_t eid, VkCommandBuffer cmd)
+  void PreDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(!m_Events.contains(eid) || !m_pDriver->IsCmdPrimary())
       return;
@@ -1731,7 +1731,7 @@ struct VulkanColorAndStencilCallback : public VulkanPixelHistoryCallback
       pipestate.BeginRenderPassAndApplyState(m_pDriver, cmd, VulkanRenderState::BindGraphics, true);
   }
 
-  bool PostDraw(uint32_t eid, VkCommandBuffer cmd)
+  bool PostDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(!m_Events.contains(eid) || !m_pDriver->IsCmdPrimary())
       return false;
@@ -1763,7 +1763,7 @@ struct VulkanColorAndStencilCallback : public VulkanPixelHistoryCallback
     return false;
   }
 
-  void PostRedraw(uint32_t eid, VkCommandBuffer cmd)
+  void PostRedraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     // nothing to do
   }
@@ -1869,14 +1869,14 @@ struct VulkanColorAndStencilCallback : public VulkanPixelHistoryCallback
           m_pDriver, cmd, VulkanRenderState::BindNone, true);
   }
 
-  void PreDispatch(uint32_t eid, VkCommandBuffer cmd)
+  void PreDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(!m_Events.contains(eid))
       return;
     size_t storeOffset = m_EventIndices.size() * sizeof(EventInfo);
     CopyPixel(eid, cmd, storeOffset, false);
   }
-  bool PostDispatch(uint32_t eid, VkCommandBuffer cmd)
+  bool PostDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(!m_Events.contains(eid))
       return false;
@@ -1885,7 +1885,7 @@ struct VulkanColorAndStencilCallback : public VulkanPixelHistoryCallback
     m_EventIndices.insert(std::make_pair(eid, m_EventIndices.size()));
     return false;
   }
-  void PostRedispatch(uint32_t eid, VkCommandBuffer cmd) {}
+  void PostRedispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   void PreMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(!m_Events.contains(eid))
@@ -1899,7 +1899,7 @@ struct VulkanColorAndStencilCallback : public VulkanPixelHistoryCallback
       }
       return;
     }
-    PreDispatch(eid, cmd);
+    PreDispatch(eid, flags, cmd);
   }
   bool PostMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
@@ -1923,7 +1923,7 @@ struct VulkanColorAndStencilCallback : public VulkanPixelHistoryCallback
       m_pDriver->GetCmdRenderState().FinishSuspendedRenderPass(cmd);
     }
 
-    bool ret = PostDispatch(eid, cmd);
+    bool ret = PostDispatch(eid, flags, cmd);
 
     if(flags & ActionFlags::BeginPass)
       m_pDriver->GetCmdRenderState().BeginRenderPassAndApplyState(
@@ -2146,7 +2146,7 @@ struct TestsFailedCallback : public VulkanPixelHistoryCallback
   }
 
   ~TestsFailedCallback() {}
-  void PreDraw(uint32_t eid, VkCommandBuffer cmd)
+  void PreDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(!m_Events.contains(eid))
       return;
@@ -2176,20 +2176,20 @@ struct TestsFailedCallback : public VulkanPixelHistoryCallback
                                                 false);
   }
 
-  bool PostDraw(uint32_t eid, VkCommandBuffer cmd) { return false; }
+  bool PostDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
   void AliasEvent(uint32_t primary, uint32_t alias)
   {
     // TODO: handle aliased events.
   }
 
-  void PostRedraw(uint32_t eid, VkCommandBuffer cmd)
+  void PostRedraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     // nothing to do
   }
 
-  void PreDispatch(uint32_t eid, VkCommandBuffer cmd) {}
-  bool PostDispatch(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedispatch(uint32_t eid, VkCommandBuffer cmd) {}
+  void PreDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
+  bool PostDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   void PreMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   bool PostMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
   void PostRemisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
@@ -2238,10 +2238,16 @@ struct TestsFailedCallback : public VulkanPixelHistoryCallback
   {
     auto it = m_OcclusionQueries.find(rdcpair<uint32_t, uint32_t>(eventId, test));
     if(it == m_OcclusionQueries.end())
+    {
       RDCERR("Can't locate occlusion query for event id %u and test flags %u", eventId, test);
+      return 0;
+    }
     if(it->second >= m_OcclusionResults.size())
+    {
       RDCERR("Event %u, occlusion index is %u, and the total # of occlusion query data %zu",
              eventId, it->second, m_OcclusionResults.size());
+      return 0;
+    }
     return m_OcclusionResults[it->second];
   }
 
@@ -2428,11 +2434,10 @@ private:
     const VulkanCreationInfo::Pipeline &p =
         m_pDriver->GetDebugManager()->GetPipelineInfo(basePipeline);
     EventFlags eventShaderFlags = m_pDriver->GetEventFlags(eid);
-    uint32_t numberOfStages = 5;
     rdcarray<VkShaderModule> replacementShaders;
-    replacementShaders.resize(numberOfStages);
+    replacementShaders.resize(NumShaderStages);
     // Replace fragment shader because it might have early fragments
-    for(size_t i = 0; i < numberOfStages; i++)
+    for(size_t i = 0; i < replacementShaders.size(); i++)
     {
       if(p.shaders[i].module == ResourceId())
         continue;
@@ -2701,7 +2706,7 @@ struct VulkanPixelHistoryPerFragmentCallback : VulkanPixelHistoryCallback
     VkPipeline postModPipe;
   };
 
-  void PreDraw(uint32_t eid, VkCommandBuffer cmd)
+  void PreDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(m_EventFragments.find(eid) == m_EventFragments.end())
       return;
@@ -3027,8 +3032,8 @@ struct VulkanPixelHistoryPerFragmentCallback : VulkanPixelHistoryCallback
     m_pDriver->GetCmdRenderState().BeginRenderPassAndApplyState(
         m_pDriver, cmd, VulkanRenderState::BindGraphics, true);
   }
-  bool PostDraw(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedraw(uint32_t eid, VkCommandBuffer cmd) {}
+  bool PostDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   // CreatePerFragmentPipelines for getting per fragment information.
   Pipelines CreatePerFragmentPipelines(ResourceId pipe, VkRenderPass rp, VkRenderPass origRpWithDepth,
                                        uint32_t eid, uint32_t fragmentIndex,
@@ -3098,11 +3103,10 @@ struct VulkanPixelHistoryPerFragmentCallback : VulkanPixelHistoryCallback
     memcpy(stages.data(), pipeCreateInfo.pStages, stages.byteSize());
 
     EventFlags eventFlags = m_pDriver->GetEventFlags(eid);
-    VkShaderModule replacementShaders[5] = {};
+    VkShaderModule replacementShaders[NumShaderStages] = {};
 
     // Clean shaders
-    uint32_t numberOfStages = 5;
-    for(size_t i = 0; i < numberOfStages; i++)
+    for(size_t i = 0; i < NumShaderStages; i++)
     {
       if((eventFlags & PipeStageRWEventFlags(StageFromIndex(i))) != EventFlags::NoFlags)
         replacementShaders[i] = m_ShaderCache->GetShaderWithoutSideEffects(
@@ -3193,12 +3197,18 @@ struct VulkanPixelHistoryPerFragmentCallback : VulkanPixelHistoryCallback
     stageCI.module = m_ShaderCache->GetPrimitiveIdShader(colorOutputIndex);
     stageCI.pName = "main";
     bool gsFound = false;
+    bool meshFound = false;
     bool fsFound = false;
     for(uint32_t i = 0; i < pipeCreateInfo.stageCount; i++)
     {
       if(stages[i].stage == VK_SHADER_STAGE_GEOMETRY_BIT)
       {
         gsFound = true;
+        break;
+      }
+      if(stages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT)
+      {
+        meshFound = true;
         break;
       }
       if(stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
@@ -3214,7 +3224,7 @@ struct VulkanPixelHistoryPerFragmentCallback : VulkanPixelHistoryCallback
       pipeCreateInfo.pStages = stages.data();
     }
 
-    if(!gsFound)
+    if(!gsFound && !meshFound)
     {
       vkr = m_pDriver->vkCreateGraphicsPipelines(m_pDriver->GetDev(), VK_NULL_HANDLE, 1,
                                                  &pipeCreateInfo, NULL, &pipes.primitiveIdPipe);
@@ -3230,9 +3240,9 @@ struct VulkanPixelHistoryPerFragmentCallback : VulkanPixelHistoryCallback
     return pipes;
   }
 
-  void PreDispatch(uint32_t eid, VkCommandBuffer cmd) {}
-  bool PostDispatch(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedispatch(uint32_t eid, VkCommandBuffer cmd) {}
+  void PreDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
+  bool PostDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   void PreMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   bool PostMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
   void PostRemisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
@@ -3291,7 +3301,7 @@ struct VulkanPixelHistoryDiscardedFragmentsCallback : VulkanPixelHistoryCallback
       m_pDriver->vkDestroyPipeline(m_pDriver->GetDev(), pipe, NULL);
   }
 
-  void PreDraw(uint32_t eid, VkCommandBuffer cmd)
+  void PreDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd)
   {
     if(m_Events.find(eid) == m_Events.end())
       return;
@@ -3372,11 +3382,11 @@ struct VulkanPixelHistoryDiscardedFragmentsCallback : VulkanPixelHistoryCallback
     return m_OcclusionResults[it->second] == 0;
   }
 
-  bool PostDraw(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedraw(uint32_t eid, VkCommandBuffer cmd) {}
-  void PreDispatch(uint32_t eid, VkCommandBuffer cmd) {}
-  bool PostDispatch(uint32_t eid, VkCommandBuffer cmd) { return false; }
-  void PostRedispatch(uint32_t eid, VkCommandBuffer cmd) {}
+  bool PostDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
+  void PreDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
+  bool PostDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
+  void PostRedispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   void PreMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
   bool PostMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) { return false; }
   void PostRemisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) {}
@@ -3822,7 +3832,8 @@ void UpdateTestsFailed(const TestsFailedCallback *tfCb, uint32_t eventId, uint32
     return;
 
   // Shader discard with default fragment tests order.
-  if(!earlyFragmentTests)
+  if(!earlyFragmentTests &&
+     (eventFlags & (TestMustFail_DepthTesting | TestMustFail_StencilTesting)) == 0)
   {
     uint64_t occlData = tfCb->GetOcclusionResult(eventId, TestEnabled_FragmentDiscard);
     mod.shaderDiscarded = (occlData == 0);
@@ -3838,6 +3849,9 @@ void UpdateTestsFailed(const TestsFailedCallback *tfCb, uint32_t eventId, uint32
   if(mod.depthBoundsFailed)
     return;
 
+  if(eventFlags & TestMustFail_StencilTesting)
+    return;
+
   if((eventFlags & (TestEnabled_StencilTesting | TestMustFail_StencilTesting)) ==
      TestEnabled_StencilTesting)
   {
@@ -3845,6 +3859,9 @@ void UpdateTestsFailed(const TestsFailedCallback *tfCb, uint32_t eventId, uint32
     mod.stencilTestFailed = (occlData == 0);
   }
   if(mod.stencilTestFailed)
+    return;
+
+  if(eventFlags & TestMustFail_DepthTesting)
     return;
 
   if((eventFlags & (TestEnabled_DepthTesting | TestMustFail_DepthTesting)) == TestEnabled_DepthTesting)
@@ -4044,6 +4061,8 @@ rdcarray<PixelModification> VulkanReplay::PixelHistory(rdcarray<EventUsage> even
           mod.backfaceCulled = true;
         if(flags & TestMustFail_DepthTesting)
           mod.depthTestFailed = true;
+        if(flags & TestMustFail_StencilTesting)
+          mod.stencilTestFailed = true;
         if(flags & TestMustFail_Scissor)
           mod.scissorClipped = true;
         if(flags & TestMustFail_SampleMask)

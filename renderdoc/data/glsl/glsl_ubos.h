@@ -35,16 +35,36 @@ BINDING(0) uniform MeshUBOData
   mat4 mvp;
   mat4 invProj;
   vec4 color;
+
   int displayFormat;
   uint homogenousInput;
   vec2 pointSpriteSize;
+
   uint rawoutput;
   uint flipY;
-  vec2 padding;
+  float vtxExploderSNorm;
+  float exploderScale;
+
+  vec3 exploderCentre;
+  float padding;
+
+  uvec4 meshletColours[12];
 }
 INST_NAME(Mesh);
 
 #endif    // defined(MESH_UBO) || defined(__cplusplus)
+
+#if defined(MESH_UBO) && defined(VULKAN)
+
+layout(binding = 1, std140) readonly buffer meshlet_data
+{
+  uint meshletCount;
+  uint meshletOffset;
+  uvec4 data[];
+}
+meshlet;
+
+#endif    // defined(MESH_UBO)
 
 #if defined(CHECKER_UBO) || defined(__cplusplus)
 

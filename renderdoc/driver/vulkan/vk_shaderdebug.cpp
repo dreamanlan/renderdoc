@@ -1385,13 +1385,23 @@ public:
       m_pDriver->FlushQ();
     }
 
-    float *ret = (float *)m_DebugData.ReadbackBuffer.Map(NULL, 0);
-    if(!ret)
+    float *retf = (float *)m_DebugData.ReadbackBuffer.Map(NULL, 0);
+    if(!retf)
       return false;
 
-    // convert float results, we did all sampling at 32-bit precision
+    uint32_t *retu = (uint32_t *)retf;
+    int32_t *reti = (int32_t *)retf;
+
+    // convert full precision results, we did all sampling at 32-bit precision
     for(uint8_t c = 0; c < 4; c++)
-      setFloatComp(output, c, ret[c]);
+    {
+      if(VarTypeCompType(output.type) == CompType::Float)
+        setFloatComp(output, c, retf[c]);
+      else if(VarTypeCompType(output.type) == CompType::SInt)
+        setIntComp(output, c, reti[c]);
+      else
+        setUintComp(output, c, retu[c]);
+    }
 
     m_DebugData.ReadbackBuffer.Unmap();
 
@@ -2093,7 +2103,7 @@ private:
     rdcspv::Id breakLabel = editor.MakeId();
     rdcspv::Id defaultLabel = editor.MakeId();
 
-    rdcarray<rdcspv::PairLiteralIntegerIdRef> targets;
+    rdcarray<rdcspv::SwitchPairU32LiteralId> targets;
 
     rdcspv::OperationList cases;
 
@@ -2199,7 +2209,7 @@ private:
     }
 
     func.add(rdcspv::OpSelectionMerge(breakLabel, rdcspv::SelectionControl::None));
-    func.add(rdcspv::OpSwitch(opParam, defaultLabel, targets));
+    func.add(rdcspv::OpSwitch32(opParam, defaultLabel, targets));
 
     func.append(cases);
 
@@ -2534,7 +2544,7 @@ private:
     switchVal = func.add(rdcspv::OpIAdd(u32, editor.MakeId(), switchVal, dim));
 
     // switch on the combined operation and image type value
-    rdcarray<rdcspv::PairLiteralIntegerIdRef> targets;
+    rdcarray<rdcspv::SwitchPairU32LiteralId> targets;
 
     rdcspv::OperationList cases;
 
@@ -2915,7 +2925,7 @@ private:
     }
 
     func.add(rdcspv::OpSelectionMerge(breakLabel, rdcspv::SelectionControl::None));
-    func.add(rdcspv::OpSwitch(switchVal, defaultLabel, targets));
+    func.add(rdcspv::OpSwitch32(switchVal, defaultLabel, targets));
 
     func.append(cases);
 
@@ -4110,7 +4120,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
 
   const ActionDescription *action = m_pDriver->GetAction(eventId);
 
-  if(!(action->flags & ActionFlags::Drawcall))
+  if(!(action->flags & (ActionFlags::MeshDispatch | ActionFlags::Drawcall)))
   {
     RDCLOG("No drawcall selected");
     return new ShaderDebugTrace();

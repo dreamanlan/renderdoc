@@ -206,7 +206,7 @@ static void ClampScalars(rdcspv::DebugAPIWrapper *apiWrapper, const ShaderVariab
     apiWrapper->AddDebugMessage(
         MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
         StringFormat::Fmt("Invalid scalar index %u at matrix %s with %u columns. Clamping to %u",
-                          scalar0, var.columns, var.name.c_str(), var.columns - 1));
+                          scalar0, var.name.c_str(), var.columns, var.columns - 1));
     scalar0 = RDCMIN((uint8_t)1, var.columns) - 1;
   }
   if(scalar1 > var.rows && scalar1 != 0xff)
@@ -214,7 +214,7 @@ static void ClampScalars(rdcspv::DebugAPIWrapper *apiWrapper, const ShaderVariab
     apiWrapper->AddDebugMessage(
         MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
         StringFormat::Fmt("Invalid scalar index %u at matrix %s with %u rows. Clamping to %u",
-                          scalar1, var.rows, var.name.c_str(), var.rows - 1));
+                          scalar1, var.name.c_str(), var.rows, var.rows - 1));
     scalar1 = RDCMIN((uint8_t)1, var.rows) - 1;
   }
 }
@@ -965,6 +965,8 @@ ShaderDebugTrace *Debugger::BeginDebug(DebugAPIWrapper *api, const ShaderStage s
           sourceVar.rows = var.rows;
           sourceVar.columns = var.columns;
           sourceVar.signatureIndex = sigNames.indexOf(debugVarName);
+
+          StripCommonGLPrefixes(sourceVar.name);
 
           for(uint32_t x = 0; x < uint32_t(var.rows) * var.columns; x++)
             sourceVar.variables.push_back(DebugVariableReference(
@@ -2355,7 +2357,7 @@ ShaderVariable Debugger::ReadFromPointer(const ShaderVariable &ptr) const
           for(uint8_t c = 0; c < var.columns; c++)
           {
             apiWrapper->ReadBufferValue(bind, offset + c * matrixStride, VarTypeByteSize(var.type),
-                                        VarElemPointer(var, VarTypeByteSize(var.type) * c));
+                                        VarElemPointer(var, c));
           }
         }
       }

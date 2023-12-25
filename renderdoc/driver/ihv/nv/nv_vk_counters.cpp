@@ -148,8 +148,9 @@ struct NVVulkanCounters::Impl
     if(actionnode.events.empty())
       return false;    // Skip nodes with no events
 
-    if(!(actionnode.flags & (ActionFlags::Clear | ActionFlags::Drawcall | ActionFlags::Dispatch |
-                             ActionFlags::Present | ActionFlags::Copy | ActionFlags::Resolve)))
+    if(!(actionnode.flags &
+         (ActionFlags::Clear | ActionFlags::MeshDispatch | ActionFlags::Drawcall |
+          ActionFlags::Dispatch | ActionFlags::Present | ActionFlags::Copy | ActionFlags::Resolve)))
       return false;    // Filter out events we cannot profile
 
     return true;
@@ -232,34 +233,40 @@ struct VulkanNvidiaActionCallback final : public VulkanActionCallback
     m_driver->SetActionCB(this);
   }
   ~VulkanNvidiaActionCallback() { m_driver->SetActionCB(NULL); }
-  void PreDraw(uint32_t eid, VkCommandBuffer cmd) final
+  void PreDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final
   {
     rdcstr eidName = StringFormat::Fmt("%d", eid);
     nv::perf::profiler::VulkanPushRange(Unwrap(cmd), eidName.c_str());
   }
 
-  bool PostDraw(uint32_t eid, VkCommandBuffer cmd) final
+  bool PostDraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final
   {
     nv::perf::profiler::VulkanPopRange(Unwrap(cmd));
     return false;
   }
 
-  void PostRedraw(uint32_t eid, VkCommandBuffer cmd) final {}
-  void PreDispatch(uint32_t eid, VkCommandBuffer cmd) final { PreDraw(eid, cmd); }
-  bool PostDispatch(uint32_t eid, VkCommandBuffer cmd) final { return PostDraw(eid, cmd); }
-  void PostRedispatch(uint32_t eid, VkCommandBuffer cmd) final {}
+  void PostRedraw(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final {}
+  void PreDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final
+  {
+    PreDraw(eid, flags, cmd);
+  }
+  bool PostDispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final
+  {
+    return PostDraw(eid, flags, cmd);
+  }
+  void PostRedispatch(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final {}
   void PreMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final
   {
     if(flags & ActionFlags::PassBoundary)
       return;
-    PreDraw(eid, cmd);
+    PreDraw(eid, flags, cmd);
   }
 
   bool PostMisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final
   {
     if(flags & ActionFlags::PassBoundary)
       return false;
-    return PostDraw(eid, cmd);
+    return PostDraw(eid, flags, cmd);
   }
 
   void PostRemisc(uint32_t eid, ActionFlags flags, VkCommandBuffer cmd) final {}

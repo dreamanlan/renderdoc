@@ -168,6 +168,7 @@ public:
   void FlipOutputWindow(uint64_t id);
 
   void InitPostVSBuffers(uint32_t eventId);
+  void InitPostMSBuffers(uint32_t eventId);
   void InitPostVSBuffers(const rdcarray<uint32_t> &passEvents);
 
   // indicates that EID alias is the same as eventId
@@ -261,7 +262,7 @@ public:
 
 private:
   void FillRootElements(uint32_t eventId, const D3D12RenderState::RootSignature &rootSig,
-                        const ShaderBindpointMapping *mappings[(uint32_t)ShaderStage::Count],
+                        const ShaderBindpointMapping *mappings[NumShaderStages],
                         rdcarray<D3D12Pipe::RootSignatureRange> &rootElements);
   void FillResourceView(D3D12Pipe::View &view, const D3D12Descriptor *desc);
   void FillSampler(D3D12Pipe::Sampler &view, const D3D12_SAMPLER_DESC2 &desc);
@@ -305,14 +306,27 @@ private:
   {
     struct InstData
     {
-      uint32_t numVerts = 0;
-      uint64_t bufOffset = 0;
+      union
+      {
+        uint64_t bufOffset;
+        uint32_t numIndices;
+        uint32_t ampDispatchSizeX;
+      };
+      union
+      {
+        uint32_t numVerts;
+        struct
+        {
+          uint16_t y;
+          uint16_t z;
+        } ampDispatchSizeYZ;
+      };
     };
 
     struct StageData
     {
       ID3D12Resource *buf = NULL;
-      D3D_PRIMITIVE_TOPOLOGY topo = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+      Topology topo = Topology::Unknown;
 
       uint32_t vertStride = 0;
 
@@ -320,12 +334,19 @@ private:
       uint32_t numVerts = 0;
       uint32_t instStride = 0;
 
-      // complex case - expansion per instance
+      // complex case - expansion per instance,
+      // also used for meshlet offsets and sizes
       rdcarray<InstData> instData;
+
+      uint32_t primStride = 0;
+      uint64_t primOffset = 0;
 
       bool useIndices = false;
       ID3D12Resource *idxBuf = NULL;
+      uint64_t idxOffset = 0;
       DXGI_FORMAT idxFmt = DXGI_FORMAT_UNKNOWN;
+
+      rdcfixedarray<uint32_t, 3> dispatchSize;
 
       bool hasPosOut = false;
 
@@ -333,7 +354,7 @@ private:
       float farPlane = 0.0f;
 
       rdcstr status;
-    } vsin, vsout, gsout;
+    } vsout, gsout, ampout, meshout;
 
     const StageData &GetStage(MeshDataStage type)
     {
@@ -341,10 +362,14 @@ private:
         return vsout;
       else if(type == MeshDataStage::GSOut)
         return gsout;
+      else if(type == MeshDataStage::TaskOut)
+        return ampout;
+      else if(type == MeshDataStage::MeshOut)
+        return meshout;
       else
         RDCERR("Unexpected mesh data stage!");
 
-      return vsin;
+      return vsout;
     }
   };
 
@@ -439,6 +464,9 @@ private:
     ID3DBlob *QuadOverdrawWriteDXILPS = NULL;
     ID3D12RootSignature *QuadResolveRootSig = NULL;
     ID3D12PipelineState *QuadResolvePipe[8] = {NULL};
+    ID3D12RootSignature *DepthCopyResolveRootSig = NULL;
+    ID3D12PipelineState *DepthResolvePipe[2][5] = {};
+    ID3D12PipelineState *DepthCopyPipe[2][5] = {};
 
     ID3D12Resource *Texture = NULL;
     ResourceId resourceId;

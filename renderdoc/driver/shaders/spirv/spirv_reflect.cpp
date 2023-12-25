@@ -30,6 +30,24 @@
 #include "spirv_editor.h"
 #include "spirv_op_helpers.h"
 
+void StripCommonGLPrefixes(rdcstr &name)
+{
+  // remove certain common prefixes that generate only useless noise from GLSL. This is mostly
+  // irrelevant for the majority of cases but is primarily relevant for single-component outputs
+  // like gl_PointSize or gl_CullPrimitiveEXT
+  const rdcstr prefixesToRemove[] = {
+      "gl_PerVertex.",           "gl_PerVertex_var.",     "gl_MeshVerticesEXT.",
+      "gl_MeshVerticesEXT_var.", "gl_MeshPrimitivesEXT.", "gl_MeshPrimitivesEXT_var.",
+  };
+
+  for(const rdcstr &prefix : prefixesToRemove)
+  {
+    int offs = name.find(prefix);
+    if(offs == 0)
+      name.erase(0, prefix.length());
+  }
+}
+
 void FillSpecConstantVariables(ResourceId shader, const SPIRVPatchData &patchData,
                                const rdcarray<ShaderConstant> &invars,
                                rdcarray<ShaderVariable> &outvars,
@@ -278,8 +296,14 @@ static int32_t GetBinding(uint32_t binding)
   return binding == ~0U ? INVALID_BIND : (uint32_t)binding;
 }
 
-static bool IsStrippableBuiltin(rdcspv::BuiltIn builtin)
+static bool IsStrippableBuiltin(rdcspv::BuiltIn builtin, bool perPrimitive)
 {
+  if(perPrimitive &&
+     (builtin == rdcspv::BuiltIn::PrimitiveId || builtin == rdcspv::BuiltIn::Layer ||
+      builtin == rdcspv::BuiltIn::ViewportIndex || builtin == rdcspv::BuiltIn::CullPrimitiveEXT ||
+      builtin == rdcspv::BuiltIn::ShadingRateKHR))
+    return true;
+
   return builtin == rdcspv::BuiltIn::PointSize || builtin == rdcspv::BuiltIn::ClipDistance ||
          builtin == rdcspv::BuiltIn::CullDistance;
 }
@@ -408,10 +432,10 @@ StructSizes CalculateStructProps(uint32_t emptyStructSize, const ShaderConstant 
     if(matSize > 1)
       ret.extendedAlign = ret.baseAlign = c.type.matrixByteStride;
 
-    ret.scalarSize = ret.scalarAlign * RDCMAX(c.type.rows, (uint8_t)1) *
-                     RDCMAX(c.type.columns, (uint8_t)1) * RDCMAX(c.type.elements, 1U);
-    ret.baseSize = ret.baseAlign * matSize * RDCMAX(c.type.elements, 1U);
-    ret.extendedSize = ret.extendedAlign * matSize * RDCMAX(c.type.elements, 1U);
+    ret.scalarSize =
+        ret.scalarAlign * RDCMAX(c.type.rows, (uint8_t)1) * RDCMAX(c.type.columns, (uint8_t)1);
+    ret.baseSize = ret.baseAlign * matSize;
+    ret.extendedSize = ret.extendedAlign * matSize;
   }
   else
   {
@@ -459,7 +483,26 @@ StructSizes CalculateStructProps(uint32_t emptyStructSize, const ShaderConstant 
     }
   }
 
+  ret.scalarSize *= RDCMAX(c.type.elements, 1U);
+  ret.baseSize *= RDCMAX(c.type.elements, 1U);
+  ret.extendedSize *= RDCMAX(c.type.elements, 1U);
+
   return ret;
+}
+
+void CalculateScalarLayout(uint32_t offset, rdcarray<ShaderConstant> &consts)
+{
+  for(size_t i = 0; i < consts.size(); i++)
+  {
+    consts[i].byteOffset = offset;
+
+    CalculateScalarLayout(offset, consts[i].type.members);
+
+    StructSizes sizes = CalculateStructProps(1, consts[i]);
+    if(consts[i].type.elements > 1)
+      consts[i].type.arrayByteStride = sizes.scalarSize / consts[i].type.elements;
+    offset += sizes.scalarSize;
+  }
 }
 
 namespace rdcspv
@@ -851,7 +894,7 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
   }
 
   // pick up execution mode size
-  if(stage == ShaderStage::Compute)
+  if(stage == ShaderStage::Compute || stage == ShaderStage::Task || stage == ShaderStage::Mesh)
   {
     const EntryPoint &e = *entry;
 
@@ -869,6 +912,18 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
       reflection.dispatchThreadsDimension[0] = e.executionModes.localSize.x;
       reflection.dispatchThreadsDimension[1] = e.executionModes.localSize.y;
       reflection.dispatchThreadsDimension[2] = e.executionModes.localSize.z;
+    }
+
+    {
+      int idx = e.executionModes.others.indexOf(rdcspv::ExecutionMode::OutputVertices);
+      if(idx >= 0)
+        patchData.maxVertices = e.executionModes.others[idx].outputVertices;
+    }
+
+    {
+      int idx = e.executionModes.others.indexOf(rdcspv::ExecutionMode::OutputPrimitivesEXT);
+      if(idx >= 0)
+        patchData.maxPrimitives = e.executionModes.others[idx].outputPrimitivesEXT;
     }
 
     // vulkan spec says "If an object is decorated with the WorkgroupSize decoration, this must take
@@ -968,6 +1023,10 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
 
   std::set<Id> usedIds;
   std::map<Id, std::set<uint32_t>> usedStructChildren;
+  // for arrayed top level builtins like gl_MeshPrimitivesEXT[] there could be an access chain
+  // first with just the array index, then later the access to the builtin. This map tracks those
+  // first access chains so the second one can reference the original global
+  std::map<Id, Id> topLevelChildChain;
 
   // build the static call tree from the entry point, and build a list of all IDs referenced
   {
@@ -993,10 +1052,37 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
         {
           OpAccessChain access(it);
 
+          const DataType &pointeeType = dataTypes[dataTypes[idTypes[access.base]].InnerType()];
+
+          if(pointeeType.type == DataType::ArrayType)
+          {
+            const DataType &innerType = dataTypes[pointeeType.InnerType()];
+
+            if(innerType.type == DataType::StructType &&
+               (innerType.children[0].decorations.flags & rdcspv::Decorations::HasBuiltIn))
+            {
+              if(access.indexes.size() == 1)
+              {
+                topLevelChildChain[access.result] = access.base;
+              }
+              else if(access.indexes.size() == 2)
+              {
+                usedStructChildren[access.base].insert(
+                    EvaluateConstant(access.indexes[1], specInfo).value.u32v[0]);
+              }
+            }
+          }
           // save top-level children referenced in structs
-          if(dataTypes[dataTypes[idTypes[access.base]].InnerType()].type == DataType::StructType)
-            usedStructChildren[access.base].insert(
+          else if(pointeeType.type == DataType::StructType)
+          {
+            rdcspv::Id globalId = access.base;
+
+            if(topLevelChildChain.find(access.base) != topLevelChildChain.end())
+              globalId = topLevelChildChain[access.base];
+
+            usedStructChildren[globalId].insert(
                 EvaluateConstant(access.indexes[0], specInfo).value.u32v[0]);
+          }
         }
 
         if(it.opcode() == Op::FunctionCall)
@@ -1032,6 +1118,9 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
 
   // $Globals gathering - for GL global values
   ConstantBlock globalsblock;
+
+  // for mesh shaders, the task-mesh communication payload
+  ConstantBlock taskPayloadBlock;
 
   // specialisation constant gathering
   ConstantBlock specblock;
@@ -1078,7 +1167,10 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
       //
       // Some compilers generate global variables instead of members of a global struct. If this is
       // a directly decorated builtin variable which is never used, skip it
-      if(IsStrippableBuiltin(decorations[global.id].builtIn) && !used)
+      if(IsStrippableBuiltin(
+             decorations[global.id].builtIn,
+             decorations[global.id].others.contains(rdcspv::Decoration::PerPrimitiveEXT)) &&
+         !used)
         continue;
 
       // move to the inner struct if this is an array of structs - e.g. for arrayed shader outputs
@@ -1123,7 +1215,9 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
               continue;
 
             // skip this member if it's unused and of a type that is commonly included 'by accident'
-            if(IsStrippableBuiltin(structType->children[i].decorations.builtIn) &&
+            if(IsStrippableBuiltin(structType->children[i].decorations.builtIn,
+                                   structType->children[i].decorations.others.contains(
+                                       rdcspv::Decoration::PerPrimitiveEXT)) &&
                usedchildren.find(i) == usedchildren.end())
               continue;
 
@@ -1168,7 +1262,8 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
             global.storage == StorageClass::UniformConstant ||
             global.storage == StorageClass::AtomicCounter ||
             global.storage == StorageClass::StorageBuffer ||
-            global.storage == StorageClass::PushConstant)
+            global.storage == StorageClass::PushConstant ||
+            global.storage == StorageClass::TaskPayloadWorkgroupEXT)
     {
       // variable type must be a pointer of the same storage class
       RDCASSERT(dataTypes[global.type].type == DataType::PointerType);
@@ -1196,6 +1291,7 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
                         (decorations[varType->id].flags & Decorations::BufferBlock);
       const bool pushConst = (global.storage == StorageClass::PushConstant);
       const bool atomicCounter = (global.storage == StorageClass::AtomicCounter);
+      const bool taskPayload = (global.storage == StorageClass::TaskPayloadWorkgroupEXT);
 
       rdcspv::StorageClass effectiveStorage = global.storage;
       if(ssbo)
@@ -1319,24 +1415,51 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
       {
         if(varType->type != DataType::StructType)
         {
-          // global loose variable - add to $Globals block
-          RDCASSERT(varType->type == DataType::ScalarType || varType->type == DataType::VectorType ||
-                    varType->type == DataType::MatrixType || varType->type == DataType::ArrayType);
-          RDCASSERT(sourceAPI == GraphicsAPI::OpenGL);
-
-          ShaderConstant constant;
-
-          MakeConstantBlockVariable(constant, pointerTypes, effectiveStorage, *varType,
-                                    strings[global.id], decorations[global.id], specInfo);
-
-          if(isArray)
-            constant.type.elements = arraySize;
+          if(taskPayload)
+          {
+            if(!patchData.invalidTaskPayload)
+            {
+              RDCWARN(
+                  "Unhandled case - non-struct task payload. Most likely DXC bug as only one task "
+                  "payload variable allowed per entry point.");
+              taskPayloadBlock.name = "invalid";
+              taskPayloadBlock.bufferBacked = false;
+              patchData.invalidTaskPayload = true;
+            }
+          }
           else
-            constant.type.elements = 0;
+          {
+            // global loose variable - add to $Globals block
+            RDCASSERT(varType->type == DataType::ScalarType || varType->type == DataType::VectorType ||
+                      varType->type == DataType::MatrixType || varType->type == DataType::ArrayType);
+            RDCASSERT(sourceAPI == GraphicsAPI::OpenGL);
 
-          constant.byteOffset = decorations[global.id].location;
+            ShaderConstant constant;
 
-          globalsblock.variables.push_back(constant);
+            MakeConstantBlockVariable(constant, pointerTypes, effectiveStorage, *varType,
+                                      strings[global.id], decorations[global.id], specInfo);
+
+            if(isArray)
+              constant.type.elements = arraySize;
+            else
+              constant.type.elements = 0;
+
+            constant.byteOffset = decorations[global.id].location;
+
+            globalsblock.variables.push_back(constant);
+          }
+        }
+        else if(taskPayload)
+        {
+          taskPayloadBlock.name = strings[global.id];
+          if(taskPayloadBlock.name.empty())
+            taskPayloadBlock.name = StringFormat::Fmt("payload%u", global.id.value());
+          taskPayloadBlock.bufferBacked = false;
+
+          MakeConstantBlockVariables(effectiveStorage, *varType, 0, 0, taskPayloadBlock.variables,
+                                     pointerTypes, specInfo);
+
+          CalculateScalarLayout(0, taskPayloadBlock.variables);
         }
         else
         {
@@ -1459,6 +1582,8 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
     cblocks.push_back(cblockpair(bindmap, globalsblock));
   }
 
+  reflection.taskPayload = taskPayloadBlock;
+
   // look for execution modes that affect the reflection and apply them
   {
     const EntryPoint &e = *entry;
@@ -1480,7 +1605,14 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
       }
     }
 
-    patchData.outTopo = e.executionModes.outTopo;
+    reflection.outputTopology = e.executionModes.outTopo;
+
+    if(e.executionModes.others.contains(rdcspv::ExecutionMode::OutputPoints))
+      reflection.outputTopology = Topology::PointList;
+    else if(e.executionModes.others.contains(rdcspv::ExecutionMode::OutputLinesEXT))
+      reflection.outputTopology = Topology::LineList;
+    else if(e.executionModes.others.contains(rdcspv::ExecutionMode::OutputTrianglesEXT))
+      reflection.outputTopology = Topology::TriangleList;
   }
 
   for(auto it = extSets.begin(); it != extSets.end(); it++)
@@ -1747,6 +1879,10 @@ void Reflector::MakeConstantBlockVariables(rdcspv::StorageClass storage, const D
     else if(capabilities.find(rdcspv::Capability::StoragePushConstant16) != capabilities.end())
       emptyStructSize = 2;
   }
+  else if(storage == rdcspv::StorageClass::TaskPayloadWorkgroupEXT)
+  {
+    return;
+  }
 
   for(size_t i = 0; i < cblock.size(); i++)
   {
@@ -1951,6 +2087,9 @@ void Reflector::AddSignatureParameter(const bool isInput, const ShaderStage stag
   if(varDecorations.builtIn != BuiltIn::Invalid)
     sig.systemValue = MakeShaderBuiltin(stage, varDecorations.builtIn);
 
+  if(varDecorations.others.contains(rdcspv::Decoration::PerPrimitiveEXT))
+    sig.perPrimitiveRate = true;
+
   // fragment shader outputs are implicitly colour outputs. All other builtin outputs do not have a
   // register index
   if(stage == ShaderStage::Fragment && !isInput && sig.systemValue == ShaderBuiltin::Undefined)
@@ -1980,6 +2119,13 @@ void Reflector::AddSignatureParameter(const bool isInput, const ShaderStage stag
       // outputs
       if(stage == ShaderStage::Tess_Control)
         arraySize = 1;
+
+      // for mesh shaders too, ignore the root level of array-ness for outputs
+      if(stage == ShaderStage::Mesh && !isInput)
+      {
+        arraySize = 1;
+        isArray = false;
+      }
 
       // if this is a root array in the geometry shader, don't reflect it as an array either
       if(stage == ShaderStage::Geometry && isInput)
@@ -2090,6 +2236,7 @@ void Reflector::AddSignatureParameter(const bool isInput, const ShaderStage stag
 
     if(isArray)
       n += StringFormat::Fmt("[%u]", a);
+    StripCommonGLPrefixes(n);
 
     sig.varName = n;
 

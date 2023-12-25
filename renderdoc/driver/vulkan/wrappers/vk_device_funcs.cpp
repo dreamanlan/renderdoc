@@ -590,6 +590,59 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
   VkInstanceCreateInfo modifiedCreateInfo;
   modifiedCreateInfo = *pCreateInfo;
 
+  // Android is a bad platform with a bad loader that it custom wrote, and implicit layers get added
+  // to the create info's layer list even if they weren't specified, so it's impossible to tell if
+  // it's an application making a mistake or the platform messing up. Disable this protection on Android
+#if DISABLED(RDOC_ANDROID)
+  for(uint32_t i = 0; i < modifiedCreateInfo.enabledLayerCount; i++)
+  {
+    if(rdcstr(modifiedCreateInfo.ppEnabledLayerNames[i]) == RENDERDOC_VULKAN_LAYER_NAME)
+    {
+      // see if any debug report callbacks were passed in the pNext chain
+      VkDebugReportCallbackCreateInfoEXT *report =
+          (VkDebugReportCallbackCreateInfoEXT *)pCreateInfo->pNext;
+
+      rdcstr msg =
+          "RenderDoc's layer should NEVER be activated manually. Do not include it in "
+          "vkCreateInstance's instance layers.";
+
+      RDCERR("%s", msg.c_str());
+
+      while(report)
+      {
+        if(report->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT)
+          report->pfnCallback(VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_INSTANCE_EXT,
+                              0, 1, 1, "RDOC", msg.c_str(), report->pUserData);
+
+        report = (VkDebugReportCallbackCreateInfoEXT *)report->pNext;
+      }
+
+      // or debug utils callbacks
+      VkDebugUtilsMessengerCreateInfoEXT *messenger =
+          (VkDebugUtilsMessengerCreateInfoEXT *)pCreateInfo->pNext;
+
+      VkDebugUtilsMessengerCallbackDataEXT messengerData = {};
+
+      messengerData.messageIdNumber = 1;
+      messengerData.pMessageIdName = NULL;
+      messengerData.pMessage = msg.c_str();
+      messengerData.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CALLBACK_DATA_EXT;
+
+      while(messenger)
+      {
+        if(messenger->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)
+          messenger->pfnUserCallback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+                                     VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT, &messengerData,
+                                     messenger->pUserData);
+
+        messenger = (VkDebugUtilsMessengerCreateInfoEXT *)messenger->pNext;
+      }
+
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
+  }
+#endif
+
   for(uint32_t i = 0; i < modifiedCreateInfo.enabledExtensionCount; i++)
   {
     if(!IsSupportedExtension(modifiedCreateInfo.ppEnabledExtensionNames[i]))
@@ -1808,6 +1861,28 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
           "geometry/tessellation stages will not be available");
     }
 
+    bool scalarBlock = false;
+
+    // enable VK_EXT_scalar_block_layout if it's available, to fetch mesh output in the mesh stage
+    if(supportedExtensions.find(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) !=
+       supportedExtensions.end())
+    {
+      scalarBlock = true;
+      Extensions.push_back(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME);
+      RDCLOG("Enabling VK_EXT_scalar_block_layout extension");
+    }
+    else
+    {
+      VkPhysicalDeviceMeshShaderFeaturesEXT *meshFeats =
+          (VkPhysicalDeviceMeshShaderFeaturesEXT *)FindNextStruct(
+              &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
+
+      if(meshFeats && meshFeats->meshShader)
+        RDCWARN(
+            "VK_EXT_scalar_block_layout extension not available, mesh output from "
+            "mesh stage will not be available");
+    }
+
     bool KHRbuffer = false, EXTbuffer = false;
 
     if(supportedExtensions.find(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) !=
@@ -2528,6 +2603,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       {
         CHECK_PHYS_EXT_FEATURE(primitiveTopologyListRestart);
         CHECK_PHYS_EXT_FEATURE(primitiveTopologyPatchListRestart);
+
+        m_ListRestart = ext->primitiveTopologyListRestart != VK_FALSE;
       }
       END_PHYS_EXT_CHECK();
 
@@ -3177,6 +3254,26 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
             (ext->extendedDynamicState3DepthClipNegativeOneToOne != VK_FALSE);
       }
       END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceMeshShaderFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(taskShader);
+        CHECK_PHYS_EXT_FEATURE(meshShader);
+        CHECK_PHYS_EXT_FEATURE(multiviewMeshShader);
+        CHECK_PHYS_EXT_FEATURE(primitiveFragmentShadingRateMeshShader);
+        CHECK_PHYS_EXT_FEATURE(meshShaderQueries);
+
+        m_MeshShaders = ext->meshShader != VK_FALSE;
+        m_TaskShaders = ext->taskShader != VK_FALSE;
+        m_MeshQueries = avail.meshShaderQueries != VK_FALSE;
+
+        if(avail.meshShaderQueries)
+          ext->meshShaderQueries = true;
+        else
+          RDCWARN("meshShaderQueries = false, mesh shader performance counters unavailable");
+      }
+      END_PHYS_EXT_CHECK();
     }
 
     if(availFeatures.depthClamp)
@@ -3464,6 +3561,91 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
     }
 
+    VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalarBlockEXTFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT,
+    };
+
+    if(RDCMIN(m_EnabledExtensions.vulkanVersion, physProps.apiVersion) >= VK_MAKE_VERSION(1, 2, 0))
+    {
+      VkPhysicalDeviceVulkan12Features avail12Features = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+      };
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      availBase.pNext = &avail12Features;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
+
+      if(avail12Features.scalarBlockLayout)
+      {
+        VkPhysicalDeviceVulkan12Features *existing =
+            (VkPhysicalDeviceVulkan12Features *)FindNextStruct(
+                &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+
+        if(existing)
+        {
+          existing->scalarBlockLayout = VK_TRUE;
+        }
+        else
+        {
+          VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *existingEXT =
+              (VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *)FindNextStruct(
+                  &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT);
+
+          if(existingEXT)
+          {
+            existingEXT->scalarBlockLayout = VK_TRUE;
+          }
+          else
+          {
+            // don't add a new VkPhysicalDeviceVulkan12Features to the pNext chain because if we do
+            // we have to remove any components etc. Instead just add the individual
+            // VkPhysicalDeviceScalarBlockLayoutFeaturesEXT
+            scalarBlockEXTFeatures.scalarBlockLayout = VK_TRUE;
+
+            scalarBlockEXTFeatures.pNext = (void *)createInfo.pNext;
+            createInfo.pNext = &scalarBlockEXTFeatures;
+          }
+        }
+      }
+    }
+    else if(scalarBlock)
+    {
+      VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalarAvail = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT,
+      };
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      availBase.pNext = &scalarAvail;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
+
+      if(scalarAvail.scalarBlockLayout)
+      {
+        // see if there's an existing struct
+        VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *existing =
+            (VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *)FindNextStruct(
+                &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT);
+
+        if(existing)
+        {
+          existing->scalarBlockLayout = VK_TRUE;
+        }
+        else
+        {
+          // otherwise, add our own, and push it onto the pNext array
+          scalarBlockEXTFeatures.scalarBlockLayout = VK_TRUE;
+
+          scalarBlockEXTFeatures.pNext = (void *)createInfo.pNext;
+          createInfo.pNext = &scalarBlockEXTFeatures;
+        }
+      }
+      else
+      {
+        RDCWARN(
+            "VK_EXT_scalar_block_layout is available, but the physical device feature "
+            "is not. Disabling");
+
+        Extensions.removeOne(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME);
+      }
+    }
+
     VkPhysicalDeviceBufferDeviceAddressFeaturesEXT bufAddrEXTFeatures = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT,
     };
@@ -3718,6 +3900,11 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
              supportedExtensions.end() &&
          !vulkan12Features.bufferDeviceAddress)
         m_EnabledExtensions.ext_KHR_buffer_device_address = false;
+
+      if(supportedExtensions.find(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) ==
+             supportedExtensions.end() &&
+         !vulkan12Features.scalarBlockLayout)
+        m_EnabledExtensions.ext_EXT_scalar_block_layout = false;
 
       if(supportedExtensions.find(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) ==
              supportedExtensions.end() &&
@@ -4159,7 +4346,8 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
       VkPhysicalDeviceProperties physProps;
       ObjDisp(physicalDevice)->GetPhysicalDeviceProperties(Unwrap(physicalDevice), &physProps);
 
-      record->instDevInfo->vulkanVersion = physProps.apiVersion;
+      record->instDevInfo->vulkanVersion =
+          RDCMIN(physProps.apiVersion, GetRecord(m_Instance)->instDevInfo->vulkanVersion);
 
 #undef CheckExt
 #define CheckExt(name, ver) \

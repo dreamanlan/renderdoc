@@ -131,6 +131,10 @@ static const BuiltinShaderConfig builtinShaders[] = {
     BuiltinShaderConfig(BuiltinShader::DepthBuf2MSFS, EmbeddedResource(glsl_vk_depthbuf2ms_frag),
                         rdcspv::ShaderStage::Fragment,
                         FeatureCheck::SampleShading | FeatureCheck::NonMetalBackend),
+    BuiltinShaderConfig(BuiltinShader::DepthCopyFS, EmbeddedResource(glsl_depth_copy_frag),
+                        rdcspv::ShaderStage::Fragment, FeatureCheck::FragmentStores),
+    BuiltinShaderConfig(BuiltinShader::DepthCopyMSFS, EmbeddedResource(glsl_depth_copyms_frag),
+                        rdcspv::ShaderStage::Fragment, FeatureCheck::FragmentStores),
 };
 
 RDCCOMPILE_ASSERT(ARRAY_COUNT(builtinShaders) == arraydim<BuiltinShader>(),
@@ -301,7 +305,7 @@ VulkanShaderCache::VulkanShaderCache(WrappedVulkan *driver)
                              GenerateGLSLShader(source, ShaderType::Vulkan, 430, defines), blob);
 
           // if we missed the inputHash, make a copy there too.
-          if(m_CacheShaders)
+          if(m_CacheShaders && blob)
           {
             m_ShaderCache[inputHash] = new rdcarray<uint32_t>(*blob);
             m_ShaderCacheDirty = true;
@@ -544,8 +548,8 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
 
   VulkanResourceManager *rm = m_pDriver->GetResourceManager();
 
-  static VkPipelineShaderStageCreateInfo stages[6];
-  static VkSpecializationInfo specInfo[6];
+  static VkPipelineShaderStageCreateInfo stages[NumShaderStages];
+  static VkSpecializationInfo specInfo[NumShaderStages];
   static rdcarray<VkSpecializationMapEntry> specMapEntries;
 
   // the specialization constants can't use more than a uint64_t, so we just over-allocate
@@ -553,7 +557,7 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
 
   size_t specEntries = 0;
 
-  for(uint32_t i = 0; i < 6; i++)
+  for(uint32_t i = 0; i < NumShaderStages; i++)
     specEntries += pipeInfo.shaders[i].specialization.size();
 
   specMapEntries.resize(specEntries);
@@ -566,7 +570,7 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
   uint32_t dataOffset = 0;
 
   // reserve space for spec constants
-  for(uint32_t i = 0; i < 6; i++)
+  for(uint32_t i = 0; i < NumShaderStages; i++)
   {
     if(pipeInfo.shaders[i].module != ResourceId())
     {

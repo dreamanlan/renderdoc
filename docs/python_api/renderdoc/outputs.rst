@@ -52,10 +52,16 @@ Mesh View
 .. autoclass:: MeshDataStage
   :members:
 
+.. autoclass:: MeshletSize
+  :members:
+
+.. autoclass:: TaskGroupSize
+  :members:
+
 .. autoclass:: MeshFormat
   :members:
 
-.. autoclass:: SolidShade
+.. autoclass:: Visualisation
   :members:
 
 .. autoclass:: Camera

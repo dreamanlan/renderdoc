@@ -195,6 +195,14 @@ static void create(WrappedVulkan *driver, const char *objName, const int line,
     RDCERR("Failed creating object %s at line %i, vkr was %s", objName, line, ToStr(vkr).c_str());
 }
 
+enum class StencilMode
+{
+  KEEP,
+  KEEP_TEST_EQUAL_ONE,
+  REPLACE,
+  WRITE_ZERO,
+};
+
 // a simpler one-shot descriptor containing anything we might want to vary in a graphics pipeline
 struct ConciseGraphicsPipeline
 {
@@ -214,7 +222,7 @@ struct ConciseGraphicsPipeline
   // depth stencil
   bool depthEnable;
   bool stencilEnable;
-  VkStencilOp stencilOp;
+  StencilMode stencilOperations;
 
   // color blend
   bool colourOutput;
@@ -260,6 +268,34 @@ static void create(WrappedVulkan *driver, const char *objName, const int line, V
     msaa.sampleShadingEnable = true;
   }
 
+  VkCompareOp stencilTest = VK_COMPARE_OP_ALWAYS;
+  VkStencilOp stencilOp = VK_STENCIL_OP_KEEP;
+  uint8_t stencilReference = 0;
+
+  switch(info.stencilOperations)
+  {
+    case StencilMode::KEEP:
+    {
+      break;
+    }
+    case StencilMode::KEEP_TEST_EQUAL_ONE:
+    {
+      stencilTest = VK_COMPARE_OP_EQUAL;
+      stencilReference = 1;
+      break;
+    }
+    case StencilMode::REPLACE:
+    {
+      stencilOp = VK_STENCIL_OP_REPLACE;
+      break;
+    }
+    case StencilMode::WRITE_ZERO:
+    {
+      stencilOp = VK_STENCIL_OP_ZERO;
+      break;
+    }
+  };
+
   const VkPipelineDepthStencilStateCreateInfo depthStencil = {
       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
       NULL,
@@ -269,8 +305,8 @@ static void create(WrappedVulkan *driver, const char *objName, const int line, V
       VK_COMPARE_OP_ALWAYS,
       false,
       info.stencilEnable,
-      {info.stencilOp, info.stencilOp, info.stencilOp, VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 0},
-      {info.stencilOp, info.stencilOp, info.stencilOp, VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 0},
+      {stencilOp, stencilOp, stencilOp, stencilTest, 0xff, 0xff, stencilReference},
+      {stencilOp, stencilOp, stencilOp, stencilTest, 0xff, 0xff, stencilReference},
       0.0f,
       1.0f,
   };
@@ -686,7 +722,7 @@ VulkanDebugManager::VulkanDebugManager(WrappedVulkan *driver)
         true,    // sampleRateShading
         true,    // depthEnable
         true,    // stencilEnable
-        VK_STENCIL_OP_REPLACE,
+        StencilMode::REPLACE,
         false,    // colourOutput
         false,    // blendEnable
         VK_BLEND_FACTOR_ONE,
@@ -738,7 +774,7 @@ VulkanDebugManager::VulkanDebugManager(WrappedVulkan *driver)
         false,    // sampleRateShading
         false,    // depthEnable
         false,    // stencilEnable
-        VK_STENCIL_OP_REPLACE,
+        StencilMode::REPLACE,
         true,     // colourOutput
         false,    // blendEnable
         VK_BLEND_FACTOR_ONE,
@@ -872,7 +908,8 @@ VulkanDebugManager::~VulkanDebugManager()
 
   for(auto it = m_DiscardPipes.begin(); it != m_DiscardPipes.end(); it++)
   {
-    m_pDriver->vkDestroyPipeline(dev, it->second.pso, NULL);
+    for(size_t i = 0; i < ARRAY_COUNT(it->second.pso); i++)
+      m_pDriver->vkDestroyPipeline(dev, it->second.pso[i], NULL);
     m_pDriver->vkDestroyRenderPass(dev, it->second.rp, NULL);
   }
 
@@ -1079,7 +1116,7 @@ void VulkanDebugManager::CreateCustomShaderPipeline(ResourceId shader, VkPipelin
       false,    // sampleRateShading
       false,    // depthEnable
       false,    // stencilEnable
-      VK_STENCIL_OP_KEEP,
+      StencilMode::KEEP,
       true,     // colourOutput
       false,    // blendEnable
       VK_BLEND_FACTOR_ONE,
@@ -2034,7 +2071,7 @@ void VulkanDebugManager::FillWithDiscardPattern(VkCommandBuffer cmd, DiscardType
     DiscardPassData &passdata = m_DiscardPipes[key];
 
     // create and cache a pipeline and RP that writes to this format and sample count
-    if(passdata.pso == VK_NULL_HANDLE)
+    if(passdata.pso[0] == VK_NULL_HANDLE)
     {
       BuiltinShaderBaseType baseType = BuiltinShaderBaseType::Float;
 
@@ -2094,7 +2131,7 @@ void VulkanDebugManager::FillWithDiscardPattern(VkCommandBuffer cmd, DiscardType
           false,    // sampleRateShading
           true,     // depthEnable
           true,     // stencilEnable
-          VK_STENCIL_OP_REPLACE,
+          StencilMode::REPLACE,
           true,     // colourOutput
           false,    // blendEnable
           VK_BLEND_FACTOR_ONE,
@@ -2102,10 +2139,26 @@ void VulkanDebugManager::FillWithDiscardPattern(VkCommandBuffer cmd, DiscardType
           0xf,    // writeMask
       };
 
-      CREATE_OBJECT(passdata.pso, pipeInfo);
+      CREATE_OBJECT(passdata.pso[0], pipeInfo);
+
+      if(depth)
+      {
+        // depth-only, no stencil
+        pipeInfo.stencilEnable = false;
+        pipeInfo.stencilOperations = StencilMode::KEEP;
+
+        CREATE_OBJECT(passdata.pso[1], pipeInfo);
+
+        // stencil-only, no depth
+        pipeInfo.depthEnable = false;
+        pipeInfo.stencilEnable = true;
+        pipeInfo.stencilOperations = StencilMode::REPLACE;
+
+        CREATE_OBJECT(passdata.pso[2], pipeInfo);
+      }
     }
 
-    if(passdata.pso == VK_NULL_HANDLE)
+    if(passdata.pso[0] == VK_NULL_HANDLE)
       return;
 
     DiscardImgData &imgdata = m_DiscardImages[GetResID(image)];
@@ -2113,76 +2166,60 @@ void VulkanDebugManager::FillWithDiscardPattern(VkCommandBuffer cmd, DiscardType
     // create and cache views and framebuffers for every slice in this image
     if(imgdata.fbs.empty())
     {
-      VkImageAspectFlags aspectMask = imAspects;
-
-      for(int pass = 0; pass < 3; pass++)
+      for(uint32_t a = 0; a < imInfo.arrayLayers; a++)
       {
-        // only depth/stencil images need multiple sets of views to mask out one aspect or the other
-        if(pass > 0)
-        {
-          if(imAspects != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
-            break;
+        VkImageViewCreateInfo viewInfo = {
+            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            NULL,
+            0,
+            image,
+            VK_IMAGE_VIEW_TYPE_2D,
+            imInfo.format,
+            {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+            {
+                imAspects,
+                0,
+                1,
+                a,
+                1,
+            },
+        };
 
-          if(pass == 1)
-            aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-          else if(pass == 2)
-            aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-        }
+        VkImageView view;
+        VkResult vkr = driver->vkCreateImageView(driver->GetDev(), &viewInfo, NULL, &view);
+        CheckVkResult(vkr);
+        NameVulkanObject(view, StringFormat::Fmt("FillWithDiscardPattern view %s",
+                                                 ToStr(GetResID(image)).c_str()));
 
-        for(uint32_t a = 0; a < imInfo.arrayLayers; a++)
-        {
-          VkImageViewCreateInfo viewInfo = {
-              VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-              NULL,
-              0,
-              image,
-              VK_IMAGE_VIEW_TYPE_2D,
-              imInfo.format,
-              {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-               VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
-              {
-                  aspectMask,
-                  0,
-                  1,
-                  a,
-                  1,
-              },
-          };
+        imgdata.views.push_back(view);
 
-          VkImageView view;
-          VkResult vkr = driver->vkCreateImageView(driver->GetDev(), &viewInfo, NULL, &view);
-          CheckVkResult(vkr);
-          NameVulkanObject(view, StringFormat::Fmt("FillWithDiscardPattern view %s",
-                                                   ToStr(GetResID(image)).c_str()));
+        // create framebuffer
+        VkFramebufferCreateInfo fbinfo = {
+            VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            NULL,
+            0,
+            passdata.rp,
+            1,
+            &view,
+            imInfo.extent.width,
+            imInfo.extent.height,
+            1,
+        };
 
-          imgdata.views.push_back(view);
+        VkFramebuffer fb;
+        vkr = driver->vkCreateFramebuffer(driver->GetDev(), &fbinfo, NULL, &fb);
+        CheckVkResult(vkr);
 
-          // create framebuffer
-          VkFramebufferCreateInfo fbinfo = {
-              VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-              NULL,
-              0,
-              passdata.rp,
-              1,
-              &view,
-              imInfo.extent.width,
-              imInfo.extent.height,
-              1,
-          };
-
-          VkFramebuffer fb;
-          vkr = driver->vkCreateFramebuffer(driver->GetDev(), &fbinfo, NULL, &fb);
-          CheckVkResult(vkr);
-
-          imgdata.fbs.push_back(fb);
-        }
+        imgdata.fbs.push_back(fb);
       }
     }
 
     if(imgdata.fbs.empty())
       return;
 
-    ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS, Unwrap(passdata.pso));
+    ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  Unwrap(passdata.pso[0]));
     ObjDisp(cmd)->CmdBindDescriptorSets(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
                                         Unwrap(m_DiscardLayout), 0, 1,
                                         UnwrapPtr(m_DiscardSet[(size_t)type]), 0, NULL);
@@ -2228,22 +2265,39 @@ void VulkanDebugManager::FillWithDiscardPattern(VkCommandBuffer cmd, DiscardType
     ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(m_DiscardLayout), VK_SHADER_STAGE_ALL, 0, 4,
                                    &pass);
 
-    uint32_t offset = 0;
     if(imAspects != discardRange.aspectMask &&
        imAspects == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
     {
       // if we're only discarding one of depth or stencil in a depth/stencil image, pick a
       // framebuffer that only targets that aspect.
       if(discardRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT)
-        offset = imInfo.arrayLayers;
+      {
+        if(passdata.pso[1] == VK_NULL_HANDLE)
+        {
+          RDCERR("Don't have depth-only pipeline for masking out stencil discard");
+          return;
+        }
+
+        ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      Unwrap(passdata.pso[1]));
+      }
       else
-        offset = imInfo.arrayLayers * 2;
+      {
+        if(passdata.pso[2] == VK_NULL_HANDLE)
+        {
+          RDCERR("Don't have stencil-only pipeline for masking out depth discard");
+          return;
+        }
+
+        ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      Unwrap(passdata.pso[2]));
+      }
     }
 
     for(uint32_t slice = discardRange.baseArrayLayer;
         slice < discardRange.baseArrayLayer + discardRange.layerCount; slice++)
     {
-      rpbegin.framebuffer = Unwrap(imgdata.fbs[slice + offset]);
+      rpbegin.framebuffer = Unwrap(imgdata.fbs[slice]);
       ObjDisp(cmd)->CmdBeginRenderPass(Unwrap(cmd), &rpbegin, VK_SUBPASS_CONTENTS_INLINE);
 
       if(depth && discardRange.aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT)
@@ -2274,7 +2328,8 @@ void VulkanDebugManager::FillWithDiscardPattern(VkCommandBuffer cmd, DiscardType
 
     dstimBarrier.oldLayout = dstimBarrier.newLayout;
     dstimBarrier.newLayout = curLayout;
-    dstimBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dstimBarrier.srcAccessMask = depth ? (VkAccessFlags)VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                                       : (VkAccessFlags)VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     dstimBarrier.dstAccessMask = VK_ACCESS_ALL_WRITE_BITS | VK_ACCESS_ALL_READ_BITS;
 
     DoPipelineBarrier(cmd, 1, &dstimBarrier);
@@ -2670,7 +2725,9 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
 
   // start with the limits as they are, and subtract off them incrementally. When any limit would
   // drop below 0, we fail.
-  uint32_t maxPerStageDescriptorSamplers[6] = {
+  uint32_t maxPerStageDescriptorSamplers[NumShaderStages] = {
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSamplers,
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSamplers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSamplers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSamplers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSamplers,
@@ -2678,7 +2735,9 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSamplers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSamplers,
   };
-  uint32_t maxPerStageDescriptorUniformBuffers[6] = {
+  uint32_t maxPerStageDescriptorUniformBuffers[NumShaderStages] = {
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorUniformBuffers,
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorUniformBuffers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorUniformBuffers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorUniformBuffers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorUniformBuffers,
@@ -2686,7 +2745,9 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorUniformBuffers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorUniformBuffers,
   };
-  uint32_t maxPerStageDescriptorStorageBuffers[6] = {
+  uint32_t maxPerStageDescriptorStorageBuffers[NumShaderStages] = {
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageBuffers,
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageBuffers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageBuffers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageBuffers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageBuffers,
@@ -2694,7 +2755,9 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageBuffers,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageBuffers,
   };
-  uint32_t maxPerStageDescriptorSampledImages[6] = {
+  uint32_t maxPerStageDescriptorSampledImages[NumShaderStages] = {
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSampledImages,
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSampledImages,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSampledImages,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSampledImages,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSampledImages,
@@ -2702,7 +2765,9 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSampledImages,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorSampledImages,
   };
-  uint32_t maxPerStageDescriptorStorageImages[6] = {
+  uint32_t maxPerStageDescriptorStorageImages[NumShaderStages] = {
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageImages,
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageImages,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageImages,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageImages,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageImages,
@@ -2710,7 +2775,9 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageImages,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageImages,
   };
-  uint32_t maxPerStageDescriptorInputAttachments[6] = {
+  uint32_t maxPerStageDescriptorInputAttachments[NumShaderStages] = {
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorInputAttachments,
+      m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorInputAttachments,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorInputAttachments,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorInputAttachments,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorInputAttachments,
@@ -2718,7 +2785,9 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorInputAttachments,
       m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorInputAttachments,
   };
-  uint32_t maxPerStageResources[6] = {
+  uint32_t maxPerStageResources[NumShaderStages] = {
+      m_pDriver->GetDeviceProps().limits.maxPerStageResources,
+      m_pDriver->GetDeviceProps().limits.maxPerStageResources,
       m_pDriver->GetDeviceProps().limits.maxPerStageResources,
       m_pDriver->GetDeviceProps().limits.maxPerStageResources,
       m_pDriver->GetDeviceProps().limits.maxPerStageResources,
@@ -2743,7 +2812,7 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
       m_pDriver->GetDeviceProps().limits.maxDescriptorSetInputAttachments;
 
   uint32_t maxDescriptorSetInlineUniformBlocks = 0;
-  uint32_t maxPerStageDescriptorInlineUniformBlocks[6] = {};
+  uint32_t maxPerStageDescriptorInlineUniformBlocks[NumShaderStages] = {};
 
   if(m_pDriver->GetExtensions(NULL).ext_EXT_inline_uniform_block)
   {
@@ -2780,7 +2849,7 @@ void VulkanReplay::PatchReservedDescriptors(const VulkanStatePipeline &pipe,
 #define UPDATE_AND_CHECK_STAGE_LIMIT(maxLimit)                                                 \
   if(!error)                                                                                   \
   {                                                                                            \
-    for(uint32_t sbit = 0; sbit < 6; sbit++)                                                   \
+    for(uint32_t sbit = 0; sbit < NumShaderStages; sbit++)                                     \
     {                                                                                          \
       if(newBind.stageFlags & (1U << sbit))                                                    \
       {                                                                                        \
@@ -3287,6 +3356,7 @@ void VulkanReplay::GeneralMisc::Init(WrappedVulkan *driver, VkDescriptorPool des
       {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 64},
       {VK_DESCRIPTOR_TYPE_SAMPLER, 64},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 32},
   };
 
   VkDescriptorPoolCreateInfo descPoolInfo = {
@@ -3378,7 +3448,7 @@ void VulkanReplay::TextureRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
         false,    // sampleRateShading
         false,    // depthEnable
         false,    // stencilEnable
-        VK_STENCIL_OP_KEEP,
+        StencilMode::KEEP,
         true,     // colourOutput
         false,    // blendEnable
         VK_BLEND_FACTOR_ONE,
@@ -3825,6 +3895,8 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
   CREATE_OBJECT(SRGBA8RP, VK_FORMAT_R8G8B8A8_SRGB);
   CREATE_OBJECT(SRGBA8MSRP, VK_FORMAT_R8G8B8A8_SRGB, VULKAN_MESH_VIEW_SAMPLES);
 
+  CREATE_OBJECT(m_PointSampler, VK_FILTER_NEAREST);
+
   CREATE_OBJECT(m_CheckerDescSetLayout,
                 {{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, NULL}});
 
@@ -3836,19 +3908,34 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
   CREATE_OBJECT(m_TriSizeDescSetLayout,
                 {
                     {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, NULL},
+                    {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL},
                     {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, NULL},
                 });
+
+  CREATE_OBJECT(m_DepthCopyDescSetLayout, {
+                                              {
+                                                  0,
+                                                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                  1,
+                                                  VK_SHADER_STAGE_ALL,
+                                                  &m_PointSampler,
+                                              },
+                                          });
 
   CREATE_OBJECT(m_CheckerPipeLayout, m_CheckerDescSetLayout, 0);
   CREATE_OBJECT(m_QuadResolvePipeLayout, m_QuadDescSetLayout, 0);
   CREATE_OBJECT(m_TriSizePipeLayout, m_TriSizeDescSetLayout, 0);
+  CREATE_OBJECT(m_DepthCopyPipeLayout, m_DepthCopyDescSetLayout, 0);
   CREATE_OBJECT(m_QuadDescSet, descriptorPool, m_QuadDescSetLayout);
   CREATE_OBJECT(m_TriSizeDescSet, descriptorPool, m_TriSizeDescSetLayout);
   CREATE_OBJECT(m_CheckerDescSet, descriptorPool, m_CheckerDescSetLayout);
+  CREATE_OBJECT(m_DepthCopyDescSet, descriptorPool, m_DepthCopyDescSetLayout);
 
   m_CheckerUBO.Create(driver, driver->GetDev(), 128, 10, 0);
   RDCCOMPILE_ASSERT(sizeof(CheckerboardUBOData) <= 128, "checkerboard UBO size");
 
+  m_DummyMeshletSSBO.Create(driver, driver->GetDev(), sizeof(Vec4f) * 2, 1,
+                            GPUBuffer::eGPUBufferSSBO);
   m_TriSizeUBO.Create(driver, driver->GetDev(), sizeof(Vec4f), 4096, 0);
 
   ConciseGraphicsPipeline pipeInfo = {
@@ -3861,7 +3948,7 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
       false,    // sampleRateShading
       false,    // depthEnable
       false,    // stencilEnable
-      VK_STENCIL_OP_KEEP,
+      StencilMode::KEEP,
       true,     // colourOutput
       false,    // blendEnable
       VK_BLEND_FACTOR_SRC_ALPHA,
@@ -3881,13 +3968,13 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
   RDCCOMPILE_ASSERT(ARRAY_COUNT(m_CheckerF16Pipeline) == ARRAY_COUNT(m_QuadResolvePipeline),
                     "Arrays are mismatched in size!");
 
-  uint32_t supportedSampleCounts = driver->GetDeviceProps().limits.framebufferColorSampleCounts;
+  uint32_t supportedColorSampleCounts = driver->GetDeviceProps().limits.framebufferColorSampleCounts;
 
   for(size_t i = 0; i < ARRAY_COUNT(m_CheckerF16Pipeline); i++)
   {
     VkSampleCountFlagBits samples = VkSampleCountFlagBits(1 << i);
 
-    if((supportedSampleCounts & (uint32_t)samples) == 0)
+    if((supportedColorSampleCounts & (uint32_t)samples) == 0)
       continue;
 
     VkRenderPass RGBA16MSRP = VK_NULL_HANDLE;
@@ -3899,7 +3986,7 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
     else
       continue;
 
-    // if we this sample count is supported then create a pipeline
+    // if we know this sample count is supported then create a pipeline
     pipeInfo.renderPass = RGBA16MSRP;
     pipeInfo.sampleCount = VkSampleCountFlagBits(1 << i);
 
@@ -3923,14 +4010,288 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
 
     driver->vkDestroyRenderPass(driver->GetDev(), RGBA16MSRP, NULL);
   }
-
   RDCASSERTEQUAL((uint32_t)driver->GetDeviceProps().limits.framebufferColorSampleCounts,
                  samplesHandled);
+
+  uint32_t supportedDepthSampleCounts = driver->GetDeviceProps().limits.framebufferDepthSampleCounts;
+
+  samplesHandled = 0;
+  {
+    ConciseGraphicsPipeline DepthCopyPipeInfo = {
+        SRGBA8RP,
+        m_DepthCopyPipeLayout,
+        shaderCache->GetBuiltinModule(BuiltinShader::BlitVS),
+        shaderCache->GetBuiltinModule(BuiltinShader::DepthCopyFS),
+        {VK_DYNAMIC_STATE_VIEWPORT},
+        VK_SAMPLE_COUNT_1_BIT,
+        false,    // sampleRateShading
+        true,     // depthEnable
+        true,     // stencilEnable
+        StencilMode::WRITE_ZERO,
+        true,     // colourOutput
+        false,    // blendEnable
+        VK_BLEND_FACTOR_DST_ALPHA,
+        VK_BLEND_FACTOR_ONE,
+        0x0,    // writeMask
+    };
+
+    VkAttachmentReference colRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference dsRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+    VkAttachmentDescription attDescs[] = {
+        {
+            0,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_SAMPLE_COUNT_1_BIT,
+            VK_ATTACHMENT_LOAD_OP_LOAD,
+            VK_ATTACHMENT_STORE_OP_STORE,
+            VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            colRef.layout,
+            colRef.layout,
+        },
+        {
+            0,
+            VK_FORMAT_D24_UNORM_S8_UINT,
+            VK_SAMPLE_COUNT_1_BIT,    // will patch this just below
+            VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            VK_ATTACHMENT_STORE_OP_STORE,
+            VK_ATTACHMENT_LOAD_OP_CLEAR,
+            VK_ATTACHMENT_STORE_OP_STORE,
+            dsRef.layout,
+            dsRef.layout,
+        },
+    };
+
+    VkSubpassDescription subp = {
+        0,      VK_PIPELINE_BIND_POINT_GRAPHICS,
+        0,      NULL,       // inputs
+        1,      &colRef,    // color
+        NULL,               // resolve
+        &dsRef,             // depth-stencil
+        0,      NULL,       // preserve
+    };
+
+    VkRenderPassCreateInfo rpinfo = {
+        VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        NULL,
+        0,
+        2,
+        attDescs,
+        1,
+        &subp,
+        0,
+        NULL,    // dependencies
+    };
+
+    RDCCOMPILE_ASSERT(ARRAY_COUNT(m_DepthCopyPipeline) == ARRAY_COUNT(m_DepthResolvePipeline),
+                      "m_DepthCopyPipeline size must match m_DepthResolvePipeline");
+
+    if(DepthCopyPipeInfo.fragment != VK_NULL_HANDLE)
+    {
+      for(size_t f = 0; f < ARRAY_COUNT(m_DepthCopyPipeline); ++f)
+      {
+        for(size_t i = 0; i < ARRAY_COUNT(m_DepthCopyPipeline[f]); ++i)
+          m_DepthCopyPipeline[f][i] = VK_NULL_HANDLE;
+
+        VkFormat fmt = (f == 0) ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        VkImageFormatProperties props;
+        if(driver->vkGetPhysicalDeviceImageFormatProperties(
+               driver->GetPhysDev(), fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0, &props) != VK_SUCCESS)
+          continue;
+
+        attDescs[1].format = fmt;
+        for(size_t i = 0; i < ARRAY_COUNT(m_DepthCopyPipeline[f]); ++i)
+        {
+          VkSampleCountFlagBits samples = VkSampleCountFlagBits(1 << i);
+          if((supportedDepthSampleCounts & (uint32_t)samples) == 0)
+            continue;
+
+          VkRenderPass depthMSRP = VK_NULL_HANDLE;
+          attDescs[0].samples = samples;
+          attDescs[1].samples = samples;
+          VkResult vkr = driver->vkCreateRenderPass(driver->GetDev(), &rpinfo, NULL, &depthMSRP);
+          if(vkr != VK_SUCCESS)
+            RDCERR("Failed to create depth overlay resolve render pass: %s", ToStr(vkr).c_str());
+
+          if(depthMSRP != VK_NULL_HANDLE)
+            samplesHandled |= (uint32_t)samples;
+          else
+            continue;
+
+          // if we know this sample count is supported then create a pipeline
+          DepthCopyPipeInfo.renderPass = depthMSRP;
+          DepthCopyPipeInfo.sampleCount = VkSampleCountFlagBits(1 << i);
+
+          if(i == 0)
+            DepthCopyPipeInfo.fragment = shaderCache->GetBuiltinModule(BuiltinShader::DepthCopyFS);
+          else
+            DepthCopyPipeInfo.fragment = shaderCache->GetBuiltinModule(BuiltinShader::DepthCopyMSFS);
+
+          CREATE_OBJECT(m_DepthCopyPipeline[f][i], DepthCopyPipeInfo);
+
+          driver->vkDestroyRenderPass(driver->GetDev(), depthMSRP, NULL);
+        }
+      }
+    }
+  }
+  RDCASSERTEQUAL((uint32_t)driver->GetDeviceProps().limits.framebufferDepthSampleCounts,
+                 samplesHandled);
+
+  samplesHandled = 0;
+  {
+    // make patched shader
+    VkShaderModule greenFSmod = VK_NULL_HANDLE;
+    float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
+    driver->GetDebugManager()->PatchFixedColShader(greenFSmod, green);
+
+    CREATE_OBJECT(m_DepthResolvePipeLayout, VK_NULL_HANDLE, 0);
+
+    ConciseGraphicsPipeline DepthResolvePipeInfo = {
+        SRGBA8RP,
+        m_DepthResolvePipeLayout,
+        shaderCache->GetBuiltinModule(BuiltinShader::BlitVS),
+        greenFSmod,
+        {VK_DYNAMIC_STATE_VIEWPORT},
+        VK_SAMPLE_COUNT_1_BIT,
+        false,    // sampleRateShading
+        false,    // depthEnable
+        true,     // stencilEnable
+        StencilMode::KEEP_TEST_EQUAL_ONE,
+        true,     // colourOutput
+        false,    // blendEnable
+        VK_BLEND_FACTOR_DST_ALPHA,
+        VK_BLEND_FACTOR_ONE,
+        0xf,    // writeMask
+    };
+
+    VkAttachmentReference colRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference dsRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+    VkAttachmentDescription attDescs[] = {
+        {
+            0,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_SAMPLE_COUNT_1_BIT,
+            VK_ATTACHMENT_LOAD_OP_LOAD,
+            VK_ATTACHMENT_STORE_OP_STORE,
+            VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            colRef.layout,
+            colRef.layout,
+        },
+        {
+            0,
+            VK_FORMAT_D24_UNORM_S8_UINT,
+            VK_SAMPLE_COUNT_1_BIT,    // will patch this just below
+            VK_ATTACHMENT_LOAD_OP_LOAD,
+            VK_ATTACHMENT_STORE_OP_STORE,
+            VK_ATTACHMENT_LOAD_OP_LOAD,
+            VK_ATTACHMENT_STORE_OP_STORE,
+            dsRef.layout,
+            dsRef.layout,
+        },
+    };
+
+    VkSubpassDescription subp = {
+        0,      VK_PIPELINE_BIND_POINT_GRAPHICS,
+        0,      NULL,       // inputs
+        1,      &colRef,    // color
+        NULL,               // resolve
+        &dsRef,             // depth-stencil
+        0,      NULL,       // preserve
+    };
+
+    VkRenderPassCreateInfo rpinfo = {
+        VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        NULL,
+        0,
+        2,
+        attDescs,
+        1,
+        &subp,
+        0,
+        NULL,    // dependencies
+    };
+
+    if(DepthResolvePipeInfo.fragment != VK_NULL_HANDLE)
+    {
+      for(size_t f = 0; f < ARRAY_COUNT(m_DepthResolvePipeline); ++f)
+      {
+        for(size_t i = 0; i < ARRAY_COUNT(m_DepthResolvePipeline[f]); ++i)
+          m_DepthResolvePipeline[f][i] = VK_NULL_HANDLE;
+
+        VkFormat fmt = (f == 0) ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        VkImageFormatProperties props;
+        if(driver->vkGetPhysicalDeviceImageFormatProperties(
+               driver->GetPhysDev(), fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0, &props) != VK_SUCCESS)
+          continue;
+
+        attDescs[1].format = fmt;
+        for(size_t i = 0; i < ARRAY_COUNT(m_DepthResolvePipeline[f]); ++i)
+        {
+          VkSampleCountFlagBits samples = VkSampleCountFlagBits(1 << i);
+          if((supportedDepthSampleCounts & (uint32_t)samples) == 0)
+            continue;
+
+          VkRenderPass rgba16MSRP = VK_NULL_HANDLE;
+          attDescs[0].samples = samples;
+          attDescs[1].samples = samples;
+          VkResult vkr = driver->vkCreateRenderPass(driver->GetDev(), &rpinfo, NULL, &rgba16MSRP);
+          if(vkr != VK_SUCCESS)
+            RDCERR("Failed to create depth overlay resolve render pass: %s", ToStr(vkr).c_str());
+
+          if(rgba16MSRP != VK_NULL_HANDLE)
+            samplesHandled |= (uint32_t)samples;
+          else
+            continue;
+
+          // if we know this sample count is supported then create a pipeline
+          DepthResolvePipeInfo.renderPass = rgba16MSRP;
+          DepthResolvePipeInfo.sampleCount = VkSampleCountFlagBits(1 << i);
+
+          CREATE_OBJECT(m_DepthResolvePipeline[f][i], DepthResolvePipeInfo);
+
+          driver->vkDestroyRenderPass(driver->GetDev(), rgba16MSRP, NULL);
+        }
+      }
+    }
+  }
+
+  RDCASSERTEQUAL((uint32_t)driver->GetDeviceProps().limits.framebufferDepthSampleCounts,
+                 samplesHandled);
+
+  m_DefaultDepthStencilFormat = VK_FORMAT_UNDEFINED;
+  {
+    for(VkFormat fmt : {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT})
+    {
+      VkImageFormatProperties imgprops = {};
+      VkResult vkr = driver->vkGetPhysicalDeviceImageFormatProperties(
+          driver->GetPhysDev(), fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0, &imgprops);
+      if(vkr == VK_SUCCESS)
+      {
+        m_DefaultDepthStencilFormat = fmt;
+        break;
+      }
+    }
+  }
+  if(m_DefaultDepthStencilFormat == VK_FORMAT_UNDEFINED)
+  {
+    RDCERR("Overlay failed to find default depth stencil format");
+  }
+
+  VkDescriptorBufferInfo meshssbo = {};
+  m_DummyMeshletSSBO.FillDescriptor(meshssbo);
 
   VkDescriptorBufferInfo checkerboard = {};
   m_CheckerUBO.FillDescriptor(checkerboard);
 
   VkWriteDescriptorSet writes[] = {
+      {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Unwrap(m_TriSizeDescSet), 1, 0, 1,
+       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &meshssbo, NULL},
       {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Unwrap(m_CheckerDescSet), 0, 0, 1,
        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &checkerboard, NULL},
   };
@@ -3959,6 +4320,19 @@ void VulkanReplay::OverlayRendering::Destroy(WrappedVulkan *driver)
   for(size_t i = 0; i < ARRAY_COUNT(m_QuadResolvePipeline); i++)
     driver->vkDestroyPipeline(driver->GetDev(), m_QuadResolvePipeline[i], NULL);
 
+  driver->vkDestroyPipelineLayout(driver->GetDev(), m_DepthResolvePipeLayout, NULL);
+  driver->vkDestroyDescriptorSetLayout(driver->GetDev(), m_DepthCopyDescSetLayout, NULL);
+  driver->vkDestroyPipelineLayout(driver->GetDev(), m_DepthCopyPipeLayout, NULL);
+
+  for(size_t f = 0; f < ARRAY_COUNT(m_DepthResolvePipeline); ++f)
+  {
+    for(size_t i = 0; i < ARRAY_COUNT(m_DepthResolvePipeline[f]); ++i)
+    {
+      driver->vkDestroyPipeline(driver->GetDev(), m_DepthResolvePipeline[f][i], NULL);
+      driver->vkDestroyPipeline(driver->GetDev(), m_DepthCopyPipeline[f][i], NULL);
+    }
+  }
+
   driver->vkDestroyDescriptorSetLayout(driver->GetDev(), m_CheckerDescSetLayout, NULL);
   driver->vkDestroyPipelineLayout(driver->GetDev(), m_CheckerPipeLayout, NULL);
   for(size_t i = 0; i < ARRAY_COUNT(m_CheckerF16Pipeline); i++)
@@ -3971,17 +4345,25 @@ void VulkanReplay::OverlayRendering::Destroy(WrappedVulkan *driver)
   m_TriSizeUBO.Destroy();
   driver->vkDestroyDescriptorSetLayout(driver->GetDev(), m_TriSizeDescSetLayout, NULL);
   driver->vkDestroyPipelineLayout(driver->GetDev(), m_TriSizePipeLayout, NULL);
+
+  driver->vkDestroySampler(driver->GetDev(), m_PointSampler, NULL);
 }
 
 void VulkanReplay::MeshRendering::Init(WrappedVulkan *driver, VkDescriptorPool descriptorPool)
 {
-  CREATE_OBJECT(DescSetLayout,
-                {{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, NULL}});
+  CREATE_OBJECT(
+      DescSetLayout,
+      {
+          {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, NULL},
+          {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL},
+      });
 
   CREATE_OBJECT(PipeLayout, DescSetLayout, 0);
   CREATE_OBJECT(DescSet, descriptorPool, DescSetLayout);
 
   UBO.Create(driver, driver->GetDev(), sizeof(MeshUBOData), 16, 0);
+  MeshletSSBO.Create(driver, driver->GetDev(), sizeof(uint32_t) * (4 + MAX_NUM_MESHLETS), 16,
+                     GPUBuffer::eGPUBufferSSBO);
   BBoxVB.Create(driver, driver->GetDev(), sizeof(Vec4f) * 128, 16, GPUBuffer::eGPUBufferVBuffer);
 
   Vec4f TLN = Vec4f(-1.0f, 1.0f, 0.0f, 1.0f);    // TopLeftNear, etc...
@@ -4043,13 +4425,17 @@ void VulkanReplay::MeshRendering::Init(WrappedVulkan *driver, VkDescriptorPool d
 
   AxisFrustumVB.Unmap();
 
-  VkDescriptorBufferInfo meshrender = {};
+  VkDescriptorBufferInfo meshubo = {};
+  VkDescriptorBufferInfo meshssbo = {};
 
-  UBO.FillDescriptor(meshrender);
+  UBO.FillDescriptor(meshubo);
+  MeshletSSBO.FillDescriptor(meshssbo);
 
   VkWriteDescriptorSet writes[] = {
       {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Unwrap(DescSet), 0, 0, 1,
-       VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &meshrender, NULL},
+       VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &meshubo, NULL},
+      {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Unwrap(DescSet), 1, 0, 1,
+       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, NULL, &meshssbo, NULL},
   };
 
   VkDevice dev = driver->GetDev();
@@ -4064,6 +4450,7 @@ void VulkanReplay::MeshRendering::Destroy(WrappedVulkan *driver)
 
   UBO.Destroy();
   BBoxVB.Destroy();
+  MeshletSSBO.Destroy();
   AxisFrustumVB.Destroy();
 
   driver->vkDestroyDescriptorSetLayout(driver->GetDev(), DescSetLayout, NULL);

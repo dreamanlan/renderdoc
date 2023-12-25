@@ -265,7 +265,7 @@ rdcarray<uint32_t> VulkanReplay::GetPassEvents(uint32_t eventId)
     // so we don't actually do anything (init postvs/action overlay)
     // but it's useful to have the first part of the pass as part
     // of the list
-    if(start->flags & (ActionFlags::Drawcall | ActionFlags::PassBoundary))
+    if(start->flags & (ActionFlags::MeshDispatch | ActionFlags::Drawcall | ActionFlags::PassBoundary))
       passEvents.push_back(start->eventId);
 
     start = start->next;
@@ -1198,12 +1198,12 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
     }
 
     ret.vertexInput.bindings.resize(state.vertexBindings.size());
-    for(size_t i = 0; i < state.vertexBindings.size(); i++)
+    for(const VkVertexInputBindingDescription2EXT &b : state.vertexBindings)
     {
-      ret.vertexInput.bindings[i].vertexBufferBinding = state.vertexBindings[i].binding;
-      ret.vertexInput.bindings[i].perInstance =
-          state.vertexBindings[i].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE;
-      ret.vertexInput.bindings[i].instanceDivisor = state.vertexBindings[i].divisor;
+      ret.vertexInput.bindings.resize_for_index(b.binding);
+      ret.vertexInput.bindings[b.binding].vertexBufferBinding = b.binding;
+      ret.vertexInput.bindings[b.binding].perInstance = b.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE;
+      ret.vertexInput.bindings[b.binding].instanceDivisor = b.divisor;
     }
 
     ret.vertexInput.vertexBuffers.resize(state.vbuffers.size());
@@ -1217,12 +1217,22 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
 
     // Shader Stages
     VKPipe::Shader *stages[] = {
-        &ret.vertexShader,   &ret.tessControlShader, &ret.tessEvalShader,
-        &ret.geometryShader, &ret.fragmentShader,
+        &ret.vertexShader,
+        &ret.tessControlShader,
+        &ret.tessEvalShader,
+        &ret.geometryShader,
+        &ret.fragmentShader,
+        // compute
+        NULL,
+        &ret.taskShader,
+        &ret.meshShader,
     };
 
     for(size_t i = 0; i < ARRAY_COUNT(stages); i++)
     {
+      if(stages[i] == NULL)
+        continue;
+
       stages[i]->resourceId = rm->GetUnreplacedOriginalID(p.shaders[i].module);
       stages[i]->entryPoint = p.shaders[i].entryPoint;
 
@@ -1591,8 +1601,8 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
     ret.vertexInput.vertexBuffers.clear();
 
     VKPipe::Shader *stages[] = {
-        &ret.vertexShader,   &ret.tessControlShader, &ret.tessEvalShader,
-        &ret.geometryShader, &ret.fragmentShader,
+        &ret.vertexShader,   &ret.tessControlShader, &ret.tessEvalShader, &ret.geometryShader,
+        &ret.fragmentShader, &ret.taskShader,        &ret.meshShader,
     };
 
     for(size_t i = 0; i < ARRAY_COUNT(stages); i++)
@@ -4390,6 +4400,8 @@ void VulkanReplay::BuildTargetShader(ShaderEncoding sourceEncoding, const bytebu
       case ShaderStage::Geometry: stage = rdcspv::ShaderStage::Geometry; break;
       case ShaderStage::Pixel: stage = rdcspv::ShaderStage::Fragment; break;
       case ShaderStage::Compute: stage = rdcspv::ShaderStage::Compute; break;
+      case ShaderStage::Task: stage = rdcspv::ShaderStage::Task; break;
+      case ShaderStage::Mesh: stage = rdcspv::ShaderStage::Mesh; break;
       default:
         RDCERR("Unexpected type in BuildShader!");
         id = ResourceId();

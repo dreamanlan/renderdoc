@@ -330,6 +330,11 @@ WrappedID3D11Device::~WrappedID3D11Device()
     RDCASSERT(WrappedID3D11Texture3D1::m_TextureList.empty());
   }
 
+  WrappedID3D11Buffer::m_BufferList.clear();
+  WrappedID3D11Texture1D::m_TextureList.clear();
+  WrappedID3D11Texture2D1::m_TextureList.clear();
+  WrappedID3D11Texture3D1::m_TextureList.clear();
+
   SAFE_DELETE(m_Replay);
 
   SAFE_RELEASE(m_ReplayNVAPI);
@@ -1415,7 +1420,8 @@ RDResult WrappedID3D11Device::ReadLogInitialisation(RDCFile *rdc, bool storeStru
       else
       {
         extra +=
-            "\n\nMore debugging information may be available by enabling API validation on replay";
+            "\n\nMore debugging information may be available by enabling API validation on replay "
+            "via `File` -> `Open Capture with Options`";
       }
 
       if(HasFatalError())

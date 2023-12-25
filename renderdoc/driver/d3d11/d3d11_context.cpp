@@ -1036,7 +1036,7 @@ void WrappedID3D11DeviceContext::AddUsage(const ActionDescription &a)
   //////////////////////////////
   // Shaders
 
-  const D3D11RenderState::Shader *shArr[6] = {
+  const D3D11RenderState::Shader *shArr[NumShaderStages] = {
       &pipe->VS, &pipe->HS, &pipe->DS, &pipe->GS, &pipe->PS, &pipe->CS,
   };
 
@@ -1349,7 +1349,7 @@ RDResult WrappedID3D11DeviceContext::ReplayLog(CaptureState readType, uint32_t s
       {
         extra +=
             "\n\nMore debugging information may be available by enabling API validation on "
-            "replay";
+            "replay via `File` -> `Open Capture with Options`";
       }
 
       if(m_pDevice->HasFatalError())

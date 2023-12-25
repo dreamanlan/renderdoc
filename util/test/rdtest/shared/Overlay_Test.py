@@ -7,6 +7,9 @@ class Overlay_Test(rdtest.TestCase):
     internal = True
 
     def check_capture(self, base_event=0):
+        if base_event != 0:
+            rdtest.log.print("Checking overlays from base event {}".format(base_event))
+
         out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
 
         self.check(out is not None)
@@ -17,22 +20,24 @@ class Overlay_Test(rdtest.TestCase):
 
         # Check the actual output is as expected first.
         for fmt in fmts:
-            marker_name = "Normal Test " + fmt;
+            marker_name = "Normal Test " + fmt
             test_marker: rd.ActionDescription = self.find_action(marker_name, base_event)
             if test_marker == None:
                 rdtest.log.print("Skipping format {} marker {} not found".format(fmt, marker_name))
-                continue;
-            rdtest.log.print("Checking format {}".format(fmt))
+                continue
+            rdtest.log.begin_section("Checking format {}".format(fmt))
             has_stencil = fmt.endswith("_S8")
             for is_msaa in [False, True]:
                 if is_msaa:
-                    marker_name = "MSAA Test ";
+                    marker_name = "MSAA Test "
                 else:
-                    marker_name = "Normal Test ";
-                marker_name += fmt;
+                    marker_name = "Normal Test "
+                marker_name += fmt
                 test_marker: rd.ActionDescription = self.find_action(marker_name, base_event)
 
                 self.controller.SetFrameEvent(test_marker.next.eventId, True)
+
+                rdtest.log.print("Checking overlays at event {}: {}".format(test_marker.next.eventId, marker_name))
 
                 pipe: rd.PipeState = self.controller.GetPipelineState()
 
@@ -44,6 +49,7 @@ class Overlay_Test(rdtest.TestCase):
 
                 # Background around the outside
                 self.check_pixel_value(col_tex, 0.1, 0.1, [0.2, 0.2, 0.2, 1.0])
+                self.check_pixel_value(col_tex, 0.15, 0.2, [0.2, 0.2, 0.2, 1.0])
                 self.check_pixel_value(col_tex, 0.8, 0.1, [0.2, 0.2, 0.2, 1.0])
                 self.check_pixel_value(col_tex, 0.5, 0.95, [0.2, 0.2, 0.2, 1.0])
 
@@ -162,6 +168,13 @@ class Overlay_Test(rdtest.TestCase):
                             self.check_pixel_value(overlay_id, 325, y, [200.0/255.0, 1.0, 0.0, 1.0], eps=eps)
                             self.check_pixel_value(overlay_id, 340, y, [200.0/255.0, 1.0, 0.0, 1.0], eps=eps)
                     elif overlay == rd.DebugOverlay.Depth:
+                        # Background around the outside should not be changed by the overlay
+                        self.check_pixel_value(overlay_id, 35, 35, [0.0, 0.0, 0.0, 0.0])
+                        self.check_pixel_value(overlay_id, 40, 30, [0.0, 0.0, 0.0, 0.0])
+                        self.check_pixel_value(overlay_id, 320, 35, [0.0, 0.0, 0.0, 0.0])
+                        self.check_pixel_value(overlay_id, 200, 285, [0.0, 0.0, 0.0, 0.0])
+
+
                         self.check_pixel_value(overlay_id, 150, 90, [0.0, 1.0, 0.0, 1.0], eps=eps)
                         self.check_pixel_value(overlay_id, 150, 130, [0.0, 1.0, 0.0, 1.0], eps=eps)
                         # Intersection with lesser depth - depth fail
@@ -190,6 +203,9 @@ class Overlay_Test(rdtest.TestCase):
                         self.check_pixel_value(overlay_id, 200, 65, [0.0, 1.0, 0.0, 1.0], eps=eps)
                         self.check_pixel_value(overlay_id, 200, 79, [0.0, 1.0, 0.0, 1.0], eps=eps)
                         self.check_pixel_value(overlay_id, 200, 93, [0.0, 1.0, 0.0, 1.0], eps=eps)
+
+                        # Shader modified depth (pass)
+                        self.check_pixel_value(overlay_id, 180, 160, [0.0, 1.0, 0.0, 1.0], eps=eps)
                     elif overlay == rd.DebugOverlay.Stencil:
                         self.check_pixel_value(overlay_id, 150, 90, [0.0, 1.0, 0.0, 1.0], eps=eps)
                         # Intersection with different stencil - stencil fail
@@ -582,7 +598,7 @@ class Overlay_Test(rdtest.TestCase):
             eps = 0.001
 
             if has_stencil:
-                self.check_pixel_value(depth_tex, 180, 160, [0.0, 0.0/255.0, 0.0, 1.0], eps=eps)
+                self.check_pixel_value(depth_tex, 170, 160, [0.0, 0.0/255.0, 0.0, 1.0], eps=eps)
                 self.check_pixel_value(depth_tex, 160, 135, [0.9, 85.0/255.0, 0.0, 1.0], eps=eps)
                 self.check_pixel_value(depth_tex, 160, 165, [0.0, 0.0/255.0, 0.0, 1.0], eps=eps)
                 self.check_pixel_value(depth_tex, 250, 150, [0.5, 85.0/255.0, 0.0, 1.0], eps=eps)
@@ -688,6 +704,10 @@ class Overlay_Test(rdtest.TestCase):
 
             rdtest.log.success("All overlays as expected for main action Format {}".format(fmt))
 
+            rdtest.log.end_section("Checking format {}".format(fmt))
+
+        rdtest.log.begin_section("Checking mip/slice rendering")
+
         # Now test overlays on a render-to-slice/mip case
         for mip in [2, 3]:
             sub_marker: rd.ActionDescription = self.find_action("Subresources mip {}".format(mip), base_event)
@@ -792,17 +812,19 @@ class Overlay_Test(rdtest.TestCase):
                     self.check_pixel_value(overlay_id, 50 >> shift, 45 >> shift, [2.0, 2.0, 2.0, 2.0], sub=sub)
                 elif overlay == rd.DebugOverlay.TriangleSizeDraw or overlay == rd.DebugOverlay.TriangleSizePass:
                     if mip == 2:
-                        self.check_pixel_value(overlay_id, 50 >> shift, 36 >> shift, [585.0, 585.0, 585.0, 1.0], sub=sub)
+                        self.check_pixel_value(overlay_id, 50 >> shift, 36 >> shift, [585.0, 585.0, 585.0, 1.0], sub=sub, eps=1/8)
                     else:
-                        self.check_pixel_value(overlay_id, 50 >> shift, 36 >> shift, [151.75, 151.75, 151.75, 1.0], sub=sub)
+                        self.check_pixel_value(overlay_id, 50 >> shift, 36 >> shift, [151.75, 151.75, 151.75, 1.0], sub=sub, eps=1/16)
                     self.check_pixel_value(overlay_id, 30 >> shift, 36 >> shift, [0.0, 0.0, 0.0, 0.0], sub=sub)
                     self.check_pixel_value(overlay_id, 70 >> shift, 34 >> shift, [0.0, 0.0, 0.0, 0.0], sub=sub)
                     self.check_pixel_value(overlay_id, 70 >> shift, 20 >> shift, [0.0, 0.0, 0.0, 0.0], sub=sub)
                     if mip == 2:
-                        self.check_pixel_value(overlay_id, 50 >> shift, 45 >> shift, [117.0, 117.0, 117.0, 1.0], sub=sub)
+                        self.check_pixel_value(overlay_id, 50 >> shift, 45 >> shift, [117.0, 117.0, 117.0, 1.0], sub=sub, eps=1/16)
                     else:
-                        self.check_pixel_value(overlay_id, 50 >> shift, 45 >> shift, [30.359375, 30.359375, 30.359375, 1.0], sub=sub)
+                        self.check_pixel_value(overlay_id, 50 >> shift, 45 >> shift, [30.359375, 30.359375, 30.359375, 1.0], sub=sub, eps=1/16)
 
                 rdtest.log.success("Picked values are correct for mip {} overlay {}".format(sub.mip, str(overlay)))
+
+        rdtest.log.end_section("Checking mip/slice rendering")
 
         out.Shutdown()

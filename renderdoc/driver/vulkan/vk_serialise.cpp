@@ -773,6 +773,12 @@ SERIALISE_VK_HANDLES();
                VkPhysicalDeviceMemoryPriorityFeaturesEXT)                                              \
   PNEXT_STRUCT(VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT, VkMemoryPriorityAllocateInfoEXT)   \
                                                                                                        \
+  /* VK_EXT_mesh_shader */                                                                             \
+  PNEXT_STRUCT(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,                             \
+               VkPhysicalDeviceMeshShaderFeaturesEXT)                                                  \
+  PNEXT_STRUCT(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT,                           \
+               VkPhysicalDeviceMeshShaderPropertiesEXT)                                                \
+                                                                                                       \
   /* VK_EXT_mutable_descriptor_type */                                                                 \
   PNEXT_STRUCT(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT,                 \
                VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT)                                       \
@@ -1506,10 +1512,6 @@ SERIALISE_VK_HANDLES();
                                                                                                        \
   /* VK_EXT_legacy_dithering */                                                                        \
   PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_DITHERING_FEATURES_EXT)                   \
-                                                                                                       \
-  /* VK_EXT_mesh_shader */                                                                             \
-  PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT)                        \
-  PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT)                      \
                                                                                                        \
   /* VK_EXT_metal_objects */                                                                           \
   PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT)                             \
@@ -2460,8 +2462,8 @@ void DoSerialise(SerialiserType &ser, VkBufferViewCreateInfo &el)
   SERIALISE_MEMBER_VKFLAGS(VkBufferViewCreateFlags, flags);
   SERIALISE_MEMBER(buffer).Important();
   SERIALISE_MEMBER(format).Important();
-  SERIALISE_MEMBER(offset);
-  SERIALISE_MEMBER(range);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
+  SERIALISE_MEMBER(range).OffsetOrSize();
 }
 
 template <>
@@ -2541,10 +2543,10 @@ void Deserialise(const VkImageViewCreateInfo &el)
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VkSparseMemoryBind &el)
 {
-  SERIALISE_MEMBER(resourceOffset);
-  SERIALISE_MEMBER(size);
+  SERIALISE_MEMBER(resourceOffset).OffsetOrSize();
+  SERIALISE_MEMBER(size).OffsetOrSize();
   SERIALISE_MEMBER(memory);
-  SERIALISE_MEMBER(memoryOffset);
+  SERIALISE_MEMBER(memoryOffset).OffsetOrSize();
   SERIALISE_MEMBER_VKFLAGS(VkSparseMemoryBindFlags, flags);
 }
 
@@ -2580,10 +2582,10 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VkSparseImageMemoryBind &el)
 {
   SERIALISE_MEMBER(subresource);
-  SERIALISE_MEMBER(offset);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
   SERIALISE_MEMBER(extent);
   SERIALISE_MEMBER(memory);
-  SERIALISE_MEMBER(memoryOffset);
+  SERIALISE_MEMBER(memoryOffset).OffsetOrSize();
   SERIALISE_MEMBER_VKFLAGS(VkSparseMemoryBindFlags, flags);
 }
 
@@ -2828,7 +2830,7 @@ void DoSerialise(SerialiserType &ser, VkVertexInputAttributeDescription &el)
   SERIALISE_MEMBER(location);
   SERIALISE_MEMBER(binding);
   SERIALISE_MEMBER(format);
-  SERIALISE_MEMBER(offset);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
 }
 
 template <typename SerialiserType>
@@ -3239,14 +3241,14 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VkSpecializationMapEntry &el)
 {
   SERIALISE_MEMBER(constantID);
-  SERIALISE_MEMBER(offset);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
   // this was accidentally duplicated - hide it from the UI
   SERIALISE_MEMBER(constantID).Hidden();
 
   // don't serialise size_t, otherwise capture/replay between different bit-ness won't work
   {
     uint64_t size = el.size;
-    ser.Serialise("size"_lit, size);
+    ser.Serialise("size"_lit, size).OffsetOrSize();
     if(ser.IsReading())
       el.size = (size_t)size;
   }
@@ -3388,7 +3390,7 @@ void DoSerialise(SerialiserType &ser, VkMemoryAllocateInfo &el)
   RDCASSERT(ser.IsReading() || el.sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
   SerialiseNext(ser, el.sType, el.pNext);
 
-  SERIALISE_MEMBER(allocationSize).Important();
+  SERIALISE_MEMBER(allocationSize).Important().OffsetOrSize();
   SERIALISE_MEMBER(memoryTypeIndex).Important();
 }
 
@@ -3431,8 +3433,8 @@ void DoSerialise(SerialiserType &ser, VkBufferMemoryBarrier &el)
   SERIALISE_MEMBER_TYPED(int32_t, srcQueueFamilyIndex);
   SERIALISE_MEMBER_TYPED(int32_t, dstQueueFamilyIndex);
   SERIALISE_MEMBER(buffer).Important();
-  SERIALISE_MEMBER(offset);
-  SERIALISE_MEMBER(size);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
+  SERIALISE_MEMBER(size).OffsetOrSize();
 }
 
 template <>
@@ -3490,8 +3492,21 @@ void DoSerialise(SerialiserType &ser, VkGraphicsPipelineCreateInfo &el)
     hasTess |= (el.pStages[i].stage & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                                        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)) != 0;
 
-  SERIALISE_MEMBER_OPT(pVertexInputState);
-  SERIALISE_MEMBER_OPT(pInputAssemblyState);
+  bool hasMesh = false;
+  for(uint32_t i = 0; i < el.stageCount; i++)
+    hasMesh |= (el.pStages[i].stage & VK_SHADER_STAGE_MESH_BIT_EXT) != 0;
+
+  // if we have mesh shaders, fixed function vertex input is ignored and may be garbage
+  if(hasMesh)
+  {
+    SERIALISE_MEMBER_OPT_EMPTY(pVertexInputState);
+    SERIALISE_MEMBER_OPT_EMPTY(pInputAssemblyState);
+  }
+  else
+  {
+    SERIALISE_MEMBER_OPT(pVertexInputState);
+    SERIALISE_MEMBER_OPT(pInputAssemblyState);
+  }
 
   // if we don't have tessellation shaders, pTessellationState is ignored and may be garbage
   if(hasTess)
@@ -3802,8 +3817,8 @@ void DoSerialise(SerialiserType &ser, VkDescriptorBufferInfo &el)
   OPTIONAL_RESOURCES();
 
   SERIALISE_MEMBER(buffer);
-  SERIALISE_MEMBER(offset);
-  SERIALISE_MEMBER(range);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
+  SERIALISE_MEMBER(range).OffsetOrSize();
 }
 
 template <typename SerialiserType>
@@ -3928,8 +3943,8 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VkPushConstantRange &el)
 {
   SERIALISE_MEMBER_VKFLAGS(VkShaderStageFlags, stageFlags);
-  SERIALISE_MEMBER(offset);
-  SERIALISE_MEMBER(size);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
+  SERIALISE_MEMBER(size).OffsetOrSize();
 }
 
 template <typename SerialiserType>
@@ -3994,8 +4009,8 @@ void DoSerialise(SerialiserType &ser, VkMappedMemoryRange &el)
   SerialiseNext(ser, el.sType, el.pNext);
 
   SERIALISE_MEMBER(memory).Important();
-  SERIALISE_MEMBER(offset);
-  SERIALISE_MEMBER(size);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
+  SERIALISE_MEMBER(size).OffsetOrSize();
 }
 
 template <>
@@ -4007,7 +4022,7 @@ void Deserialise(const VkMappedMemoryRange &el)
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VkBufferImageCopy &el)
 {
-  SERIALISE_MEMBER(bufferOffset);
+  SERIALISE_MEMBER(bufferOffset).OffsetOrSize();
   SERIALISE_MEMBER(bufferRowLength);
   SERIALISE_MEMBER(bufferImageHeight);
   SERIALISE_MEMBER(imageSubresource);
@@ -4018,9 +4033,9 @@ void DoSerialise(SerialiserType &ser, VkBufferImageCopy &el)
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VkBufferCopy &el)
 {
-  SERIALISE_MEMBER(srcOffset);
-  SERIALISE_MEMBER(dstOffset);
-  SERIALISE_MEMBER(size);
+  SERIALISE_MEMBER(srcOffset).OffsetOrSize();
+  SERIALISE_MEMBER(dstOffset).OffsetOrSize();
+  SERIALISE_MEMBER(size).OffsetOrSize();
 }
 
 template <typename SerialiserType>
@@ -5126,8 +5141,8 @@ void DoSerialise(SerialiserType &ser, DescriptorSetSlot &el)
     {
       VkDeviceSize offset = el.offset;
       VkDeviceSize range = el.GetRange();
-      SERIALISE_ELEMENT(offset);
-      SERIALISE_ELEMENT(range);
+      SERIALISE_ELEMENT(offset).OffsetOrSize();
+      SERIALISE_ELEMENT(range).OffsetOrSize();
       el.offset = offset;
       el.range = range;
     }
@@ -5313,8 +5328,8 @@ void DoSerialise(SerialiserType &ser, VkDescriptorUpdateTemplateEntry &el)
       offset = el.offset;
       stride = el.stride;
     }
-    ser.Serialise("offset"_lit, offset);
-    ser.Serialise("stride"_lit, stride);
+    ser.Serialise("offset"_lit, offset).OffsetOrSize();
+    ser.Serialise("stride"_lit, stride).OffsetOrSize();
     if(ser.IsReading())
     {
       el.offset = (size_t)offset;
@@ -5324,8 +5339,8 @@ void DoSerialise(SerialiserType &ser, VkDescriptorUpdateTemplateEntry &el)
 #if DISABLED(RDOC_APPLE)
   else
   {
-    SERIALISE_MEMBER(offset);
-    SERIALISE_MEMBER(stride);
+    SERIALISE_MEMBER(offset).OffsetOrSize();
+    SERIALISE_MEMBER(stride).OffsetOrSize();
   }
 #endif
 }
@@ -5379,7 +5394,7 @@ void DoSerialise(SerialiserType &ser, VkBindBufferMemoryInfo &el)
 
   SERIALISE_MEMBER(buffer).Important();
   SERIALISE_MEMBER(memory).Important();
-  SERIALISE_MEMBER(memoryOffset);
+  SERIALISE_MEMBER(memoryOffset).OffsetOrSize();
 }
 
 template <>
@@ -5396,7 +5411,7 @@ void DoSerialise(SerialiserType &ser, VkBindImageMemoryInfo &el)
 
   SERIALISE_MEMBER(image).Important();
   SERIALISE_MEMBER(memory).Important();
-  SERIALISE_MEMBER(memoryOffset);
+  SERIALISE_MEMBER(memoryOffset).OffsetOrSize();
 }
 
 template <>
@@ -7861,9 +7876,9 @@ void DoSerialise(SerialiserType &ser, VkBufferCopy2 &el)
   RDCASSERT(ser.IsReading() || el.sType == VK_STRUCTURE_TYPE_BUFFER_COPY_2);
   SerialiseNext(ser, el.sType, el.pNext);
 
-  SERIALISE_MEMBER(srcOffset);
-  SERIALISE_MEMBER(dstOffset);
-  SERIALISE_MEMBER(size);
+  SERIALISE_MEMBER(srcOffset).OffsetOrSize();
+  SERIALISE_MEMBER(dstOffset).OffsetOrSize();
+  SERIALISE_MEMBER(size).OffsetOrSize();
 }
 
 template <>
@@ -7937,7 +7952,7 @@ void DoSerialise(SerialiserType &ser, VkBufferImageCopy2 &el)
   RDCASSERT(ser.IsReading() || el.sType == VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2);
   SerialiseNext(ser, el.sType, el.pNext);
 
-  SERIALISE_MEMBER(bufferOffset);
+  SERIALISE_MEMBER(bufferOffset).OffsetOrSize();
   SERIALISE_MEMBER(bufferRowLength);
   SERIALISE_MEMBER(bufferImageHeight);
   SERIALISE_MEMBER(imageSubresource);
@@ -8271,6 +8286,14 @@ void DoSerialise(SerialiserType &ser, VkDrawIndexedIndirectCommand &el)
   SERIALISE_MEMBER(firstIndex);
   SERIALISE_MEMBER(vertexOffset);
   SERIALISE_MEMBER(firstInstance);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkDrawMeshTasksIndirectCommandEXT &el)
+{
+  SERIALISE_MEMBER(groupCountX);
+  SERIALISE_MEMBER(groupCountY);
+  SERIALISE_MEMBER(groupCountZ);
 }
 
 template <typename SerialiserType>
@@ -9912,6 +9935,69 @@ void Deserialise(const VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT &el)
 }
 
 template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkPhysicalDeviceMeshShaderFeaturesEXT &el)
+{
+  RDCASSERT(ser.IsReading() ||
+            el.sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
+  SerialiseNext(ser, el.sType, el.pNext);
+
+  SERIALISE_MEMBER(taskShader);
+  SERIALISE_MEMBER(meshShader);
+  SERIALISE_MEMBER(multiviewMeshShader);
+  SERIALISE_MEMBER(primitiveFragmentShadingRateMeshShader);
+  SERIALISE_MEMBER(meshShaderQueries);
+}
+
+template <>
+void Deserialise(const VkPhysicalDeviceMeshShaderFeaturesEXT &el)
+{
+  DeserialiseNext(el.pNext);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkPhysicalDeviceMeshShaderPropertiesEXT &el)
+{
+  RDCASSERT(ser.IsReading() ||
+            el.sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT);
+  SerialiseNext(ser, el.sType, el.pNext);
+
+  SERIALISE_MEMBER(maxTaskWorkGroupTotalCount);
+  SERIALISE_MEMBER(maxTaskWorkGroupCount);
+  SERIALISE_MEMBER(maxTaskWorkGroupInvocations);
+  SERIALISE_MEMBER(maxTaskWorkGroupSize);
+  SERIALISE_MEMBER(maxTaskPayloadSize);
+  SERIALISE_MEMBER(maxTaskSharedMemorySize);
+  SERIALISE_MEMBER(maxTaskPayloadAndSharedMemorySize);
+  SERIALISE_MEMBER(maxMeshWorkGroupTotalCount);
+  SERIALISE_MEMBER(maxMeshWorkGroupCount);
+  SERIALISE_MEMBER(maxMeshWorkGroupInvocations);
+  SERIALISE_MEMBER(maxMeshWorkGroupSize);
+  SERIALISE_MEMBER(maxMeshSharedMemorySize);
+  SERIALISE_MEMBER(maxMeshPayloadAndSharedMemorySize);
+  SERIALISE_MEMBER(maxMeshOutputMemorySize);
+  SERIALISE_MEMBER(maxMeshPayloadAndOutputMemorySize);
+  SERIALISE_MEMBER(maxMeshOutputComponents);
+  SERIALISE_MEMBER(maxMeshOutputVertices);
+  SERIALISE_MEMBER(maxMeshOutputPrimitives);
+  SERIALISE_MEMBER(maxMeshOutputLayers);
+  SERIALISE_MEMBER(maxMeshMultiviewViewCount);
+  SERIALISE_MEMBER(meshOutputPerVertexGranularity);
+  SERIALISE_MEMBER(meshOutputPerPrimitiveGranularity);
+  SERIALISE_MEMBER(maxPreferredTaskWorkGroupInvocations);
+  SERIALISE_MEMBER(maxPreferredMeshWorkGroupInvocations);
+  SERIALISE_MEMBER(prefersLocalInvocationVertexOutput);
+  SERIALISE_MEMBER(prefersLocalInvocationPrimitiveOutput);
+  SERIALISE_MEMBER(prefersCompactVertexOutput);
+  SERIALISE_MEMBER(prefersCompactPrimitiveOutput);
+}
+
+template <>
+void Deserialise(const VkPhysicalDeviceMeshShaderPropertiesEXT &el)
+{
+  DeserialiseNext(el.pNext);
+}
+
+template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT &el)
 {
   RDCASSERT(ser.IsReading() ||
@@ -10492,8 +10578,8 @@ void DoSerialise(SerialiserType &ser, VkBufferMemoryBarrier2 &el)
   SERIALISE_MEMBER_TYPED(int32_t, srcQueueFamilyIndex);
   SERIALISE_MEMBER_TYPED(int32_t, dstQueueFamilyIndex);
   SERIALISE_MEMBER(buffer).Important();
-  SERIALISE_MEMBER(offset);
-  SERIALISE_MEMBER(size);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
+  SERIALISE_MEMBER(size).OffsetOrSize();
 }
 
 template <>
@@ -11157,7 +11243,7 @@ void DoSerialise(SerialiserType &ser, VkConditionalRenderingBeginInfoEXT &el)
   SerialiseNext(ser, el.sType, el.pNext);
 
   SERIALISE_MEMBER(buffer).Important();
-  SERIALISE_MEMBER(offset);
+  SERIALISE_MEMBER(offset).OffsetOrSize();
   SERIALISE_MEMBER_VKFLAGS(VkConditionalRenderingFlagsEXT, flags);
 }
 
@@ -11587,6 +11673,8 @@ INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMaintenance4Properties);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMemoryBudgetPropertiesEXT);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMemoryPriorityFeaturesEXT);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMemoryProperties2);
+INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMeshShaderFeaturesEXT);
+INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMeshShaderPropertiesEXT);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMultiviewFeatures);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceMultiviewProperties);
@@ -11803,6 +11891,7 @@ INSTANTIATE_SERIALISE_TYPE(VkDisplayPlanePropertiesKHR);
 INSTANTIATE_SERIALISE_TYPE(VkDisplayPropertiesKHR);
 INSTANTIATE_SERIALISE_TYPE(VkDrawIndexedIndirectCommand);
 INSTANTIATE_SERIALISE_TYPE(VkDrawIndirectCommand);
+INSTANTIATE_SERIALISE_TYPE(VkDrawMeshTasksIndirectCommandEXT);
 INSTANTIATE_SERIALISE_TYPE(VkExtent2D);
 INSTANTIATE_SERIALISE_TYPE(VkExtent3D);
 INSTANTIATE_SERIALISE_TYPE(VkExternalMemoryProperties);

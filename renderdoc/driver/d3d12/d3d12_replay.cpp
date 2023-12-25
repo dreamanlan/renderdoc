@@ -48,6 +48,8 @@
 RDOC_CONFIG(bool, D3D12_HardwareCounters, true,
             "Enable support for IHV-specific hardware counters on D3D12.");
 
+RDOC_DEBUG_CONFIG(bool, D3D12_PixelHistory, false, "BETA: Enable D3D12 pixel history support.");
+
 // this is global so we can free it even after D3D12Replay is destroyed
 static HMODULE D3D12Lib = NULL;
 
@@ -65,6 +67,8 @@ D3D12Replay::D3D12Replay(WrappedID3D12Device *d)
 
 void D3D12Replay::Shutdown()
 {
+  bool apiValidation = m_pDevice->GetReplayOptions().apiValidation;
+
   for(size_t i = 0; i < m_ProxyResources.size(); i++)
     m_ProxyResources[i]->Release();
   m_ProxyResources.clear();
@@ -80,8 +84,12 @@ void D3D12Replay::Shutdown()
 
   // we should have unloaded both modules here by now. If we haven't - we probably leaked some D3D12
   // objects. This can cause subsequent captures to fail to open.
-  RDCASSERT(GetModuleHandleA("d3d12.dll") == NULL);
-  RDCASSERT(GetModuleHandleA("d3d12core.dll") == NULL);
+  // Unless API validation is enabled, as the validation layers don't refcount the DLL properly
+  if(!apiValidation)
+  {
+    RDCASSERT(GetModuleHandleA("d3d12.dll") == NULL);
+    RDCASSERT(GetModuleHandleA("d3d12core.dll") == NULL);
+  }
 }
 
 void D3D12Replay::Initialise(IDXGIFactory1 *factory)
@@ -301,6 +309,7 @@ APIProperties D3D12Replay::GetAPIProperties()
       (m_DriverInfo.vendor == GPUVendor::AMD || m_DriverInfo.vendor == GPUVendor::Samsung) &&
       m_RGP != NULL && m_RGP->DriverSupportsInterop();
   ret.shaderDebugging = true;
+  ret.pixelHistory = D3D12_PixelHistory();
 
   return ret;
 }
@@ -624,6 +633,8 @@ rdcstr D3D12Replay::DisassembleShader(ResourceId pipeline, const ShaderReflectio
       case ShaderStage::Geometry: search = "stage=\"GS\""; break;
       case ShaderStage::Pixel: search = "stage=\"PS\""; break;
       case ShaderStage::Compute: search = "stage=\"CS\""; break;
+      case ShaderStage::Amplification: search = "stage=\"AS\""; break;
+      case ShaderStage::Mesh: search = "stage=\"MS\""; break;
       default: return "; Unknown shader stage in shader reflection\n";
     }
 
@@ -1030,12 +1041,14 @@ ShaderStageMask ToShaderStageMask(D3D12_SHADER_VISIBILITY vis)
     case D3D12_SHADER_VISIBILITY_DOMAIN: return ShaderStageMask::Domain;
     case D3D12_SHADER_VISIBILITY_GEOMETRY: return ShaderStageMask::Geometry;
     case D3D12_SHADER_VISIBILITY_PIXEL: return ShaderStageMask::Pixel;
+    case D3D12_SHADER_VISIBILITY_AMPLIFICATION: return ShaderStageMask::Amplification;
+    case D3D12_SHADER_VISIBILITY_MESH: return ShaderStageMask::Mesh;
     default: return ShaderStageMask::Unknown;
   }
 }
 
 void D3D12Replay::FillRootElements(uint32_t eventId, const D3D12RenderState::RootSignature &rootSig,
-                                   const ShaderBindpointMapping *mappings[(uint32_t)ShaderStage::Count],
+                                   const ShaderBindpointMapping *mappings[NumShaderStages],
                                    rdcarray<D3D12Pipe::RootSignatureRange> &rootElements)
 {
   if(rootSig.rootsig == ResourceId())
@@ -1730,14 +1743,35 @@ void D3D12Replay::SavePipelineState(uint32_t eventId)
   }
   else if(pipe)
   {
-    D3D12Pipe::Shader *dstArr[] = {&state.vertexShader, &state.hullShader, &state.domainShader,
-                                   &state.geometryShader, &state.pixelShader};
+    D3D12Pipe::Shader *dstArr[] = {
+        &state.vertexShader,
+        &state.hullShader,
+        &state.domainShader,
+        &state.geometryShader,
+        &state.pixelShader,
+        // compute
+        NULL,
+        &state.ampShader,
+        &state.meshShader,
+    };
 
-    D3D12_SHADER_BYTECODE *srcArr[] = {&pipe->graphics->VS, &pipe->graphics->HS, &pipe->graphics->DS,
-                                       &pipe->graphics->GS, &pipe->graphics->PS};
+    D3D12_SHADER_BYTECODE *srcArr[] = {
+        &pipe->graphics->VS,
+        &pipe->graphics->HS,
+        &pipe->graphics->DS,
+        &pipe->graphics->GS,
+        &pipe->graphics->PS,
+        // compute
+        NULL,
+        &pipe->graphics->AS,
+        &pipe->graphics->MS,
+    };
 
-    for(size_t stage = 0; stage < 5; stage++)
+    for(size_t stage = 0; stage < ARRAY_COUNT(dstArr); stage++)
     {
+      if(!dstArr[stage])
+        continue;
+
       D3D12Pipe::Shader &dst = *dstArr[stage];
       D3D12_SHADER_BYTECODE &src = *srcArr[stage];
 
@@ -1764,13 +1798,15 @@ void D3D12Replay::SavePipelineState(uint32_t eventId)
   // Root Signature
   /////////////////////////////////////////////////
   {
-    const ShaderBindpointMapping *mappings[(uint32_t)ShaderStage::Count];
+    const ShaderBindpointMapping *mappings[NumShaderStages];
     mappings[(uint32_t)ShaderStage::Vertex] = &state.vertexShader.bindpointMapping;
     mappings[(uint32_t)ShaderStage::Hull] = &state.hullShader.bindpointMapping;
     mappings[(uint32_t)ShaderStage::Domain] = &state.domainShader.bindpointMapping;
     mappings[(uint32_t)ShaderStage::Geometry] = &state.geometryShader.bindpointMapping;
     mappings[(uint32_t)ShaderStage::Pixel] = &state.pixelShader.bindpointMapping;
     mappings[(uint32_t)ShaderStage::Compute] = &state.computeShader.bindpointMapping;
+    mappings[(uint32_t)ShaderStage::Amplification] = &state.ampShader.bindpointMapping;
+    mappings[(uint32_t)ShaderStage::Mesh] = &state.meshShader.bindpointMapping;
 
     if(pipe && pipe->IsCompute())
     {
@@ -3211,7 +3247,7 @@ rdcarray<uint32_t> D3D12Replay::GetPassEvents(uint32_t eventId)
     // so we don't actually do anything (init postvs/action overlay)
     // but it's useful to have the first part of the pass as part
     // of the list
-    if(start->flags & (ActionFlags::Drawcall | ActionFlags::PassBoundary))
+    if(start->flags & (ActionFlags::MeshDispatch | ActionFlags::Drawcall | ActionFlags::PassBoundary))
       passEvents.push_back(start->eventId);
 
     start = start->next;
@@ -3362,6 +3398,8 @@ void D3D12Replay::BuildShader(ShaderEncoding sourceEncoding, const bytebuf &sour
         case ShaderStage::Geometry: profile = "gs_5_1"; break;
         case ShaderStage::Pixel: profile = "ps_5_1"; break;
         case ShaderStage::Compute: profile = "cs_5_1"; break;
+        case ShaderStage::Amplification: profile = "as_6_5"; break;
+        case ShaderStage::Mesh: profile = "ms_6_5"; break;
         default:
           RDCERR("Unexpected type in BuildShader!");
           id = ResourceId();
@@ -3488,7 +3526,7 @@ void D3D12Replay::RefreshDerivedReplacements()
 
     if(pipe->IsGraphics())
     {
-      ResourceId shaders[5];
+      ResourceId shaders[NumShaderStages];
 
       if(pipe->VS())
         shaders[0] = rm->GetOriginalID(pipe->VS()->GetResourceID());
@@ -3500,6 +3538,10 @@ void D3D12Replay::RefreshDerivedReplacements()
         shaders[3] = rm->GetOriginalID(pipe->GS()->GetResourceID());
       if(pipe->PS())
         shaders[4] = rm->GetOriginalID(pipe->PS()->GetResourceID());
+      if(pipe->AS())
+        shaders[6] = rm->GetOriginalID(pipe->AS()->GetResourceID());
+      if(pipe->MS())
+        shaders[7] = rm->GetOriginalID(pipe->MS()->GetResourceID());
 
       for(size_t i = 0; i < ARRAY_COUNT(shaders); i++)
       {
@@ -3526,7 +3568,7 @@ void D3D12Replay::RefreshDerivedReplacements()
         D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC desc = *pipe->graphics;
 
         D3D12_SHADER_BYTECODE *shaders[] = {
-            &desc.VS, &desc.HS, &desc.DS, &desc.GS, &desc.PS,
+            &desc.VS, &desc.HS, &desc.DS, &desc.GS, &desc.PS, &desc.AS, &desc.MS,
         };
 
         for(size_t s = 0; s < ARRAY_COUNT(shaders); s++)
@@ -4274,13 +4316,6 @@ ResourceId D3D12Replay::ApplyCustomShader(TextureDisplay &display)
 }
 
 #pragma region not yet implemented
-
-rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> events,
-                                                      ResourceId target, uint32_t x, uint32_t y,
-                                                      const Subresource &sub, CompType typeCast)
-{
-  return {};
-}
 
 ResourceId D3D12Replay::CreateProxyTexture(const TextureDescription &templateTex)
 {

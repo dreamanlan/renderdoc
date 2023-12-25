@@ -85,6 +85,29 @@ void main()
 
 )EOSHADER";
 
+  std::string fragdepthpixel = R"EOSHADER(
+
+in v2f vertIn;
+
+layout(location = 0, index = 0) out vec4 Color;
+
+void main()
+{
+	Color = vertIn.col;
+
+	if ((gl_FragCoord.x > 180.0) && (gl_FragCoord.x < 185.0) &&
+      (gl_FragCoord.y > 135.0) && (gl_FragCoord.y < 145.0))
+	{
+		gl_FragDepth = 0.0;
+	}
+  else
+  {
+		gl_FragDepth = gl_FragCoord.z;
+  }
+}
+
+)EOSHADER";
+
   int main()
   {
     // initialise, create window, create context, etc
@@ -176,6 +199,7 @@ void main()
 
     GLuint program = MakeProgram(common + vertex, common + pixel);
     GLuint whiteprogram = MakeProgram(common + vertex, whitepixel);
+    GLuint fragdepthprogram = MakeProgram(common + vertex, common + fragdepthpixel);
 
     const char *fmtNames[] = {"D24_S8", "D32F_S8", "D16_S0", "D24_S0", "D32F_S0"};
     GLenum fmts[] = {GL_DEPTH24_STENCIL8, GL_DEPTH32F_STENCIL8, GL_DEPTH_COMPONENT16,
@@ -295,6 +319,14 @@ void main()
           float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
           glClearBufferfv(GL_COLOR, 0, col);
           glClearBufferfi(GL_DEPTH_STENCIL, 0, 1.0f, 0);
+
+          if(hasStencil)
+          {
+            glScissor(32, GLsizei(screenHeight) - 32, 6, 6);
+            glClearBufferfi(GL_DEPTH_STENCIL, 0, 1.0f, 1);
+            glScissor(0, 0, screenWidth, screenHeight);
+          }
+
           glUseProgram(program);
 
           // 1: write depth
@@ -320,7 +352,9 @@ void main()
 
           glEnable(GL_STENCIL_TEST);
           glStencilFunc(GL_GREATER, 0x55, 0xff);
+          glUseProgram(fragdepthprogram);
           glDrawArrays(GL_TRIANGLES, 9, 24);
+          glUseProgram(program);
 
           if(!is_msaa)
           {

@@ -596,8 +596,27 @@ protected:
     // copy using a compute shader into a staging image first
     if(p.multisampled)
     {
-      // TODO: Is a resource transition needed here?
+      // For pipeline barriers.
+      D3D12_RESOURCE_BARRIER barriers[2] = {};
+      barriers[0] = barrier;
+      barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      // Validation will complain if we don't transition all subresources for an SRV.
+      barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+      barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+      barriers[1].Transition.pResource = m_CallbackInfo.dstBuffer;
+      barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      barriers[1].Transition.Subresource = 0;
+
+      cmd->ResourceBarrier(2, barriers);
+
       m_pDevice->GetDebugManager()->PixelHistoryCopyPixel(cmd, m_CallbackInfo.dstBuffer, p, offset);
+
+      std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+      std::swap(barriers[1].Transition.StateBefore, barriers[1].Transition.StateAfter);
+      cmd->ResourceBarrier(2, barriers);
     }
     else
     {
@@ -1068,11 +1087,26 @@ private:
                                            ? D3D12_RESOURCE_STATE_DEPTH_READ
                                            : D3D12_RESOURCE_STATE_DEPTH_WRITE;
       targetCopyParams.srcImageFormat = GetDepthSRVFormat(m_CallbackInfo.targetDesc.Format, 0);
+      targetCopyParams.depthcopy = true;
       targetCopyParams.copyFormat = DXGI_FORMAT_R32_TYPELESS;
       offset += offsetof(struct D3D12PixelHistoryValue, depth);
     }
 
     CopyImagePixel(cmd, targetCopyParams, offset);
+
+    if(IsDepthAndStencilFormat(m_CallbackInfo.targetDesc.Format))
+    {
+      D3D12CopyPixelParams stencilCopyParams = targetCopyParams;
+      stencilCopyParams.srcImageFormat =
+          GetDepthSRVFormat(m_CallbackInfo.targetImage->GetDesc().Format, 1);
+      stencilCopyParams.copyFormat = DXGI_FORMAT_R8_TYPELESS;
+      stencilCopyParams.planeSlice = 1;
+      stencilCopyParams.srcImageState =
+          m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
+              ? D3D12_RESOURCE_STATE_DEPTH_READ
+              : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      CopyImagePixel(cmd, stencilCopyParams, offset + sizeof(float));
+    }
 
     // If the target image is a depth/stencil view, we already copied the value above.
     if(IsDepthFormat(m_CallbackInfo.targetDesc.Format))
@@ -1246,6 +1280,19 @@ struct D3D12TestsFailedCallback : public D3D12PixelHistoryCallback
     uint32_t eventFlags = CalculateEventFlags(pipeState);
     m_EventFlags[eid] = eventFlags;
 
+    WrappedID3D12PipelineState *origPSO =
+        m_pDevice->GetResourceManager()->GetCurrentAs<WrappedID3D12PipelineState>(pipeState.pipe);
+    if(origPSO == NULL)
+      RDCERR("Failed to retrieve original PSO for pixel history.");
+
+    D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC pipeDesc;
+    origPSO->Fill(pipeDesc);
+
+    if(pipeDesc.DepthStencilState.DepthBoundsTestEnable)
+      m_EventDepthBounds[eid] = {pipeState.depthBoundsMin, pipeState.depthBoundsMax};
+    else
+      m_EventDepthBounds[eid] = {};
+
     // TODO: figure out if the shader has early fragments tests turned on,
     // based on the currently bound fragment shader.
     bool earlyFragmentTests = false;
@@ -1274,6 +1321,13 @@ struct D3D12TestsFailedCallback : public D3D12PixelHistoryCallback
   {
     auto it = m_EventFlags.find(eventId);
     if(it == m_EventFlags.end())
+      RDCERR("Can't find event flags for event %u", eventId);
+    return it->second;
+  }
+  rdcpair<float, float> GetEventDepthBounds(uint32_t eventId)
+  {
+    auto it = m_EventDepthBounds.find(eventId);
+    if(it == m_EventDepthBounds.end())
       RDCERR("Can't find event flags for event %u", eventId);
     return it->second;
   }
@@ -1731,6 +1785,7 @@ private:
   rdcarray<uint32_t> m_Events;
   // Key is event ID, value is the flags for that event.
   std::map<uint32_t, uint32_t> m_EventFlags;
+  std::map<uint32_t, rdcpair<float, float>> m_EventDepthBounds;
   // Key is a pair <Base pipeline, pipeline flags>
   std::map<rdcpair<ResourceId, uint32_t>, ID3D12PipelineState *> m_PipeCache;
   // Key: pair <event ID, test>
@@ -2972,6 +3027,7 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
           else
             history[h].postMod.depth =
                 GetDepthValue(DXGI_FORMAT_D32_FLOAT_S8X24_UINT, fragInfo[offset].postMod);
+          history[h].postMod.stencil = -2;
         }
         // If it is not the first fragment for the event, set the preMod to the
         // postMod of the previous fragment.
@@ -3021,6 +3077,13 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
 
         if(!passed)
           history[h].depthTestFailed = true;
+
+        rdcpair<float, float> depthBounds = tfCb->GetEventDepthBounds(history[h].eventId);
+
+        if((history[h].preMod.depth < depthBounds.first ||
+            history[h].preMod.depth > depthBounds.second) &&
+           depthBounds.second > depthBounds.first)
+          history[h].depthBoundsFailed = true;
       }
     }
   }

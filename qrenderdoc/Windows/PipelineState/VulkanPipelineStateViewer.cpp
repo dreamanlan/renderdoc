@@ -2058,6 +2058,9 @@ void VulkanPipelineStateViewer::setShaderState(const VKPipe::Shader &stage,
       shText += lit(" - ") + QFileInfo(dbg.files[entryFile].filename).fileName();
   }
 
+  if(stage.requiredSubgroupSize != 0)
+    shText += tr(" (Subgroup size %1)").arg(stage.requiredSubgroupSize);
+
   shader->setText(shText);
 
   int vs = 0;
@@ -2262,13 +2265,18 @@ void VulkanPipelineStateViewer::setState()
   // highlight the appropriate stages in the flowchart
   if(action == NULL)
   {
-    setOldMeshPipeFlow();
-    ui->pipeFlow->setStagesEnabled({true, true, true, true, true, true, true, true, true});
+    QList<bool> allOn;
+    for(int i = 0; i < ui->pipeFlow->stageNames().count(); i++)
+      allOn.append(true);
+    ui->pipeFlow->setStagesEnabled(allOn);
   }
   else if(action->flags & ActionFlags::Dispatch)
   {
-    setOldMeshPipeFlow();
-    ui->pipeFlow->setStagesEnabled({false, false, false, false, false, false, false, false, true});
+    QList<bool> computeOnly;
+    for(int i = 0; i < ui->pipeFlow->stageNames().count(); i++)
+      computeOnly.append(false);
+    computeOnly.back() = true;
+    ui->pipeFlow->setStagesEnabled(computeOnly);
   }
   else if(action->flags & ActionFlags::MeshDispatch)
   {

@@ -743,6 +743,23 @@ void DXBCContainer::ReplaceChunk(bytebuf &ByteCode, uint32_t fourcc, const byte 
       return;
     }
   }
+
+  uint32_t newOffs = uint32_t(ByteCode.size() + sizeof(uint32_t));
+  ByteCode.insert(sizeof(FileHeader) + header->numChunks * sizeof(uint32_t), (byte *)&newOffs,
+                  sizeof(newOffs));
+
+  for(uint32_t chunkIdx = 0; chunkIdx < header->numChunks; chunkIdx++)
+    chunkOffsets[chunkIdx] += sizeof(uint32_t);
+
+  ByteCode.append((byte *)&fourcc, sizeof(fourcc));
+  uint32_t chunkSize = (uint32_t)size;
+  ByteCode.append((byte *)&chunkSize, sizeof(chunkSize));
+  ByteCode.append(replacement, size);
+
+  header->numChunks++;
+  header->fileLength = (uint32_t)ByteCode.size();
+
+  HashContainer(ByteCode.data(), ByteCode.size());
 }
 
 const byte *DXBCContainer::FindChunk(const bytebuf &ByteCode, uint32_t fourcc, size_t &size)
@@ -1901,7 +1918,7 @@ DXBCContainer::DXBCContainer(const bytebuf &ByteCode, const rdcstr &debugInfoPat
         for(uint32_t j = 0; j < sign->numElems; j++)
         {
           SigParameter &b = (*sig)[j];
-          if(i != j && a.semanticName == b.semanticName)
+          if(i != j && a.semanticName == b.semanticName || a.semanticIndex != 0)
           {
             a.needSemanticIndex = true;
             break;

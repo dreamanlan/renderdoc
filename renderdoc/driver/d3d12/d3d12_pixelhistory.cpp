@@ -81,12 +81,15 @@
  * We slot the per-fragment data correctly accounting for the fragments that were discarded.
  */
 
+#include "core/settings.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "maths/formatpacking.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_debug.h"
 #include "d3d12_replay.h"
 #include "d3d12_shader_cache.h"
+
+RDOC_EXTERN_CONFIG(bool, D3D12_PixelHistory);
 
 struct D3D12CopyPixelParams
 {
@@ -642,16 +645,21 @@ protected:
 
       // Copy into a buffer, but treat the footprint as the same format as the target image
       uint32_t elementSize = GetByteSize(0, 0, 0, p.copyFormat, 0);
+      // Use Offset to get to the nearest 16KB
+      UINT64 footprintOffset = (offset >> 14) << 14;
+      UINT64 offsetRemaider = offset - footprintOffset;
+      UINT dstX = (UINT)(offsetRemaider / elementSize);
 
       dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
       dst.pResource = m_CallbackInfo.dstBuffer;
-      dst.PlacedFootprint.Offset = 0;
-      dst.PlacedFootprint.Footprint.Width =
-          (UINT)m_CallbackInfo.dstBuffer->GetDesc().Width / elementSize;
+      dst.PlacedFootprint.Offset = footprintOffset;
+      dst.PlacedFootprint.Footprint.Width = dstX + 1;
       dst.PlacedFootprint.Footprint.Height = 1;
       dst.PlacedFootprint.Footprint.Depth = 1;
       dst.PlacedFootprint.Footprint.Format = p.copyFormat;
-      dst.PlacedFootprint.Footprint.RowPitch = (UINT)m_CallbackInfo.dstBuffer->GetDesc().Width;
+      dst.PlacedFootprint.Footprint.RowPitch =
+          AlignUp(dst.PlacedFootprint.Footprint.Width * elementSize,
+                  (uint32_t)D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
 
       D3D12_BOX srcBox = {};
       srcBox.left = p.x;
@@ -661,10 +669,8 @@ protected:
       srcBox.front = 0;
       srcBox.back = 1;
 
-      // We need to apply the offset here (measured in number of elements) rather than using
-      // PlacedFootprint.Offset (measured in bytes) because the latter must be a multiple of 512
       RDCASSERT((offset % elementSize) == 0);
-      cmd->CopyTextureRegion(&dst, (UINT)(offset / elementSize), 0, 0, &src, &srcBox);
+      cmd->CopyTextureRegion(&dst, dstX, 0, 0, &src, &srcBox);
 
       std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
       cmd->ResourceBarrier(1, &barrier);
@@ -2717,6 +2723,9 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
 {
   rdcarray<PixelModification> history;
 
+  if(!D3D12_PixelHistory())
+    return history;
+
   if(events.empty())
     return history;
 
@@ -2756,6 +2765,10 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
     return history;
   }
 
+  // If the resource desc format is typeless, replace it with a typed format
+  if(IsTypelessFormat(resDesc.Format))
+    resDesc.Format = GetTypedFormat(resDesc.Format, typeCast);
+
   // TODO: perhaps should allocate most resources after D3D12OcclusionCallback, since we will
   // get a smaller subset of events that passed the occlusion query.
   D3D12PixelHistoryResources resources = {};
@@ -2782,14 +2795,6 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
   callbackInfo.colorDescriptor = resources.colorDescriptor;
   callbackInfo.dsImage = resources.dsImage;
   callbackInfo.dsDescriptor = resources.dsDescriptor;
-
-  // If the resource desc format is typeless, replace it with a typed format
-  if(IsTypelessFormat(callbackInfo.targetDesc.Format))
-  {
-    ResourceFormat fmt = MakeResourceFormat(callbackInfo.targetDesc.Format);
-    fmt.compType = typeCast;
-    callbackInfo.targetDesc.Format = MakeDXGIFormat(fmt);
-  }
 
   callbackInfo.dstBuffer = resources.dstBuffer;
 
@@ -2904,7 +2909,8 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
   std::map<uint32_t, uint32_t> eventsWithFrags;
   std::map<uint32_t, ModificationValue> eventPremods;
   ResourceFormat fmt = MakeResourceFormat(callbackInfo.targetDesc.Format);
-  fmt.compType = typeCast;
+  if(typeCast != CompType::Typeless)
+    fmt.compType = typeCast;
 
   for(size_t h = 0; h < history.size();)
   {

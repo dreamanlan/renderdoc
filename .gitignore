@@ -9,6 +9,7 @@ Release32/
 Release64/
 build/
 build-*/
+build*/
 /compile_commands.json
 .cache/
 /dist/

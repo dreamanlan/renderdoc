@@ -976,6 +976,36 @@ void WrappedOpenGL::glClipControl(GLenum origin, GLenum depth)
 }
 
 template <typename SerialiserType>
+bool WrappedOpenGL::Serialise_glClipControlEXT(SerialiserType &ser, GLenum origin, GLenum depth)
+{
+  SERIALISE_ELEMENT(origin);
+  SERIALISE_ELEMENT(depth);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    GL.glClipControlEXT(origin, depth);
+  }
+
+  return true;
+}
+
+void WrappedOpenGL::glClipControlEXT(GLenum origin, GLenum depth)
+{
+  SERIALISE_TIME_CALL(GL.glClipControlEXT(origin, depth));
+
+  if(IsActiveCapturing(m_State))
+  {
+    USE_SCRATCH_SERIALISER();
+    SCOPED_SERIALISE_CHUNK(gl_CurChunk);
+    Serialise_glClipControlEXT(ser, origin, depth);
+
+    GetContextRecord()->AddChunk(scope.Get());
+  }
+}
+
+template <typename SerialiserType>
 bool WrappedOpenGL::Serialise_glProvokingVertex(SerialiserType &ser, GLenum mode)
 {
   SERIALISE_ELEMENT(mode);
@@ -2026,6 +2056,7 @@ INSTANTIATE_FUNCTION_SERIALISED(void, glDepthRangeArrayv, GLuint first, GLsizei 
                                 const GLdouble *v);
 INSTANTIATE_FUNCTION_SERIALISED(void, glDepthBoundsEXT, GLclampd nearVal, GLclampd farVal);
 INSTANTIATE_FUNCTION_SERIALISED(void, glClipControl, GLenum origin, GLenum depth);
+INSTANTIATE_FUNCTION_SERIALISED(void, glClipControlEXT, GLenum origin, GLenum depth);
 INSTANTIATE_FUNCTION_SERIALISED(void, glProvokingVertex, GLenum mode);
 INSTANTIATE_FUNCTION_SERIALISED(void, glPrimitiveRestartIndex, GLuint index);
 INSTANTIATE_FUNCTION_SERIALISED(void, glDisable, GLenum cap);

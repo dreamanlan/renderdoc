@@ -432,6 +432,8 @@ void WrappedOpenGL::RenderTextInternal(float x, float y, const rdcstr &text)
 
     if(GL.glClipControl && HasExt[ARB_clip_control])
       GL.glClipControl(eGL_LOWER_LEFT, eGL_NEGATIVE_ONE_TO_ONE);
+    if(GL.glClipControlEXT && HasExt[EXT_clip_control])
+      GL.glClipControlEXT(eGL_LOWER_LEFT, eGL_NEGATIVE_ONE_TO_ONE);
 
     // bind VAO so we can fiddle with vertex attrib state
     GL.glBindVertexArray(ctxdata.DummyVAO);

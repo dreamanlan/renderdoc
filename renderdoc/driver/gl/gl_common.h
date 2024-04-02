@@ -808,7 +808,8 @@ extern bool IsGLES;
   EXT_TO_CHECK(99, 99, EXT_multisampled_render_to_texture)       \
   EXT_TO_CHECK(99, 99, OVR_multiview)                            \
   EXT_TO_CHECK(99, 99, OES_texture_float)                        \
-  EXT_TO_CHECK(99, 99, EXT_discard_framebuffer)
+  EXT_TO_CHECK(99, 99, EXT_discard_framebuffer)                  \
+  EXT_TO_CHECK(99, 99, EXT_clip_control)
 
 // GL extensions equivalents
 // Either promoted extensions from EXT to ARB, or
@@ -844,8 +845,7 @@ extern bool IsGLES;
   EXT_COMP_CHECK(ARB_texture_buffer_object, OES_texture_buffer)                             \
   EXT_COMP_CHECK(ARB_texture_buffer_range, EXT_texture_buffer)                              \
   EXT_COMP_CHECK(ARB_texture_buffer_range, OES_texture_buffer)                              \
-  EXT_COMP_CHECK(EXT_framebuffer_sRGB, EXT_sRGB_write_control)                              \
-  EXT_COMP_CHECK(ARB_clip_control, EXT_clip_control)
+  EXT_COMP_CHECK(EXT_framebuffer_sRGB, EXT_sRGB_write_control)
 
 // extensions we know we want to check for are precached, indexd by this enum
 enum ExtensionCheckEnum
@@ -1879,6 +1879,7 @@ enum class GLChunk : uint32_t
   glBlendBarrier,
   glFramebufferTexture2DMultisampleEXT,
   glDiscardFramebufferEXT,
+  glClipControlEXT,
   glDepthRangeArrayfvOES,
   glDepthRangeArrayfvNV,
   glDepthRangeIndexedfOES,

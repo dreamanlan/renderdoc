@@ -915,6 +915,7 @@ public:
                                 const GLfloat *v);
   IMPLEMENT_FUNCTION_SERIALISED(void, glDepthBoundsEXT, GLclampd nearVal, GLclampd farVal);
   IMPLEMENT_FUNCTION_SERIALISED(void, glClipControl, GLenum origin, GLenum depth);
+  IMPLEMENT_FUNCTION_SERIALISED(void, glClipControlEXT, GLenum origin, GLenum depth);
   IMPLEMENT_FUNCTION_SERIALISED(void, glProvokingVertex, GLenum mode);
   IMPLEMENT_FUNCTION_SERIALISED(void, glPrimitiveRestartIndex, GLuint index);
   IMPLEMENT_FUNCTION_SERIALISED(void, glDisable, GLenum cap);

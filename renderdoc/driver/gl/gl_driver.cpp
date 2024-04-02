@@ -4084,6 +4084,7 @@ bool WrappedOpenGL::ProcessChunk(ReadSerialiser &ser, GLChunk chunk)
     case GLChunk::glInvalidateFramebuffer:
     case GLChunk::glInvalidateNamedFramebufferData:
       return Serialise_glInvalidateNamedFramebufferData(ser, 0, 0, 0);
+    case GLChunk::glClipControlEXT: return Serialise_glClipControlEXT(ser, eGL_NONE, eGL_NONE);
     case GLChunk::glDrawBuffer:
     case GLChunk::glNamedFramebufferDrawBuffer:
     case GLChunk::glFramebufferDrawBufferEXT:

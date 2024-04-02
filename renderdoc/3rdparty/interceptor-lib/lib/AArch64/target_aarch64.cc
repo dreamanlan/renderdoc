@@ -49,7 +49,7 @@ std::vector<TrampolineConfig> TargetAARCH64::GetTrampolineConfigs(
     uintptr_t start_address) const {
   std::vector<TrampolineConfig> configs;
   configs.push_back({FIRST_4G_TRAMPOLINE, false, 0x10000, 0xffffffff});
-  configs.push_back({FULL_TRAMPOLINE, false, 0, 0xffffffffffffffff});
+  configs.push_back({FULL_TRAMPOLINE, false, 0, static_cast<uintptr_t>(0xffffffffffffffffull)});
   return configs;
 }
 

@@ -765,7 +765,7 @@ void GLReplay::InitPostVSBuffers(uint32_t eventId)
 
   bool flipY = false;
 
-  if(HasExt[ARB_clip_control])
+  if(HasExt[ARB_clip_control] || HasExt[EXT_clip_control])
   {
     GLenum clipOrigin = eGL_LOWER_LEFT;
     GL.glGetIntegerv(eGL_CLIP_ORIGIN, (GLint *)&clipOrigin);

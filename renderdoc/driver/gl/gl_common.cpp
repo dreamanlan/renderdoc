@@ -902,7 +902,7 @@ void GLPushPopState::Push(bool modern)
     enableBits[7] = GL.glIsEnabled(eGL_ALPHA_TEST) != 0;
   }
 
-  if(modern && HasExt[ARB_clip_control])
+  if(modern && (HasExt[ARB_clip_control] || HasExt[EXT_clip_control]))
   {
     GL.glGetIntegerv(eGL_CLIP_ORIGIN, (GLint *)&ClipOrigin);
     GL.glGetIntegerv(eGL_CLIP_DEPTH_MODE, (GLint *)&ClipDepth);
@@ -1108,6 +1108,8 @@ void GLPushPopState::Pop(bool modern)
 
   if(modern && GL.glClipControl && HasExt[ARB_clip_control])
     GL.glClipControl(ClipOrigin, ClipDepth);
+  if(modern && GL.glClipControlEXT && HasExt[EXT_clip_control])
+    GL.glClipControlEXT(ClipOrigin, ClipDepth);
 
   if(modern && HasExt[ARB_draw_buffers_blend])
   {

@@ -622,6 +622,9 @@ struct GLDispatchTable
 
   // GLES: EXT_discard_framebuffer
   PFNGLDISCARDFRAMEBUFFEREXTPROC glDiscardFramebufferEXT;
+  
+  // GLES: EXT_clip_control
+  PFNGLCLIPCONTROLEXTPROC glClipControlEXT;
 
   // GLES: OES_viewport_array, NV_viewport_array
   // only 2 functions which have different parameter types, so they can't be aliases of the ARB functions

@@ -985,6 +985,7 @@
   FUNC(glFramebufferTexture2DMultisampleEXT, glFramebufferTexture2DMultisampleEXT); \
   FUNC(glRenderbufferStorageMultisampleEXT, glRenderbufferStorageMultisampleEXT); \
   FUNC(glDiscardFramebufferEXT, glDiscardFramebufferEXT); \
+  FUNC(glClipControlEXT, glClipControlEXT); \
   FUNC(glDepthRangeArrayfvOES, glDepthRangeArrayfvOES); \
   FUNC(glDepthRangeArrayfvOES, glDepthRangeArrayfvNV); \
   FUNC(glDepthRangeIndexedfOES, glDepthRangeIndexedfOES); \
@@ -2248,6 +2249,7 @@
   FuncWrapper6(void, glFramebufferTexture2DMultisampleEXT, GLenum, target, GLenum, attachment, GLenum, textarget, GLuint, texture, GLint, level, GLsizei, samples); \
   FuncWrapper5(void, glRenderbufferStorageMultisampleEXT, GLenum, target, GLsizei, samples, GLenum, internalformat, GLsizei, width, GLsizei, height); \
   FuncWrapper3(void, glDiscardFramebufferEXT, GLenum, target, GLsizei, numAttachments, const GLenum *, attachments); \
+  FuncWrapper2(void, glClipControlEXT, GLenum, origin, GLenum, depth); \
   FuncWrapper3(void, glDepthRangeArrayfvOES, GLuint, first, GLsizei, count, const GLfloat *, v); \
   AliasWrapper3(void, glDepthRangeArrayfvNV, glDepthRangeArrayfvOES, GLuint, first, GLsizei, count, const GLfloat *, v); \
   FuncWrapper3(void, glDepthRangeIndexedfOES, GLuint, index, GLfloat, n, GLfloat, f); \
@@ -2660,7 +2662,6 @@
   FUNC(glClientActiveVertexStreamATI); \
   FUNC(glClientAttribDefaultEXT); \
   FUNC(glClientWaitSyncAPPLE); \
-  FUNC(glClipControlEXT); \
   FUNC(glClipPlanefOES); \
   FUNC(glClipPlane); \
   FUNC(glClipPlanexOES); \
@@ -4570,7 +4571,6 @@
   UnsupportedWrapper1(void, glClientActiveVertexStreamATI, GLenum, stream); \
   UnsupportedWrapper1(void, glClientAttribDefaultEXT, GLbitfield, mask); \
   UnsupportedWrapper3(GLenum, glClientWaitSyncAPPLE, GLsync, sync, GLbitfield, flags, GLuint64, timeout); \
-  UnsupportedWrapper2(void, glClipControlEXT, GLenum, origin, GLenum, depth); \
   UnsupportedWrapper2(void, glClipPlanefOES, GLenum, plane, const GLfloat *, equation); \
   UnsupportedWrapper2(void, glClipPlane, GLenum, plane, const GLdouble *, equation); \
   UnsupportedWrapper2(void, glClipPlanexOES, GLenum, plane, const GLfixed *, equation); \

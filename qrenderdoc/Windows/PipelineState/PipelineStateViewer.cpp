@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1026,7 +1026,7 @@ IShaderViewer *PipelineStateViewer::EditOriginalShaderSource(ResourceId id,
     files.push_back(make_rdcpair(s.filename, s.contents));
   }
 
-  return EditShader(id, shaderDetails->stage, shaderDetails->entryPoint,
+  return EditShader(id, shaderDetails->stage, shaderDetails->debugInfo.entrySourceName,
                     shaderDetails->debugInfo.compileFlags, shaderDetails->debugInfo.compiler,
                     shaderDetails->debugInfo.encoding, files);
 }
@@ -1529,6 +1529,7 @@ bool PipelineStateViewer::SaveShaderFile(const ShaderReflection *shader)
     case ShaderEncoding::SPIRVAsm:
     case ShaderEncoding::OpenGLSPIRVAsm: filter = tr("SPIR-V assembly files (*.spvasm)"); break;
     case ShaderEncoding::DXIL: filter = tr("DXIL Shader files (*.dxbc)"); break;
+    case ShaderEncoding::Slang: filter = tr("Slang Shader files (*.slang)"); break;
     case ShaderEncoding::Unknown:
     case ShaderEncoding::Count: filter = tr("All files (*.*)"); break;
   }

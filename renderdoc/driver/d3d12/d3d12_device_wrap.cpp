@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_device.h"
+#include "core/settings.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "driver/ihv/amd/official/DXExt/AmdExtD3D.h"
 #include "driver/ihv/amd/official/DXExt/AmdExtD3DCommandListMarkerApi.h"
@@ -30,6 +31,9 @@
 #include "d3d12_command_queue.h"
 #include "d3d12_resources.h"
 #include "d3d12_shader_cache.h"
+
+RDOC_DEBUG_CONFIG(bool, D3D12_Experimental_EnableRTSupport, false,
+                  "Enable support for experimental DXR support");
 
 static bool UsesExtensionUAV(const D3D12_SHADER_BYTECODE &sh, uint32_t reg, uint32_t space)
 {
@@ -1472,6 +1476,9 @@ bool WrappedID3D12Device::Serialise_CreateHeap(SerialiserType &ser, const D3D12_
     // don't create resources non-resident
     Descriptor.Flags &= ~D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT;
 
+    // don't create displayable heaps (?!)
+    Descriptor.Flags &= ~D3D12_HEAP_FLAG_ALLOW_DISPLAY;
+
     if(m_DriverInfo.vendor == GPUVendor::Software &&
        Descriptor.Properties.Type == D3D12_HEAP_TYPE_CUSTOM)
       Descriptor.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
@@ -2319,7 +2326,8 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
       return E_INVALIDARG;
 
     // don't support raytracing
-    opts->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+    if(!D3D12_Experimental_EnableRTSupport())
+      opts->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
 
     if(dolog)
       RDCLOG("Forcing no raytracing tier support");

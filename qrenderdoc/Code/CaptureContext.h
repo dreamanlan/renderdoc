@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -269,7 +269,7 @@ public:
                                      const rdcstr &format = "") override;
 
   IBufferViewer *ViewConstantBuffer(ShaderStage stage, uint32_t slot, uint32_t idx) override;
-  IPixelHistoryView *ViewPixelHistory(ResourceId texID, uint32_t x, uint32_t y,
+  IPixelHistoryView *ViewPixelHistory(ResourceId texID, uint32_t x, uint32_t y, uint32_t view,
                                       const TextureDisplay &display) override;
 
   QWidget *CreateBuiltinWindow(const rdcstr &objectName) override;

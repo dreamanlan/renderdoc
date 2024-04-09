@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2023 Baldur Karlsson
+ * Copyright (c) 2023-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -89,8 +89,6 @@
 #include "d3d12_replay.h"
 #include "d3d12_shader_cache.h"
 
-RDOC_EXTERN_CONFIG(bool, D3D12_PixelHistory);
-
 struct D3D12CopyPixelParams
 {
   // The image being copied from
@@ -173,7 +171,7 @@ struct D3D12EventInfo
   uint8_t dsWithoutShaderDiscard[8];
   uint8_t padding[8];
   uint8_t dsWithShaderDiscard[8];
-  uint8_t padding1[8];
+  uint8_t padding1[24];
 };
 
 struct D3D12PerFragmentInfo
@@ -221,10 +219,7 @@ enum D3D12PixelHistoryTests : uint32_t
   DepthTest_GreaterEqual = 7U << DepthTest_Shift,
 };
 
-namespace
-{
-
-bool IsDepthFormat(D3D12_RESOURCE_DESC desc, CompType typeCast)
+static bool IsDepthFormat(D3D12_RESOURCE_DESC desc, CompType typeCast)
 {
   // TODO: This function might need to handle where the resource is typeless but is actually depth
 
@@ -237,32 +232,104 @@ bool IsDepthFormat(D3D12_RESOURCE_DESC desc, CompType typeCast)
   return false;
 }
 
-DXGI_FORMAT GetDepthCopyFormat(DXGI_FORMAT format)
+static DXGI_FORMAT GetDepthCopyFormat(DXGI_FORMAT format)
 {
   if(format == DXGI_FORMAT_D16_UNORM)
     return DXGI_FORMAT_R16_TYPELESS;
   return DXGI_FORMAT_R32_TYPELESS;
 }
 
-void ReplayDraw(ID3D12GraphicsCommandListX *cmd, const ActionDescription &action)
+static bool IsUavWrite(ResourceUsage usage)
 {
-  // TODO: Once this is fully supported for indirect draws, this should be moved to WrappedID3D12Device
-  if(action.drawIndex == 0)
+  return (usage >= ResourceUsage::VS_RWResource && usage <= ResourceUsage::CS_RWResource);
+}
+
+static bool IsResolveWrite(ResourceUsage usage)
+{
+  return (usage == ResourceUsage::Resolve || usage == ResourceUsage::ResolveDst);
+}
+
+static bool IsCopyWrite(ResourceUsage usage)
+{
+  return (usage == ResourceUsage::CopyDst || usage == ResourceUsage::Copy ||
+          usage == ResourceUsage::GenMips);
+}
+
+static bool IsDirectWrite(ResourceUsage usage)
+{
+  return IsUavWrite(usage) || IsResolveWrite(usage) || IsCopyWrite(usage);
+}
+
+static void FillInColor(const ResourceFormat &fmt, const D3D12PixelHistoryValue &value,
+                        ModificationValue &mod)
+{
+  DecodePixelData(fmt, value.color, mod.col);
+}
+
+static void ConvertAndFillInColor(const ResourceFormat &srcFmt, const D3D12PixelHistoryValue &value,
+                                  const ResourceFormat &outFmt, ModificationValue &mod)
+{
+  if((outFmt.compType == CompType::UInt) || (outFmt.compType == CompType::SInt))
   {
-    if(action.flags & ActionFlags::Indexed)
-      cmd->DrawIndexedInstanced(action.numIndices, action.numInstances, action.indexOffset,
-                                action.baseVertex, action.instanceOffset);
+    DecodePixelData(srcFmt, value.color, mod.col);
+    // TODO : handle UInt ResourceFormatType::R10G10B10A2
+    // Clamp values based on format
+    if(outFmt.compType == CompType::UInt)
+    {
+      uint32_t limits[4] = {
+          UINT8_MAX,
+          UINT16_MAX,
+          0,
+          UINT32_MAX,
+      };
+      int limit_idx = outFmt.compByteWidth - 1;
+      for(size_t c = 0; c < outFmt.compCount; c++)
+        mod.col.uintValue[c] = RDCMIN(limits[limit_idx], mod.col.uintValue[c]);
+    }
     else
-      cmd->DrawInstanced(action.numIndices, action.numInstances, action.vertexOffset,
-                         action.instanceOffset);
+    {
+      int32_t limits[8] = {
+          INT8_MIN, INT8_MAX, INT16_MIN, INT16_MAX, 0, 0, INT32_MIN, INT32_MAX,
+      };
+      int limit_idx = 2 * (outFmt.compByteWidth - 1);
+      for(size_t c = 0; c < outFmt.compCount; c++)
+        mod.col.intValue[c] = RDCCLAMP(mod.col.intValue[c], limits[limit_idx], limits[limit_idx + 1]);
+    }
   }
   else
   {
-    // TODO: Support replay of single indirect draws
-    RDCERR("Indirect draws are NYI with ReplayDraw");
+    FloatVector v4 = DecodeFormattedComponents(srcFmt, value.color);
+    // Roundtrip through encoding to properly handle component limits
+    uint8_t tempColor[32];
+    EncodeFormattedComponents(outFmt, v4, (byte *)tempColor);
+    v4 = DecodeFormattedComponents(outFmt, tempColor);
+    memcpy(mod.col.floatValue.data(), &v4, sizeof(v4));
   }
 }
 
+static float GetDepthValue(DXGI_FORMAT depthFormat, const D3D12PixelHistoryValue &value)
+{
+  FloatVector v4 = DecodeFormattedComponents(MakeResourceFormat(depthFormat), (byte *)&value.depth);
+  return v4.x;
+}
+
+static bool CreateOcclusionPool(WrappedID3D12Device *device, uint32_t poolSize,
+                                ID3D12QueryHeap **ppQueryHeap)
+{
+  D3D12MarkerRegion region(device->GetQueue()->GetReal(),
+                           StringFormat::Fmt("CreateQueryHeap %u", poolSize));
+
+  D3D12_QUERY_HEAP_DESC queryDesc = {};
+  queryDesc.Count = poolSize;
+  queryDesc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+  HRESULT hr = device->CreateQueryHeap(&queryDesc, __uuidof(ID3D12QueryHeap), (void **)ppQueryHeap);
+  if(FAILED(hr))
+  {
+    RDCERR("Failed to create query heap for pixel history HRESULT: %s", ToStr(hr).c_str());
+    return false;
+  }
+
+  return true;
 }
 
 // Helper function to copy a single pixel out of a source texture, which will handle any texture
@@ -586,7 +653,10 @@ protected:
   void CopyImagePixel(ID3D12GraphicsCommandListX *cmd, D3D12CopyPixelParams &p, size_t offset)
   {
     uint32_t baseMip = m_CallbackInfo.targetSubresource.mip;
+    bool copy3d = m_CallbackInfo.targetDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     uint32_t baseSlice = m_CallbackInfo.targetSubresource.slice;
+    uint32_t arraySize = m_CallbackInfo.targetDesc.DepthOrArraySize;
+    uint32_t depthIndex = 0;
 
     // The images that are created specifically for evaluating pixel history are
     // already based on the target mip/slice
@@ -595,6 +665,13 @@ protected:
       // TODO: Is this always true when we call CopyImagePixel? Also need to test this case with MSAA
       baseMip = 0;
       baseSlice = 0;
+      copy3d = false;
+    }
+    else if(copy3d)
+    {
+      baseSlice = 0;
+      arraySize = 1;
+      depthIndex = m_CallbackInfo.targetSubresource.slice;
     }
 
     // For pipeline barriers.
@@ -603,9 +680,8 @@ protected:
     barrier.Transition.pResource = p.srcImage;
     barrier.Transition.StateBefore = p.srcImageState;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    barrier.Transition.Subresource =
-        D3D12CalcSubresource(baseMip, baseSlice, p.planeSlice, m_CallbackInfo.targetDesc.MipLevels,
-                             m_CallbackInfo.targetDesc.DepthOrArraySize);
+    barrier.Transition.Subresource = D3D12CalcSubresource(
+        baseMip, baseSlice, p.planeSlice, m_CallbackInfo.targetDesc.MipLevels, arraySize);
 
     // Multi-sampled images can't call CopyTextureRegion for a single sample, so instead
     // copy using a compute shader into a staging image first
@@ -647,8 +723,8 @@ protected:
       uint32_t elementSize = GetByteSize(0, 0, 0, p.copyFormat, 0);
       // Use Offset to get to the nearest 16KB
       UINT64 footprintOffset = (offset >> 14) << 14;
-      UINT64 offsetRemaider = offset - footprintOffset;
-      UINT dstX = (UINT)(offsetRemaider / elementSize);
+      UINT64 offsetRemainder = offset - footprintOffset;
+      UINT dstX = (UINT)(offsetRemainder / elementSize);
 
       dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
       dst.pResource = m_CallbackInfo.dstBuffer;
@@ -666,11 +742,14 @@ protected:
       srcBox.top = p.y;
       srcBox.right = srcBox.left + 1;
       srcBox.bottom = srcBox.top + 1;
-      srcBox.front = 0;
-      srcBox.back = 1;
+      srcBox.front = depthIndex;
+      srcBox.back = srcBox.front + 1;
 
-      RDCASSERT((offset % elementSize) == 0);
-      cmd->CopyTextureRegion(&dst, dstX, 0, 0, &src, &srcBox);
+      if(offsetRemainder % elementSize == 0)
+        cmd->CopyTextureRegion(&dst, dstX, 0, 0, &src, &srcBox);
+      else
+        RDCERR("OffsetRemainder %zu is not a multiple of elementSize %u", offsetRemainder,
+               elementSize);
 
       std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
       cmd->ResourceBarrier(1, &barrier);
@@ -913,8 +992,11 @@ struct D3D12ColorAndStencilCallback : public D3D12PixelHistoryCallback
 {
   D3D12ColorAndStencilCallback(WrappedID3D12Device *device, D3D12PixelHistoryShaderCache *shaderCache,
                                const D3D12PixelHistoryCallbackInfo &callbackInfo,
-                               const rdcarray<uint32_t> &events)
-      : D3D12PixelHistoryCallback(device, shaderCache, callbackInfo, NULL), m_Events(events)
+                               const rdcarray<uint32_t> &events,
+                               std::map<uint32_t, D3D12_RESOURCE_STATES> resourceStates)
+      : D3D12PixelHistoryCallback(device, shaderCache, callbackInfo, NULL),
+        m_Events(events),
+        m_ResourceStates(resourceStates)
   {
   }
 
@@ -1093,18 +1175,22 @@ private:
     targetCopyParams.sample = m_CallbackInfo.targetSubresource.sample;
     targetCopyParams.mip = m_CallbackInfo.targetSubresource.mip;
     targetCopyParams.arraySlice = m_CallbackInfo.targetSubresource.slice;
-    targetCopyParams.srcImageState = D3D12_RESOURCE_STATE_RENDER_TARGET;
     targetCopyParams.multisampled = (m_CallbackInfo.targetDesc.SampleDesc.Count != 1);
+    D3D12_RESOURCE_STATES nonRtFallback = m_ResourceStates[eid];
+    bool rtOutput = (nonRtFallback == D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_RESOURCE_STATES fallback = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
     if(IsDepthFormat(m_CallbackInfo.targetDesc, m_CallbackInfo.compType))
     {
-      targetCopyParams.srcImageState = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH
-                                           ? D3D12_RESOURCE_STATE_DEPTH_READ
-                                           : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      fallback = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH
+                     ? D3D12_RESOURCE_STATE_DEPTH_READ
+                     : D3D12_RESOURCE_STATE_DEPTH_WRITE;
       targetCopyParams.srcImageFormat = GetDepthSRVFormat(m_CallbackInfo.targetDesc.Format, 0);
       targetCopyParams.depthcopy = true;
       targetCopyParams.copyFormat = GetDepthCopyFormat(m_CallbackInfo.targetDesc.Format);
       offset += offsetof(struct D3D12PixelHistoryValue, depth);
     }
+    targetCopyParams.srcImageState = rtOutput ? fallback : nonRtFallback;
 
     CopyImagePixel(cmd, targetCopyParams, offset);
 
@@ -1115,10 +1201,10 @@ private:
           GetDepthSRVFormat(m_CallbackInfo.targetImage->GetDesc().Format, 1);
       stencilCopyParams.copyFormat = DXGI_FORMAT_R8_TYPELESS;
       stencilCopyParams.planeSlice = 1;
-      stencilCopyParams.srcImageState =
-          m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
-              ? D3D12_RESOURCE_STATE_DEPTH_READ
-              : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      fallback = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
+                     ? D3D12_RESOURCE_STATE_DEPTH_READ
+                     : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      stencilCopyParams.srcImageState = rtOutput ? fallback : nonRtFallback;
       CopyImagePixel(cmd, stencilCopyParams, offset + sizeof(float));
     }
 
@@ -1127,41 +1213,47 @@ private:
       return;
 
     // Get the bound depth format for this event
-    ResourceId resId = m_SavedState.dsv.GetResResourceId();
-    if(resId != ResourceId())
+    WrappedID3D12PipelineState *pipe =
+        m_pDevice->GetResourceManager()->GetCurrentAs<WrappedID3D12PipelineState>(m_SavedState.pipe);
+    if(pipe && pipe->IsGraphics())
     {
-      WrappedID3D12Resource *depthImage =
-          m_pDevice->GetResourceManager()->GetCurrentAs<WrappedID3D12Resource>(resId);
-
-      DXGI_FORMAT depthFormat = m_SavedState.dsv.GetDSV().Format;
-      // Descriptors with unknown type are valid and indicate to use the resource's format
-      if(depthFormat == DXGI_FORMAT_UNKNOWN)
-        depthFormat = depthImage->GetDesc().Format;
-
-      D3D12CopyPixelParams depthCopyParams = targetCopyParams;
-      depthCopyParams.srcImage = depthImage;
-      depthCopyParams.srcImageFormat = GetDepthSRVFormat(depthFormat, 0);
-      depthCopyParams.copyFormat = GetDepthCopyFormat(depthFormat);
-      depthCopyParams.depthcopy = true;
-      depthCopyParams.srcImageState = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH
-                                          ? D3D12_RESOURCE_STATE_DEPTH_READ
-                                          : D3D12_RESOURCE_STATE_DEPTH_WRITE;
-      CopyImagePixel(cmd, depthCopyParams, offset + offsetof(struct D3D12PixelHistoryValue, depth));
-
-      if(IsDepthAndStencilFormat(depthFormat))
+      ResourceId resId = m_SavedState.dsv.GetResResourceId();
+      if(resId != ResourceId())
       {
-        depthCopyParams.srcImageFormat = GetDepthSRVFormat(depthFormat, 1);
-        depthCopyParams.copyFormat = DXGI_FORMAT_R8_TYPELESS;
-        depthCopyParams.planeSlice = 1;
-        depthCopyParams.srcImageState =
-            m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
-                ? D3D12_RESOURCE_STATE_DEPTH_READ
-                : D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        CopyImagePixel(cmd, depthCopyParams,
-                       offset + offsetof(struct D3D12PixelHistoryValue, stencil));
-      }
+        WrappedID3D12Resource *depthImage =
+            m_pDevice->GetResourceManager()->GetCurrentAs<WrappedID3D12Resource>(resId);
 
-      m_DepthFormats.insert(std::make_pair(eid, depthFormat));
+        DXGI_FORMAT depthFormat = m_SavedState.dsv.GetDSV().Format;
+        // Descriptors with unknown type are valid and indicate to use the resource's format
+        if(depthFormat == DXGI_FORMAT_UNKNOWN)
+          depthFormat = depthImage->GetDesc().Format;
+
+        D3D12CopyPixelParams depthCopyParams = targetCopyParams;
+        depthCopyParams.srcImage = depthImage;
+        depthCopyParams.srcImageFormat = GetDepthSRVFormat(depthFormat, 0);
+        depthCopyParams.copyFormat = GetDepthCopyFormat(depthFormat);
+        depthCopyParams.depthcopy = true;
+        fallback = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH
+                       ? D3D12_RESOURCE_STATE_DEPTH_READ
+                       : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        depthCopyParams.srcImageState = rtOutput ? fallback : nonRtFallback;
+        CopyImagePixel(cmd, depthCopyParams, offset + offsetof(struct D3D12PixelHistoryValue, depth));
+
+        if(IsDepthAndStencilFormat(depthFormat))
+        {
+          depthCopyParams.srcImageFormat = GetDepthSRVFormat(depthFormat, 1);
+          depthCopyParams.copyFormat = DXGI_FORMAT_R8_TYPELESS;
+          depthCopyParams.planeSlice = 1;
+          fallback = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
+                         ? D3D12_RESOURCE_STATE_DEPTH_READ
+                         : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+          depthCopyParams.srcImageState = rtOutput ? fallback : nonRtFallback;
+          CopyImagePixel(cmd, depthCopyParams,
+                         offset + offsetof(struct D3D12PixelHistoryValue, stencil));
+        }
+
+        m_DepthFormats.insert(std::make_pair(eid, depthFormat));
+      }
     }
   }
 
@@ -1180,7 +1272,7 @@ private:
     }
 
     const ActionDescription *action = m_pDevice->GetAction(eventId);
-    ::ReplayDraw(cmd, *action);
+    m_pDevice->ReplayDraw(cmd, *action);
   }
 
   // GetPipelineReplacements creates pipeline replacements that disable all tests,
@@ -1258,6 +1350,7 @@ private:
   D3D12RenderState m_SavedState;
   std::map<ResourceId, D3D12PipelineReplacements> m_PipeCache;
   rdcarray<uint32_t> m_Events;
+  std::map<uint32_t, D3D12_RESOURCE_STATES> m_ResourceStates;
   // Key is event ID, and value is an index of where the event data is stored.
   std::map<uint32_t, size_t> m_EventIndices;
   std::map<uint32_t, DXGI_FORMAT> m_DepthFormats;
@@ -1790,7 +1883,7 @@ private:
     m_OcclusionQueries.insert(std::make_pair(rdcpair<uint32_t, uint32_t>(eventId, test), index));
 
     cmd->BeginQuery(m_OcclusionQueryHeap, D3D12_QUERY_TYPE_OCCLUSION, index);
-    ::ReplayDraw(cmd, *m_pDevice->GetAction(eventId));
+    m_pDevice->ReplayDraw(cmd, *m_pDevice->GetAction(eventId));
 
     cmd->EndQuery(m_OcclusionQueryHeap, D3D12_QUERY_TYPE_OCCLUSION, index);
   }
@@ -1808,8 +1901,8 @@ private:
   rdcarray<uint64_t> m_OcclusionResults;
 };
 
-void D3D12UpdateTestsFailed(const D3D12TestsFailedCallback *tfCb, uint32_t eventId,
-                            uint32_t eventFlags, PixelModification &mod)
+static void D3D12UpdateTestsFailed(const D3D12TestsFailedCallback *tfCb, uint32_t eventId,
+                                   uint32_t eventFlags, PixelModification &mod)
 {
   bool earlyFragmentTests = tfCb->HasEarlyFragments(eventId);
 
@@ -2051,7 +2144,7 @@ struct D3D12PixelHistoryPerFragmentCallback : D3D12PixelHistoryCallback
         state.ApplyState(m_pDevice, cmd);
 
         const ActionDescription *action = m_pDevice->GetAction(eid);
-        ::ReplayDraw(cmd, *action);
+        m_pDevice->ReplayDraw(cmd, *action);
 
         if(!isPrimPass)
         {
@@ -2114,7 +2207,7 @@ struct D3D12PixelHistoryPerFragmentCallback : D3D12PixelHistoryCallback
       state.ApplyState(m_pDevice, cmd);
 
       const ActionDescription *action = m_pDevice->GetAction(eid);
-      ::ReplayDraw(cmd, *action);
+      m_pDevice->ReplayDraw(cmd, *action);
 
       CopyImagePixel(cmd, colorCopyParams,
                      (fragsProcessed + f) * sizeof(D3D12PerFragmentInfo) +
@@ -2252,7 +2345,11 @@ struct D3D12PixelHistoryPerFragmentCallback : D3D12PixelHistoryCallback
       pipeDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     }
 
-    if(pipeDesc.GS.pShaderBytecode != NULL || pipeDesc.GS.BytecodeLength > 0)
+    if(pipeDesc.MS.pShaderBytecode != NULL || pipeDesc.MS.BytecodeLength > 0)
+    {
+      RDCWARN("Can't get primitive ID at event %u due to mesh shader usage", eid);
+    }
+    else if(pipeDesc.GS.pShaderBytecode != NULL || pipeDesc.GS.BytecodeLength > 0)
     {
       RDCWARN("Can't get primitive ID at event %u due to geometry shader usage", eid);
     }
@@ -2375,7 +2472,7 @@ struct D3D12PixelHistoryDiscardedFragmentsCallback : D3D12PixelHistoryCallback
       // for this fragment.
       // TODO replay with a dummy index buffer so that all primitives other than the target
       // one are degenerate - that way the vertex index etc is still the same as it should be.
-      ::ReplayDraw(cmd, action);
+      m_pDevice->ReplayDraw(cmd, action);
       cmd->EndQuery(m_OcclusionQueryHeap, D3D12_QUERY_TYPE_OCCLUSION, queryId);
 
       m_OcclusionQueries[make_rdcpair<uint32_t, uint32_t>(eid, primId)] = queryId;
@@ -2554,6 +2651,7 @@ bool D3D12DebugManager::PixelHistorySetupResources(D3D12PixelHistoryResources &r
   imageDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
   imageDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   imageDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  imageDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 
   hr = m_pDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &imageDesc,
                                           D3D12_RESOURCE_STATE_RENDER_TARGET, NULL,
@@ -2649,82 +2747,27 @@ bool D3D12DebugManager::PixelHistoryDestroyResources(D3D12PixelHistoryResources 
   return true;
 }
 
-namespace
-{
-
-bool CreateOcclusionPool(WrappedID3D12Device *device, uint32_t poolSize, ID3D12QueryHeap **ppQueryHeap)
-{
-  D3D12MarkerRegion region(device->GetQueue()->GetReal(),
-                           StringFormat::Fmt("CreateQueryHeap %u", poolSize));
-
-  D3D12_QUERY_HEAP_DESC queryDesc = {};
-  queryDesc.Count = poolSize;
-  queryDesc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
-  HRESULT hr = device->CreateQueryHeap(&queryDesc, __uuidof(ID3D12QueryHeap), (void **)ppQueryHeap);
-  if(FAILED(hr))
-  {
-    RDCERR("Failed to create query heap for pixel history HRESULT: %s", ToStr(hr).c_str());
-    return false;
-  }
-
-  return true;
-}
-
-bool IsDirectWrite(ResourceUsage usage)
-{
-  return ((usage >= ResourceUsage::VS_RWResource && usage <= ResourceUsage::CS_RWResource) ||
-          usage == ResourceUsage::CopyDst || usage == ResourceUsage::Copy ||
-          usage == ResourceUsage::Resolve || usage == ResourceUsage::ResolveDst ||
-          usage == ResourceUsage::GenMips);
-}
-
-void FillInColor(ResourceFormat fmt, const D3D12PixelHistoryValue &value, ModificationValue &mod)
-{
-  FloatVector v4 = DecodeFormattedComponents(fmt, value.color);
-  memcpy(mod.col.floatValue.data(), &v4, sizeof(v4));
-}
-
-void FillInColor(ResourceFormat fmt, const byte *pValue, ModificationValue &mod)
-{
-  FloatVector v4 = DecodeFormattedComponents(fmt, pValue);
-  memcpy(mod.col.floatValue.data(), &v4, sizeof(v4));
-}
-
-void ConvertAndFillInColor(ResourceFormat srcFmt, ResourceFormat outFmt,
-                           const D3D12PixelHistoryValue &value, ModificationValue &mod)
-{
-  FloatVector v4 = DecodeFormattedComponents(srcFmt, value.color);
-
-  // To properly handle some cases of component bounds, roundtrip through encoding again
-  uint8_t tempColor[32];
-  EncodeFormattedComponents(outFmt, v4, (byte *)tempColor);
-  v4 = DecodeFormattedComponents(outFmt, tempColor);
-
-  memcpy(mod.col.floatValue.data(), &v4, sizeof(v4));
-}
-
-float GetDepthValue(DXGI_FORMAT depthFormat, const D3D12PixelHistoryValue &value)
-{
-  FloatVector v4 = DecodeFormattedComponents(MakeResourceFormat(depthFormat), (byte *)&value.depth);
-  return v4.x;
-}
-
-float GetDepthValue(DXGI_FORMAT depthFormat, const byte *pValue)
-{
-  FloatVector v4 = DecodeFormattedComponents(MakeResourceFormat(depthFormat), pValue);
-  return v4.x;
-}
-
-}
-
 rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> events,
                                                       ResourceId target, uint32_t x, uint32_t y,
                                                       const Subresource &sub, CompType typeCast)
 {
   rdcarray<PixelModification> history;
 
-  if(!D3D12_PixelHistory())
-    return history;
+  RDCCOMPILE_ASSERT(sizeof(D3D12EventInfo) % 16 == 0, "D3D12EventInfo not multiple of 16-bytes");
+  RDCCOMPILE_ASSERT(sizeof(D3D12EventInfo) % 12 == 0, "D3D12EventInfo not multiple of 12-bytes");
+
+  RDCCOMPILE_ASSERT(offsetof(D3D12EventInfo, premod) % 16 == 0,
+                    "D3D12EventInfo::premod not aligned to 16-bytes");
+  RDCCOMPILE_ASSERT(offsetof(D3D12EventInfo, premod) % 12 == 0,
+                    "D3D12EventInfo::premod not aligned to 12-bytes");
+  RDCCOMPILE_ASSERT(offsetof(D3D12EventInfo, postmod) % 16 == 0,
+                    "D3D12EventInfo::postmod not aligned to 16-bytes");
+  RDCCOMPILE_ASSERT(offsetof(D3D12EventInfo, postmod) % 12 == 0,
+                    "D3D12EventInfo::postmod not aligned to 12-bytes");
+  RDCCOMPILE_ASSERT(offsetof(D3D12EventInfo, dsWithoutShaderDiscard) % 16 == 0,
+                    "D3D12EventInfo::dsWithoutShaderDiscard not aligned to 16-bytes");
+  RDCCOMPILE_ASSERT(offsetof(D3D12EventInfo, dsWithShaderDiscard) % 16 == 0,
+                    "D3D12EventInfo::dsWithShaderDiscard not aligned to 16-bytes");
 
   if(events.empty())
     return history;
@@ -2810,10 +2853,21 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
   // to determine if these draws failed for some reason (for ex., depth test).
   rdcarray<uint32_t> modEvents;
   rdcarray<uint32_t> drawEvents;
+  std::map<uint32_t, D3D12_RESOURCE_STATES> resourceStates;
   for(size_t ev = 0; ev < events.size(); ev++)
   {
-    bool clear = (events[ev].usage == ResourceUsage::Clear);
+    ResourceUsage usage = events[ev].usage;
+    bool clear = (usage == ResourceUsage::Clear);
     bool directWrite = IsDirectWrite(events[ev].usage);
+
+    D3D12_RESOURCE_STATES resourceState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if(IsUavWrite(usage))
+      resourceState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    else if(IsResolveWrite(usage))
+      resourceState = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    else if(IsCopyWrite(usage))
+      resourceState = D3D12_RESOURCE_STATE_COPY_DEST;
+    resourceStates[events[ev].eventId] = resourceState;
 
     if(directWrite || clear)
     {
@@ -2832,7 +2886,7 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
     }
   }
 
-  D3D12ColorAndStencilCallback cb(m_pDevice, shaderCache, callbackInfo, modEvents);
+  D3D12ColorAndStencilCallback cb(m_pDevice, shaderCache, callbackInfo, modEvents, resourceStates);
   {
     D3D12MarkerRegion colorStencilRegion(m_pDevice->GetQueue()->GetReal(),
                                          "D3D12ColorAndStencilCallback");
@@ -3089,7 +3143,7 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
         if((h < history.size() - 1) && (history[h].eventId == history[h + 1].eventId))
         {
           // Get post-modification value if this is not the last fragment for the event.
-          ConvertAndFillInColor(shaderOutFormat, fmt, fragInfo[offset].postMod, history[h].postMod);
+          ConvertAndFillInColor(shaderOutFormat, fragInfo[offset].postMod, fmt, history[h].postMod);
 
           // MSAA depth is expanded out to floats in the compute shader
           if(multisampled)

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1038,7 +1038,15 @@ rdcarray<ResourceId> VulkanResourceManager::InitialContentResources()
   rdcarray<ResourceId> resources =
       ResourceManager<VulkanResourceManagerConfiguration>::InitialContentResources();
   std::sort(resources.begin(), resources.end(), [this](ResourceId a, ResourceId b) {
-    return m_InitialContents[a].data.type < m_InitialContents[b].data.type;
+    const InitialContentData &aData = m_InitialContents[a].data;
+    const InitialContentData &bData = m_InitialContents[b].data;
+
+    // Always sort BLASs before TLASs, as a TLAS holds device addresses for it's BLASs
+    // and we make sure those addresses are valid
+    if(!aData.isTLAS && bData.isTLAS)
+      return true;
+
+    return aData.type < bData.type;
   });
   return resources;
 }

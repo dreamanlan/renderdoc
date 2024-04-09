@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,6 +26,7 @@
 
 #include "common/timing.h"
 #include "serialise/serialiser.h"
+#include "vk_acceleration_structure.h"
 #include "vk_common.h"
 #include "vk_info.h"
 #include "vk_manager.h"
@@ -53,7 +54,7 @@ struct VkInitParams
   uint64_t GetSerialiseSize();
 
   // check if a frame capture section version is supported
-  static const uint64_t CurrentVersion = 0x15;
+  static const uint64_t CurrentVersion = 0x16;
   static bool IsSupportedVersion(uint64_t ver);
 };
 
@@ -382,6 +383,7 @@ private:
   VulkanDebugManager *m_DebugManager = NULL;
   VulkanShaderCache *m_ShaderCache = NULL;
   VulkanTextRenderer *m_TextRenderer = NULL;
+  VulkanAccelerationStructureManager *m_ASManager = NULL;
 
   Threading::RWLock m_CapTransitionLock;
 
@@ -437,6 +439,8 @@ private:
     VkDriverInfo driverInfo = VkDriverInfo(false);
 
     VkPhysicalDevicePerformanceQueryFeaturesKHR performanceQueryFeatures = {};
+    // Only set during replay
+    VkDeviceSize maxMemoryAllocationSize = 0U;
 
     uint32_t queueCount = 0;
     VkQueueFamilyProperties queueProps[16] = {};
@@ -476,6 +480,7 @@ private:
   bool m_MeshShaders = false;
   bool m_TaskShaders = false;
   bool m_ListRestart = false;
+  bool m_AccelerationStructures = false;
 
   PFN_vkSetDeviceLoaderData m_SetDeviceLoaderData;
 
@@ -630,11 +635,6 @@ private:
   void FreeAllMemory(MemoryScope scope);
   uint64_t CurMemoryUsage(MemoryScope scope);
   void ResetMemoryBlocks(MemoryScope scope);
-  void FreeMemoryAllocation(MemoryAllocation alloc);
-
-  // internal implementation - call one of the functions above
-  MemoryAllocation AllocateMemoryForResource(bool buffer, VkMemoryRequirements mrq,
-                                             MemoryScope scope, MemoryType type);
 
   rdcarray<VkEvent> m_CleanupEvents;
 
@@ -652,6 +652,36 @@ private:
   rdcarray<ResetQuery> m_ResetQueries;
 
   const VkFormatProperties &GetFormatProperties(VkFormat f);
+
+  // CommandBufferNodes represent a specific execution of a command buffer in a frame. During a
+  // replay, they are used to track the set of partially-submitted command buffers.
+  struct CommandBufferNode
+  {
+    ResourceId cmdId = ResourceId();
+    uint32_t beginEvent = 0;
+    rdcarray<CommandBufferNode *> childCmdNodes;
+    CommandBufferNode *rootNode = NULL;
+    bool renderPassActive = false;
+
+    void DeleteChildren()
+    {
+      for(CommandBufferNode *child : childCmdNodes)
+      {
+        child->DeleteChildren();
+        delete child;
+      }
+    }
+  };
+
+  // CommandBufferExecuteInfo tracks the position of the execution of a secondary command buffer
+  // relative to the beginning of the parent command buffer. At the end of a replay's initial
+  // loading stage, these are used to build the tree of CommandBufferNodes that track a command
+  // buffer execution's absolute position in the frame.
+  struct CommandBufferExecuteInfo
+  {
+    ResourceId cmdId = ResourceId();
+    uint32_t relPos = 0;
+  };
 
   struct BakedCmdBufferInfo
   {
@@ -735,59 +765,72 @@ private:
   };
   rdcarray<ActionUse> m_ActionUses;
 
-  enum PartialReplayIndex
-  {
-    Primary,
-    Secondary,
-    ePartialNum
-  };
-
-  struct Submission
-  {
-    Submission(uint32_t eid) : baseEvent(eid), rebased(false) {}
-    uint32_t baseEvent = 0;
-    bool rebased = false;
-  };
-
-  // by definition, when replaying we must have N completely submitted command buffers, and at most
-  // two partially-submitted command buffers. One primary, that we're part-way through, and then
-  // if we're part-way through a vkCmdExecuteCommandBuffers inside that primary then there's one
-  // secondary.
+  // during active replay, command buffers may be partially-submitted if the selected event occurs
+  // within the range of the command buffer. If secondary command buffers are used and the selected
+  // event occurs within the range of a secondary, both the secondary and the command buffer that
+  // executed it are considered partially-submitted. If VK_EXT_nested_command_buffer is enabled,
+  // there may be up to N partially-submitted command buffers, where N is the maximum command
+  // nesting depth used in the capture.
   struct PartialReplayData
   {
     PartialReplayData() { Reset(); }
-    void Reset()
-    {
-      partialParent = ResourceId();
-      baseEvent = 0;
-      renderPassActive = false;
-    }
+    void Reset() { partialStack.clear(); }
 
-    // this records where in the frame a command buffer was submitted, so that we know if our replay
-    // range ends in one of these ranges we need to construct a partial command buffer for future
-    // replaying. Note that we always have the complete command buffer around - it's the bakeID
-    // itself.
-    // Since we only ever record a bakeID once the key is unique - note that the same command buffer
-    // could be recorded multiple times a frame, so the parent command buffer ID (the one recorded
-    // in vkCmd chunks) is NOT unique.
-    // However, a single baked command list can be submitted multiple times - so we have to have a
-    // list of base events
-    // Note in the case of secondary command buffers we mark when these are rebased to 'absolute'
-    // event IDs, since they could be submitted multiple times in the frame and we don't want to
-    // rebase all of them each time.
-    // Map from bakeID -> vector<Submission>
-    std::map<ResourceId, rdcarray<Submission>> cmdBufferSubmits;
+    // partialStack tracks the set of command buffers that are partially submitted during an active
+    // replay. when vkBeginCommandBuffer is replayed, we determine whether the command buffer is
+    // partial by checking whether the last event of the replay occurs within the event range of the
+    // command buffer. The last entry of partialStack should always be the node for the submission
+    // of the most deeply nested command buffer encountered in the replay so far. It may be empty if
+    // no command buffer is partial, or we have not yet replayed a partial command buffer.
+    rdcarray<CommandBufferNode> partialStack;
+    // commandTree represents the hierarchy of command buffer submissions in a frame. Each top level
+    // CommandBufferNode in the array should represent a primary command buffer, which may contain
+    // child nodes representing secondary command buffer executions. If VK_EXT_nested_command_buffer
+    // is enabled, these secondary nodes may also have child nodes, up to
+    // maxCommandBufferNestingLevel returned in VkPhysicalDeviceNestedCommandBufferPropertiesEXT.
+    // These trees are used during replay to update the partialStack.
+    rdcarray<CommandBufferNode *> commandTree;
+    // submitLookup maps a given command buffer ID to all the CommandBufferNodes representing
+    // different submissions of the same command buffer in the frame.
+    rdcflatmap<ResourceId, rdcarray<CommandBufferNode *>> submitLookup;
+  } m_Partial;
 
-    // identifies the baked ID of the command buffer that's actually partial at each level.
-    ResourceId partialParent;
+  // tracks secondary command buffer executions during initial replay loading. At the end of
+  // loading, these executions are rebased into the command nodes in PartialReplayData.
+  rdcflatmap<ResourceId, rdcarray<CommandBufferExecuteInfo>> m_CommandBufferExecutes;
 
-    // the base even of the submission that's partial, as defined above in partialParent
-    uint32_t baseEvent;
+  // in active replay, determines whether the given command buffer is partially submitted.
+  // a command buffer is partially submitted if the last event in the replayed range lies within the command buffer.
+  bool IsCommandBufferPartial(ResourceId cmdId);
 
-    // whether a renderpass is currently active in the partial recording - as with baseEvent, only
-    // valid for the command buffer referred to by partialParent.
-    bool renderPassActive;
-  } m_Partial[ePartialNum];
+  // in active replay, determines whether the given command buffer is a partially submitted primary command buffer.
+  bool IsCommandBufferPartialPrimary(ResourceId cmdId);
+
+  // helper function used to build the stack of partial command buffer nodes up to the target node.
+  // this is called in Serialise_vkBeginCommandBuffer. When we replay a given command buffer for the
+  // first time, we determine it is partial then build the partial stack up to it.
+  void SetPartialStack(const CommandBufferNode *targetNode, uint32_t curEvent);
+
+  // helper recursive function for SetPartialStack
+  void BuildPartialStackUpToTarget(const CommandBufferNode *curNode,
+                                   const CommandBufferNode *targetNode, uint32_t curEvent);
+
+  // helper function that determines whether a given event lies within the scope of a command buffer submission.
+  bool IsEventInCommandBuffer(const CommandBufferNode *cmdNode, uint32_t ev, uint32_t eventCount);
+
+  // in active replay, determines whether the given command buffer is the deepest nested partial command buffer.
+  bool IsCommandBufferDeepestPartial(ResourceId cmdId);
+
+  // for a given command buffer, gets the command node representing its partial submission in the
+  // partial stack. this function does not check whether the command buffer is in the partial stack.
+  // It will return null if it is not.
+  CommandBufferNode *GetCommandBufferPartialSubmission(ResourceId cmdId);
+
+  // determines whether a render pass is active for any node within the partial stack.
+  bool IsPartialRenderPassActive();
+
+  // determines whether we should track the open/close state of a renderpass.
+  bool ShouldUpdateRenderpassActive(ResourceId cmdId, bool dynamicRendering = false);
 
   // if we're replaying just a single action or a particular command
   // buffer subsection of command events, we don't go through the
@@ -812,11 +855,12 @@ private:
 
   bool InRerecordRange(ResourceId cmdid);
   bool HasRerecordCmdBuf(ResourceId cmdid);
-  bool ShouldUpdateRenderState(ResourceId cmdid, bool forcePrimary = false);
   bool IsRenderpassOpen(ResourceId cmdid);
-  VkCommandBuffer RerecordCmdBuf(ResourceId cmdid, PartialReplayIndex partialType = ePartialNum);
+  VkCommandBuffer RerecordCmdBuf(ResourceId cmdid);
 
   ResourceId GetPartialCommandBuffer();
+
+  void UpdateRenderStateForSecondaries(BakedCmdBufferInfo &ancestorCB, BakedCmdBufferInfo &currentCB);
 
   // this info is stored in the record on capture, but we
   // need it on replay too
@@ -854,6 +898,7 @@ private:
     rdcarray<VkBuffer> DeadBuffers;
     rdcarray<ResourceId> IDs;
   } m_DeviceAddressResources;
+  Threading::CriticalSection m_DeviceAddressResourcesLock;
 
   // holds the current list of coherent mapped memory. Locked against concurrent use
   rdcarray<VkResourceRecord *> m_CoherentMaps;
@@ -1030,8 +1075,17 @@ private:
   bool PatchIndirectDraw(size_t drawIndex, uint32_t paramStride, VkIndirectPatchType type,
                          ActionDescription &action, byte *&argptr, byte *argend);
   void InsertActionsAndRefreshIDs(BakedCmdBufferInfo &cmdBufInfo);
+  void AddReferencesForSecondaries(VkResourceRecord *record,
+                                   rdcarray<VkResourceRecord *> &cmdsWithReferences,
+                                   std::unordered_set<ResourceId> &refdIDs);
+  void AddRecordsForSecondaries(VkResourceRecord *record);
+  void UpdateImageStatesForSecondaries(VkResourceRecord *record);
   void CaptureQueueSubmit(VkQueue queue, const rdcarray<VkCommandBuffer> &commandBuffers,
                           VkFence fence);
+
+  CommandBufferNode *BuildSubmitTree(ResourceId cmdId, uint32_t curEvent,
+                                     CommandBufferNode *rootNode = NULL);
+
   void ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, rdcstr basename);
   void InternalFlushMemoryRange(VkDevice device, const VkMappedMemoryRange &memRange,
                                 bool internalFlush, bool capframe);
@@ -1119,6 +1173,7 @@ public:
   VulkanResourceManager *GetResourceManager() { return m_ResourceManager; }
   VulkanDebugManager *GetDebugManager() { return m_DebugManager; }
   VulkanShaderCache *GetShaderCache() { return m_ShaderCache; }
+  VulkanAccelerationStructureManager *GetAccelerationStructureManager() { return m_ASManager; }
   CaptureState GetState() { return m_State; }
   VulkanReplay *GetReplay() { return m_Replay; }
   // replay interface
@@ -1174,8 +1229,12 @@ public:
   uint32_t GetUploadMemoryIndex(uint32_t resourceCompatibleBitmask);
   uint32_t GetGPULocalMemoryIndex(uint32_t resourceCompatibleBitmask);
 
+  // Low-level implementation, always prefer the two below
+  MemoryAllocation AllocateMemoryForResource(bool buffer, VkMemoryRequirements mrq,
+                                             MemoryScope scope, MemoryType type);
   MemoryAllocation AllocateMemoryForResource(VkImage im, MemoryScope scope, MemoryType type);
   MemoryAllocation AllocateMemoryForResource(VkBuffer buf, MemoryScope scope, MemoryType type);
+  void FreeMemoryAllocation(MemoryAllocation alloc);
 
   void ChooseMemoryIndices();
 
@@ -1274,6 +1333,7 @@ public:
   bool TaskShaders() const { return m_TaskShaders; }
   bool MeshShaders() const { return m_MeshShaders; }
   bool ListRestart() const { return m_ListRestart; }
+  bool AccelerationStructures() const { return m_AccelerationStructures; }
   VulkanRenderState &GetRenderState() { return m_RenderState; }
   void SetActionCB(VulkanActionCallback *cb) { m_ActionCallback = cb; }
   void SetSubmitChain(void *submitChain) { m_SubmitChain = submitChain; }
@@ -1303,6 +1363,10 @@ public:
   const VkPhysicalDevicePerformanceQueryFeaturesKHR &GetPhysicalDevicePerformanceQueryFeatures()
   {
     return m_PhysicalDeviceData.performanceQueryFeatures;
+  }
+  const VkDeviceSize &GetMaxMemoryAllocationSize()
+  {
+    return m_PhysicalDeviceData.maxMemoryAllocationSize;
   }
   const VkDriverInfo &GetDriverInfo() const { return m_PhysicalDeviceData.driverInfo; }
   uint32_t FindCommandQueueFamily(ResourceId cmdId);
@@ -1348,10 +1412,10 @@ public:
   // Device initialization
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateInstance, const VkInstanceCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkInstance *pInstance);
+                                const VkAllocationCallbacks *, VkInstance *pInstance);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyInstance, VkInstance instance,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkEnumeratePhysicalDevices, VkInstance instance,
                                 uint32_t *pPhysicalDeviceCount, VkPhysicalDevice *pPhysicalDevices);
@@ -1390,10 +1454,10 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateDevice, VkPhysicalDevice physicalDevice,
                                 const VkDeviceCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkDevice *pDevice);
+                                const VkAllocationCallbacks *, VkDevice *pDevice);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyDevice, VkDevice device,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // Queue functions
 
@@ -1411,10 +1475,10 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateQueryPool, VkDevice device,
                                 const VkQueryPoolCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkQueryPool *pQueryPool);
+                                const VkAllocationCallbacks *, VkQueryPool *pQueryPool);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyQueryPool, VkDevice device, VkQueryPool queryPool,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkGetQueryPoolResults, VkDevice device,
                                 VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount,
@@ -1425,19 +1489,19 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateSemaphore, VkDevice device,
                                 const VkSemaphoreCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkSemaphore *pSemaphore);
+                                const VkAllocationCallbacks *, VkSemaphore *pSemaphore);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroySemaphore, VkDevice device, VkSemaphore semaphore,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // Fence functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateFence, VkDevice device,
-                                const VkFenceCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkFence *pFence);
+                                const VkFenceCreateInfo *pCreateInfo, const VkAllocationCallbacks *,
+                                VkFence *pFence);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyFence, VkDevice device, VkFence fence,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkResetFences, VkDevice device, uint32_t fenceCount,
                                 const VkFence *pFences);
@@ -1450,11 +1514,11 @@ public:
   // Event functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateEvent, VkDevice device,
-                                const VkEventCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkEvent *pEvent);
+                                const VkEventCreateInfo *pCreateInfo, const VkAllocationCallbacks *,
+                                VkEvent *pEvent);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyEvent, VkDevice device, VkEvent event,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkGetEventStatus, VkDevice device, VkEvent event);
 
@@ -1466,10 +1530,10 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkAllocateMemory, VkDevice device,
                                 const VkMemoryAllocateInfo *pAllocateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMemory);
+                                const VkAllocationCallbacks *, VkDeviceMemory *pMemory);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkFreeMemory, VkDevice device, VkDeviceMemory memory,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkMapMemory, VkDevice device, VkDeviceMemory memory,
                                 VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags,
@@ -1511,28 +1575,28 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateBuffer, VkDevice device,
                                 const VkBufferCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer);
+                                const VkAllocationCallbacks *, VkBuffer *pBuffer);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyBuffer, VkDevice device, VkBuffer buffer,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // Buffer view functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateBufferView, VkDevice device,
                                 const VkBufferViewCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkBufferView *pView);
+                                const VkAllocationCallbacks *, VkBufferView *pView);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyBufferView, VkDevice device, VkBufferView bufferView,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // Image functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateImage, VkDevice device,
-                                const VkImageCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkImage *pImage);
+                                const VkImageCreateInfo *pCreateInfo, const VkAllocationCallbacks *,
+                                VkImage *pImage);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyImage, VkDevice device, VkImage image,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkGetImageSubresourceLayout, VkDevice device, VkImage image,
                                 const VkImageSubresource *pSubresource, VkSubresourceLayout *pLayout);
@@ -1541,31 +1605,28 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateImageView, VkDevice device,
                                 const VkImageViewCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkImageView *pView);
+                                const VkAllocationCallbacks *, VkImageView *pView);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyImageView, VkDevice device, VkImageView imageView,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // Shader functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateShaderModule, VkDevice device,
                                 const VkShaderModuleCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
-                                VkShaderModule *pShaderModule);
+                                const VkAllocationCallbacks *, VkShaderModule *pShaderModule);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyShaderModule, VkDevice device,
-                                VkShaderModule shaderModule, const VkAllocationCallbacks *pAllocator);
+                                VkShaderModule shaderModule, const VkAllocationCallbacks *);
 
   // Pipeline functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreatePipelineCache, VkDevice device,
                                 const VkPipelineCacheCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
-                                VkPipelineCache *pPipelineCache);
+                                const VkAllocationCallbacks *, VkPipelineCache *pPipelineCache);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyPipelineCache, VkDevice device,
-                                VkPipelineCache pipelineCache,
-                                const VkAllocationCallbacks *pAllocator);
+                                VkPipelineCache pipelineCache, const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkGetPipelineCacheData, VkDevice device,
                                 VkPipelineCache pipelineCache, size_t *pDataSize, void *pData);
@@ -1577,55 +1638,50 @@ public:
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateGraphicsPipelines, VkDevice device,
                                 VkPipelineCache pipelineCache, uint32_t createInfoCount,
                                 const VkGraphicsPipelineCreateInfo *pCreateInfos,
-                                const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines);
+                                const VkAllocationCallbacks *, VkPipeline *pPipelines);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateComputePipelines, VkDevice device,
                                 VkPipelineCache pipelineCache, uint32_t createInfoCount,
                                 const VkComputePipelineCreateInfo *pCreateInfos,
-                                const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines);
+                                const VkAllocationCallbacks *, VkPipeline *pPipelines);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyPipeline, VkDevice device, VkPipeline pipeline,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // Pipeline layout functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreatePipelineLayout, VkDevice device,
                                 const VkPipelineLayoutCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
-                                VkPipelineLayout *pPipelineLayout);
+                                const VkAllocationCallbacks *, VkPipelineLayout *pPipelineLayout);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyPipelineLayout, VkDevice device,
-                                VkPipelineLayout pipelineLayout,
-                                const VkAllocationCallbacks *pAllocator);
+                                VkPipelineLayout pipelineLayout, const VkAllocationCallbacks *);
 
   // Sampler functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateSampler, VkDevice device,
                                 const VkSamplerCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkSampler *pSampler);
+                                const VkAllocationCallbacks *, VkSampler *pSampler);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroySampler, VkDevice device, VkSampler sampler,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // Descriptor set functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateDescriptorSetLayout, VkDevice device,
                                 const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
-                                VkDescriptorSetLayout *pSetLayout);
+                                const VkAllocationCallbacks *, VkDescriptorSetLayout *pSetLayout);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyDescriptorSetLayout, VkDevice device,
                                 VkDescriptorSetLayout descriptorSetLayout,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateDescriptorPool, VkDevice device,
                                 const VkDescriptorPoolCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
-                                VkDescriptorPool *pDescriptorPool);
+                                const VkAllocationCallbacks *, VkDescriptorPool *pDescriptorPool);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyDescriptorPool, VkDevice device,
-                                VkDescriptorPool descriptorPool,
-                                const VkAllocationCallbacks *pAllocator);
+                                VkDescriptorPool descriptorPool, const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkResetDescriptorPool, VkDevice device,
                                 VkDescriptorPool descriptorPool, VkDescriptorPoolResetFlags flags);
@@ -1654,10 +1710,10 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateCommandPool, VkDevice device,
                                 const VkCommandPoolCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkCommandPool *pCommandPool);
+                                const VkAllocationCallbacks *, VkCommandPool *pCommandPool);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyCommandPool, VkDevice device,
-                                VkCommandPool commandPool, const VkAllocationCallbacks *pAllocator);
+                                VkCommandPool commandPool, const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkResetCommandPool, VkDevice device,
                                 VkCommandPool commandPool, VkCommandPoolResetFlags flags);
@@ -1858,28 +1914,26 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateFramebuffer, VkDevice device,
                                 const VkFramebufferCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkFramebuffer *pFramebuffer);
+                                const VkAllocationCallbacks *, VkFramebuffer *pFramebuffer);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyFramebuffer, VkDevice device,
-                                VkFramebuffer framebuffer, const VkAllocationCallbacks *pAllocator);
+                                VkFramebuffer framebuffer, const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateRenderPass, VkDevice device,
                                 const VkRenderPassCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkRenderPass *pRenderPass);
+                                const VkAllocationCallbacks *, VkRenderPass *pRenderPass);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyRenderPass, VkDevice device, VkRenderPass renderPass,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // VK_EXT_debug_report functions
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateDebugReportCallbackEXT, VkInstance instance,
                                 const VkDebugReportCallbackCreateInfoEXT *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
-                                VkDebugReportCallbackEXT *pCallback);
+                                const VkAllocationCallbacks *, VkDebugReportCallbackEXT *pCallback);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyDebugReportCallbackEXT, VkInstance instance,
-                                VkDebugReportCallbackEXT callback,
-                                const VkAllocationCallbacks *pAllocator);
+                                VkDebugReportCallbackEXT callback, const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDebugReportMessageEXT, VkInstance instance,
                                 VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT objectType,
@@ -1922,10 +1976,10 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateSwapchainKHR, VkDevice device,
                                 const VkSwapchainCreateInfoKHR *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain);
+                                const VkAllocationCallbacks *, VkSwapchainKHR *pSwapchain);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroySwapchainKHR, VkDevice device,
-                                VkSwapchainKHR swapchain, const VkAllocationCallbacks *pAllocator);
+                                VkSwapchainKHR swapchain, const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkGetSwapchainImagesKHR, VkDevice device,
                                 VkSwapchainKHR swapchain, uint32_t *pSwapchainImageCount,
@@ -1944,14 +1998,13 @@ public:
   // these functions are non-serialised as they're only used for windowing
   // setup during capture, but they must be intercepted so we can unwrap
   // properly
-  void vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
-                           const VkAllocationCallbacks *pAllocator);
+  void vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks *);
 
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
   // VK_KHR_win32_surface
   VkResult vkCreateWin32SurfaceKHR(VkInstance instance,
                                    const VkWin32SurfaceCreateInfoKHR *pCreateInfo,
-                                   const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface);
+                                   const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 
   VkBool32 vkGetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice physicalDevice,
                                                           uint32_t queueFamilyIndex);
@@ -1987,7 +2040,7 @@ public:
   // VK_KHR_android_surface
   VkResult vkCreateAndroidSurfaceKHR(VkInstance instance,
                                      const VkAndroidSurfaceCreateInfoKHR *pCreateInfo,
-                                     const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface);
+                                     const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 
   // VK_ANDROID_external_memory_android_hardware_buffer
   VkResult vkGetAndroidHardwareBufferPropertiesANDROID(
@@ -2004,13 +2057,13 @@ public:
   // VK_MVK_macos_surface
   VkResult vkCreateMacOSSurfaceMVK(VkInstance instance,
                                    const VkMacOSSurfaceCreateInfoMVK *pCreateInfo,
-                                   const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface);
+                                   const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 #endif
 
 #if defined(VK_USE_PLATFORM_XCB_KHR)
   // VK_KHR_xcb_surface
   VkResult vkCreateXcbSurfaceKHR(VkInstance instance, const VkXcbSurfaceCreateInfoKHR *pCreateInfo,
-                                 const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface);
+                                 const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 
   VkBool32 vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice,
                                                         uint32_t queueFamilyIndex,
@@ -2021,7 +2074,7 @@ public:
 #if defined(VK_USE_PLATFORM_XLIB_KHR)
   // VK_KHR_xlib_surface
   VkResult vkCreateXlibSurfaceKHR(VkInstance instance, const VkXlibSurfaceCreateInfoKHR *pCreateInfo,
-                                  const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface);
+                                  const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 
   VkBool32 vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physicalDevice,
                                                          uint32_t queueFamilyIndex, Display *dpy,
@@ -2038,15 +2091,14 @@ public:
 #if defined(VK_USE_PLATFORM_GGP)
   VkResult vkCreateStreamDescriptorSurfaceGGP(VkInstance instance,
                                               const VkStreamDescriptorSurfaceCreateInfoGGP *pCreateInfo,
-                                              const VkAllocationCallbacks *pAllocator,
-                                              VkSurfaceKHR *pSurface);
+                                              const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 #endif
 
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR)
   // VK_KHR_wayland_surface
   VkResult vkCreateWaylandSurfaceKHR(VkInstance instance,
                                      const VkWaylandSurfaceCreateInfoKHR *pCreateInfo,
-                                     const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface);
+                                     const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 
   VkBool32 vkGetPhysicalDeviceWaylandPresentationSupportKHR(VkPhysicalDevice physicalDevice,
                                                             uint32_t queueFamilyIndex,
@@ -2073,7 +2125,7 @@ public:
 
   VkResult vkCreateDisplayModeKHR(VkPhysicalDevice physicalDevice, VkDisplayKHR display,
                                   const VkDisplayModeCreateInfoKHR *pCreateInfo,
-                                  const VkAllocationCallbacks *pAllocator, VkDisplayModeKHR *pMode);
+                                  const VkAllocationCallbacks *, VkDisplayModeKHR *pMode);
 
   VkResult vkGetDisplayPlaneCapabilitiesKHR(VkPhysicalDevice physicalDevice, VkDisplayModeKHR mode,
                                             uint32_t planeIndex,
@@ -2081,13 +2133,11 @@ public:
 
   VkResult vkCreateDisplayPlaneSurfaceKHR(VkInstance instance,
                                           const VkDisplaySurfaceCreateInfoKHR *pCreateInfo,
-                                          const VkAllocationCallbacks *pAllocator,
-                                          VkSurfaceKHR *pSurface);
+                                          const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 
   VkResult vkCreateSharedSwapchainsKHR(VkDevice device, uint32_t swapchainCount,
                                        const VkSwapchainCreateInfoKHR *pCreateInfos,
-                                       const VkAllocationCallbacks *pAllocator,
-                                       VkSwapchainKHR *pSwapchains);
+                                       const VkAllocationCallbacks *, VkSwapchainKHR *pSwapchains);
 
   // VK_NV_external_memory_capabilities
   VkResult vkGetPhysicalDeviceExternalImageFormatPropertiesNV(
@@ -2126,10 +2176,10 @@ public:
   VkResult vkDisplayPowerControlEXT(VkDevice device, VkDisplayKHR display,
                                     const VkDisplayPowerInfoEXT *pDisplayPowerInfo);
   VkResult vkRegisterDeviceEventEXT(VkDevice device, const VkDeviceEventInfoEXT *pDeviceEventInfo,
-                                    const VkAllocationCallbacks *pAllocator, VkFence *pFence);
+                                    const VkAllocationCallbacks *, VkFence *pFence);
   VkResult vkRegisterDisplayEventEXT(VkDevice device, VkDisplayKHR display,
                                      const VkDisplayEventInfoEXT *pDisplayEventInfo,
-                                     const VkAllocationCallbacks *pAllocator, VkFence *pFence);
+                                     const VkAllocationCallbacks *, VkFence *pFence);
   VkResult vkGetSwapchainCounterEXT(VkDevice device, VkSwapchainKHR swapchain,
                                     VkSurfaceCounterFlagBitsEXT counter, uint64_t *pCounterValue);
 
@@ -2198,12 +2248,12 @@ public:
   // VK_KHR_descriptor_update_template
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateDescriptorUpdateTemplate, VkDevice device,
                                 const VkDescriptorUpdateTemplateCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
+                                const VkAllocationCallbacks *,
                                 VkDescriptorUpdateTemplate *pDescriptorUpdateTemplate);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyDescriptorUpdateTemplate, VkDevice device,
                                 VkDescriptorUpdateTemplate descriptorUpdateTemplate,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkUpdateDescriptorSetWithTemplate, VkDevice device,
                                 VkDescriptorSet descriptorSet,
@@ -2256,12 +2306,10 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateDebugUtilsMessengerEXT, VkInstance instance,
                                 const VkDebugUtilsMessengerCreateInfoEXT *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
-                                VkDebugUtilsMessengerEXT *pMessenger);
+                                const VkAllocationCallbacks *, VkDebugUtilsMessengerEXT *pMessenger);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyDebugUtilsMessengerEXT, VkInstance instance,
-                                VkDebugUtilsMessengerEXT messenger,
-                                const VkAllocationCallbacks *pAllocator);
+                                VkDebugUtilsMessengerEXT messenger, const VkAllocationCallbacks *);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkSubmitDebugUtilsMessageEXT, VkInstance instance,
                                 VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
@@ -2271,12 +2319,12 @@ public:
   // VK_KHR_sampler_ycbcr_conversion
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateSamplerYcbcrConversion, VkDevice device,
                                 const VkSamplerYcbcrConversionCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator,
+                                const VkAllocationCallbacks *,
                                 VkSamplerYcbcrConversion *pYcbcrConversion);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroySamplerYcbcrConversion, VkDevice device,
                                 VkSamplerYcbcrConversion ycbcrConversion,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   // VK_KHR_device_group_creation
   VkResult vkEnumeratePhysicalDeviceGroups(
@@ -2350,11 +2398,11 @@ public:
   // VK_EXT_validation_cache
   VkResult vkCreateValidationCacheEXT(VkDevice device,
                                       const VkValidationCacheCreateInfoEXT *pCreateInfo,
-                                      const VkAllocationCallbacks *pAllocator,
+                                      const VkAllocationCallbacks *,
                                       VkValidationCacheEXT *pValidationCache);
 
   void vkDestroyValidationCacheEXT(VkDevice device, VkValidationCacheEXT validationCache,
-                                   const VkAllocationCallbacks *pAllocator);
+                                   const VkAllocationCallbacks *);
 
   VkResult vkMergeValidationCachesEXT(VkDevice device, VkValidationCacheEXT dstCache,
                                       uint32_t srcCacheCount, const VkValidationCacheEXT *pSrcCaches);
@@ -2368,7 +2416,7 @@ public:
   // VK_KHR_create_renderpass2
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateRenderPass2, VkDevice device,
                                 const VkRenderPassCreateInfo2 *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkRenderPass *pRenderPass);
+                                const VkAllocationCallbacks *, VkRenderPass *pRenderPass);
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBeginRenderPass2, VkCommandBuffer commandBuffer,
                                 const VkRenderPassBeginInfo *pRenderPassBegin,
                                 const VkSubpassBeginInfo *pSubpassBeginInfo);
@@ -2426,9 +2474,18 @@ public:
 
   VkResult vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(VkPhysicalDevice physicalDevice,
                                                           uint32_t *pTimeDomainCount,
-                                                          VkTimeDomainEXT *pTimeDomains);
+                                                          VkTimeDomainKHR *pTimeDomains);
   VkResult vkGetCalibratedTimestampsEXT(VkDevice device, uint32_t timestampCount,
-                                        const VkCalibratedTimestampInfoEXT *pTimestampInfos,
+                                        const VkCalibratedTimestampInfoKHR *pTimestampInfos,
+                                        uint64_t *pTimestamps, uint64_t *pMaxDeviation);
+
+  // VK_KHR_calibrated_timestamps (straight promotion)
+
+  VkResult vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice physicalDevice,
+                                                          uint32_t *pTimeDomainCount,
+                                                          VkTimeDomainKHR *pTimeDomains);
+  VkResult vkGetCalibratedTimestampsKHR(VkDevice device, uint32_t timestampCount,
+                                        const VkCalibratedTimestampInfoKHR *pTimestampInfos,
                                         uint64_t *pTimestamps, uint64_t *pMaxDeviation);
 
   // VK_EXT_host_query_reset
@@ -2471,8 +2528,7 @@ public:
 
   VkResult vkCreateHeadlessSurfaceEXT(VkInstance instance,
                                       const VkHeadlessSurfaceCreateInfoEXT *pCreateInfo,
-                                      const VkAllocationCallbacks *pAllocator,
-                                      VkSurfaceKHR *pSurface);
+                                      const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 
   // VK_KHR_pipeline_executable_properties
 
@@ -2494,6 +2550,11 @@ public:
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLineStippleEXT, VkCommandBuffer commandBuffer,
                                 uint32_t lineStippleFactor, uint16_t lineStipplePattern);
 
+  // VK_KHR_line_rasterization
+
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLineStippleKHR, VkCommandBuffer commandBuffer,
+                                uint32_t lineStippleFactor, uint16_t lineStipplePattern);
+
   // VK_GOOGLE_display_timing
 
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkGetRefreshCycleDurationGOOGLE, VkDevice device,
@@ -2508,7 +2569,7 @@ public:
   // VK_EXT_metal_surface
   VkResult vkCreateMetalSurfaceEXT(VkInstance instance,
                                    const VkMetalSurfaceCreateInfoEXT *pCreateInfo,
-                                   const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface);
+                                   const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 #endif
 
   // VK_KHR_timeline_semaphore
@@ -2548,11 +2609,11 @@ public:
   // VK_EXT_private_data
 
   VkResult vkCreatePrivateDataSlot(VkDevice device, const VkPrivateDataSlotCreateInfo *pCreateInfo,
-                                   const VkAllocationCallbacks *pAllocator,
+                                   const VkAllocationCallbacks *,
                                    VkPrivateDataSlot *pPrivateDataSlot);
 
   void vkDestroyPrivateDataSlot(VkDevice device, VkPrivateDataSlot privateDataSlot,
-                                const VkAllocationCallbacks *pAllocator);
+                                const VkAllocationCallbacks *);
 
   VkResult vkSetPrivateData(VkDevice device, VkObjectType objectType, uint64_t objectHandle,
                             VkPrivateDataSlot privateDataSlot, uint64_t data);
@@ -2758,7 +2819,7 @@ public:
                                 VkCommandBuffer commandBuffer,
                                 float extraPrimitiveOverestimationSize);
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLineRasterizationModeEXT, VkCommandBuffer commandBuffer,
-                                VkLineRasterizationModeEXT lineRasterizationMode);
+                                VkLineRasterizationModeKHR lineRasterizationMode);
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLineStippleEnableEXT, VkCommandBuffer commandBuffer,
                                 VkBool32 stippledLineEnable);
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLogicOpEnableEXT, VkCommandBuffer commandBuffer,
@@ -2798,4 +2859,70 @@ public:
                                 VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
                                 VkBuffer countBuffer, VkDeviceSize countBufferOffset,
                                 uint32_t maxDrawCount, uint32_t stride);
+
+  // VK_KHR_deferred_host_operations
+  VkResult vkCreateDeferredOperationKHR(VkDevice device, const VkAllocationCallbacks *,
+                                        VkDeferredOperationKHR *pDeferredOperation);
+  VkResult vkDeferredOperationJoinKHR(VkDevice device, VkDeferredOperationKHR operation);
+  void vkDestroyDeferredOperationKHR(VkDevice device, VkDeferredOperationKHR operation,
+                                     const VkAllocationCallbacks *);
+  uint32_t vkGetDeferredOperationMaxConcurrencyKHR(VkDevice device, VkDeferredOperationKHR operation);
+  VkResult vkGetDeferredOperationResultKHR(VkDevice device, VkDeferredOperationKHR operation);
+
+  // VK_KHR_acceleration_structure
+  VkResult vkBuildAccelerationStructuresKHR(
+      VkDevice device, VkDeferredOperationKHR deferredOperation, uint32_t infoCount,
+      const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+      const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBuildAccelerationStructuresIndirectKHR,
+                                VkCommandBuffer commandBuffer, uint32_t infoCount,
+                                const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+                                const VkDeviceAddress *pIndirectDeviceAddresses,
+                                const uint32_t *pIndirectStrides,
+                                const uint32_t *const *ppMaxPrimitiveCounts);
+  IMPLEMENT_FUNCTION_SERIALISED(
+      void, vkCmdBuildAccelerationStructuresKHR, VkCommandBuffer commandBuffer, uint32_t infoCount,
+      const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+      const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdCopyAccelerationStructureKHR,
+                                VkCommandBuffer commandBuffer,
+                                const VkCopyAccelerationStructureInfoKHR *pInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdCopyAccelerationStructureToMemoryKHR,
+                                VkCommandBuffer commandBuffer,
+                                const VkCopyAccelerationStructureToMemoryInfoKHR *pInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdCopyMemoryToAccelerationStructureKHR,
+                                VkCommandBuffer commandBuffer,
+                                const VkCopyMemoryToAccelerationStructureInfoKHR *pInfo);
+  void vkCmdWriteAccelerationStructuresPropertiesKHR(
+      VkCommandBuffer commandBuffer, uint32_t accelerationStructureCount,
+      const VkAccelerationStructureKHR *pAccelerationStructures, VkQueryType queryType,
+      VkQueryPool queryPool, uint32_t firstQuery);
+  VkResult vkCopyAccelerationStructureKHR(VkDevice device, VkDeferredOperationKHR deferredOperation,
+                                          const VkCopyAccelerationStructureInfoKHR *pInfo);
+  VkResult vkCopyAccelerationStructureToMemoryKHR(
+      VkDevice device, VkDeferredOperationKHR deferredOperation,
+      const VkCopyAccelerationStructureToMemoryInfoKHR *pInfo);
+  VkResult vkCopyMemoryToAccelerationStructureKHR(
+      VkDevice device, VkDeferredOperationKHR deferredOperation,
+      const VkCopyMemoryToAccelerationStructureInfoKHR *pInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateAccelerationStructureKHR, VkDevice device,
+                                const VkAccelerationStructureCreateInfoKHR *pCreateInfo,
+                                const VkAllocationCallbacks *,
+                                VkAccelerationStructureKHR *pAccelerationStructure);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkDestroyAccelerationStructureKHR, VkDevice device,
+                                VkAccelerationStructureKHR accelerationStructure,
+                                const VkAllocationCallbacks *);
+  void vkGetAccelerationStructureBuildSizesKHR(
+      VkDevice device, VkAccelerationStructureBuildTypeKHR buildType,
+      const VkAccelerationStructureBuildGeometryInfoKHR *pBuildInfo,
+      const uint32_t *pMaxPrimitiveCounts, VkAccelerationStructureBuildSizesInfoKHR *pSizeInfo);
+  VkDeviceAddress vkGetAccelerationStructureDeviceAddressKHR(
+      VkDevice device, const VkAccelerationStructureDeviceAddressInfoKHR *pInfo);
+  void vkGetDeviceAccelerationStructureCompatibilityKHR(
+      VkDevice device, const VkAccelerationStructureVersionInfoKHR *pVersionInfo,
+      VkAccelerationStructureCompatibilityKHR *pCompatibility);
+  VkResult vkWriteAccelerationStructuresPropertiesKHR(
+      VkDevice device, uint32_t accelerationStructureCount,
+      const VkAccelerationStructureKHR *pAccelerationStructures, VkQueryType queryType,
+      size_t dataSize, void *pData, size_t stride);
 };

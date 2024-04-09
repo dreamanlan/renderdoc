@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,8 @@
 #pragma once
 
 #include <atomic>
+
+#include "3rdparty/pythoncapi_compat.h"
 
 // this is defined elsewhere for managing the opaque global_handle object
 extern "C" PyThreadState *GetExecutingThreadState(PyObject *global_handle);
@@ -178,11 +180,7 @@ inline void get_return(const char *funcname, PyObject *result, PyObject *global_
 struct PyObjectRefCounter
 {
   PyObjectRefCounter(PyObject *o) : obj(o) { Py_INCREF(obj); }
-  PyObjectRefCounter(const PyObjectRefCounter &o)
-  {
-    obj = o.obj;
-    Py_INCREF(obj);
-  }
+  PyObjectRefCounter(const PyObjectRefCounter &o) { obj = Py_NewRef(o.obj); }
   ~PyObjectRefCounter()
   {
     // it may not be safe at the point this is destroyed to decref the object. For example if a
@@ -269,8 +267,7 @@ struct ScopedFuncCall
 {
   ScopedFuncCall(PyObject *h)
   {
-    handle = h;
-    Py_XINCREF(handle);
+    handle = Py_XNewRef(h);
     gil = PyGILState_Ensure();
   }
 
@@ -288,7 +285,7 @@ template <typename funcType>
 funcType ConvertFunc(const char *funcname, PyObject *func, ExceptionHandler exHandle)
 {
   // allow None to indicate no callback
-  if(func == Py_None)
+  if(Py_IsNone(func))
     return funcType();
 
   // add a reference to the global object so it stays alive while we execute, in case this is an

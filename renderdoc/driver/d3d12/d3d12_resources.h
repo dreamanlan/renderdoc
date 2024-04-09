@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -337,7 +337,6 @@ class WrappedID3D12CommandAllocator : public WrappedDeviceChild12<ID3D12CommandA
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12CommandAllocator);
 
-  ChunkAllocator *alloc = NULL;
   bool m_Internal = false;
 
   enum
@@ -359,8 +358,8 @@ public:
   {
     // reset the allocator. D3D12 munges the pool and the allocator together, so the allocator
     // becomes redundant as the only pool client and the pool is reset together.
-    if(Atomic::CmpExch32(&m_ResetEnabled, 1, 1) == 1 && alloc)
-      alloc->Reset();
+    if(Atomic::CmpExch32(&m_ResetEnabled, 1, 1) == 1 && m_pRecord && m_pRecord->cmdInfo->alloc)
+      m_pRecord->cmdInfo->alloc->Reset();
     return m_pReal->Reset();
   }
 };
@@ -928,14 +927,22 @@ public:
   virtual ~WrappedID3D12QueryHeap() { Shutdown(); }
 };
 
+class D3D12AccelerationStructure;
+
 class WrappedID3D12Resource
     : public WrappedDeviceChild12<ID3D12Resource, ID3D12Resource1, ID3D12Resource2>
 {
   static GPUAddressRangeTracker m_Addresses;
+  static rdcarray<ResourceId> m_bufferResources;
 
   WriteSerialiser &GetThreadSerialiser();
+  size_t DeleteOverlappingAccStructsInRangeAtOffset(D3D12BufferOffset bufferOffset);
 
   WrappedID3D12Heap *m_Heap = NULL;
+
+  Threading::CriticalSection m_accStructResourcesCS;
+  rdcflatmap<D3D12BufferOffset, D3D12AccelerationStructure *> m_accelerationStructMap;
+  bool m_isAccelerationStructureResource = false;
 
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12Resource, false);
@@ -959,6 +966,25 @@ public:
     if(m_Heap)
       return m_Heap->GetResourceID();
     return this->GetResourceID();
+  }
+
+  bool CreateAccStruct(D3D12BufferOffset bufferOffset,
+                       const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO &preBldInfo,
+                       D3D12AccelerationStructure **accStruct);
+
+  bool GetAccStructIfExist(D3D12BufferOffset bufferOffset,
+                           D3D12AccelerationStructure **accStruct = NULL);
+
+  bool DeleteAccStructAtOffset(D3D12BufferOffset bufferOffset);
+
+  bool IsAccelerationStructureResource() const { return m_isAccelerationStructureResource; }
+  void MarkAsAccelerationStructureResource() { m_isAccelerationStructureResource = true; }
+  static void MarkAllBufferResourceFrameReferenced(D3D12ResourceManager *rm)
+  {
+    for(ResourceId id : m_bufferResources)
+    {
+      rm->MarkResourceFrameReferenced(id, eFrameRef_Read);
+    }
   }
 
   static void RefBuffers(D3D12ResourceManager *rm);
@@ -1028,6 +1054,8 @@ public:
       range.id = GetResourceID();
 
       m_Addresses.AddTo(range);
+
+      m_bufferResources.push_back(GetResourceID());
     }
   }
   virtual ~WrappedID3D12Resource();
@@ -1262,6 +1290,27 @@ public:
   {
     return m_pReal->GetDesc();
   }
+};
+
+// class to represent acceleration structure i.e. BLAS/TLAS
+class D3D12AccelerationStructure : public WrappedDeviceChild12<ID3D12DeviceChild>
+{
+public:
+  ALLOCATE_WITH_WRAPPED_POOL(D3D12AccelerationStructure);
+
+  D3D12AccelerationStructure(WrappedID3D12Device *wrappedDevice, WrappedID3D12Resource *bufferRes,
+                             D3D12BufferOffset bufferOffset,
+                             const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO &preBldInfo);
+
+  ~D3D12AccelerationStructure();
+
+  uint64_t Size() const { return m_preBldInfo.ResultDataMaxSizeInBytes; }
+  ResourceId GetBackingBufferResourceId() const { return m_asbWrappedResource->GetResourceID(); }
+
+private:
+  WrappedID3D12Resource *m_asbWrappedResource;
+  D3D12BufferOffset m_asbWrappedResourceBufferOffset;
+  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO m_preBldInfo;
 };
 
 #define ALL_D3D12_TYPES                             \

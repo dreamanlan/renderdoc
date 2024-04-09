@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -234,8 +234,8 @@ public:
                                            uint32_t y, const Subresource &sub, CompType typeCast);
   ShaderDebugTrace *DebugVertex(uint32_t eventId, uint32_t vertid, uint32_t instid, uint32_t idx,
                                 uint32_t view);
-  ShaderDebugTrace *DebugPixel(uint32_t eventId, uint32_t x, uint32_t y, uint32_t sample,
-                               uint32_t primitive);
+  ShaderDebugTrace *DebugPixel(uint32_t eventId, uint32_t x, uint32_t y,
+                               const DebugPixelInputs &inputs);
   ShaderDebugTrace *DebugThread(uint32_t eventId, const rdcfixedarray<uint32_t, 3> &groupid,
                                 const rdcfixedarray<uint32_t, 3> &threadid);
   rdcarray<ShaderDebugState> ContinueDebug(ShaderDebugger *debugger);
@@ -366,8 +366,22 @@ private:
         return ampout;
       else if(type == MeshDataStage::MeshOut)
         return meshout;
-      else
-        RDCERR("Unexpected mesh data stage!");
+
+      if(type == MeshDataStage::Count)
+      {
+        if(gsout.buf)
+          return gsout;
+
+        if(vsout.buf)
+          return vsout;
+
+        if(meshout.buf)
+          return meshout;
+
+        return vsout;
+      }
+
+      RDCERR("Unexpected mesh data stage!");
 
       return vsout;
     }

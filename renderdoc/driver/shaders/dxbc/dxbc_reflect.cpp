@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -285,11 +285,11 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl,
       break;
   }
 
-  refl->entryPoint = "main";
+  refl->debugInfo.entrySourceName = refl->entryPoint = "main";
 
   if(dxbc->GetDebugInfo())
   {
-    refl->entryPoint = dxbc->GetDebugInfo()->GetEntryFunction();
+    refl->debugInfo.entrySourceName = refl->entryPoint = dxbc->GetDebugInfo()->GetEntryFunction();
 
     refl->debugInfo.encoding = ShaderEncoding::HLSL;
 

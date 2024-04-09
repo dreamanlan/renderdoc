@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1429,20 +1429,20 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
 
     ret.rasterizer.lineRasterMode = LineRaster::Default;
 
-    // "VK_LINE_RASTERIZATION_MODE_DEFAULT_EXT is equivalent to
-    // VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT if VkPhysicalDeviceLimits::strictLines is VK_TRUE"
+    // "VK_LINE_RASTERIZATION_MODE_DEFAULT_HKR is equivalent to
+    // VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR if VkPhysicalDeviceLimits::strictLines is VK_TRUE"
     if(m_pDriver->GetDeviceProps().limits.strictLines)
       ret.rasterizer.lineRasterMode = LineRaster::Rectangular;
 
     switch(state.lineRasterMode)
     {
-      case VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT:
+      case VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR:
         ret.rasterizer.lineRasterMode = LineRaster::Rectangular;
         break;
-      case VK_LINE_RASTERIZATION_MODE_BRESENHAM_EXT:
+      case VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR:
         ret.rasterizer.lineRasterMode = LineRaster::Bresenham;
         break;
-      case VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_EXT:
+      case VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_KHR:
         ret.rasterizer.lineRasterMode = LineRaster::RectangularSmooth;
         break;
       default: break;
@@ -2121,6 +2121,9 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
                 dstel.type = BindType::InputAttachment;
                 break;
               case DescriptorSlotType::InlineBlock: dstel.type = BindType::ConstantBuffer; break;
+              case DescriptorSlotType::AccelerationStructure:
+                dstel.type = BindType::ReadWriteBuffer;
+                break;
               case DescriptorSlotType::Unwritten:
               case DescriptorSlotType::Count: dstel.type = BindType::Unknown; break;
             }
@@ -2272,7 +2275,8 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
             else if(descriptorType == DescriptorSlotType::StorageBuffer ||
                     descriptorType == DescriptorSlotType::StorageBufferDynamic ||
                     descriptorType == DescriptorSlotType::UniformBuffer ||
-                    descriptorType == DescriptorSlotType::UniformBufferDynamic)
+                    descriptorType == DescriptorSlotType::UniformBufferDynamic ||
+                    descriptorType == DescriptorSlotType::AccelerationStructure)
             {
               destSlots.binds[a].viewResourceId = ResourceId();
 
@@ -4383,6 +4387,7 @@ rdcarray<ShaderSourcePrefix> VulkanReplay::GetCustomShaderSourcePrefixes()
   // right binding and helper definitions
   return {
       {ShaderEncoding::HLSL, HLSL_CUSTOM_PREFIX},
+      {ShaderEncoding::Slang, HLSL_CUSTOM_PREFIX},
   };
 }
 

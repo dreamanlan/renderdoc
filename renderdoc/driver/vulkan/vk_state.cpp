@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -84,7 +84,7 @@ void setupRenderingInfo(const VulkanRenderState::DynamicRendering &dynamicRender
     if(!att)
       continue;
 
-    if(att->loadOp != VK_ATTACHMENT_LOAD_OP_NONE_EXT)
+    if(att->loadOp != VK_ATTACHMENT_LOAD_OP_NONE_KHR)
       att->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
 
     if(att->storeOp != VK_ATTACHMENT_STORE_OP_NONE)
@@ -298,8 +298,6 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
 
   if(binding == BindGraphics || binding == BindInitial)
   {
-    bool dynamicStates[VkDynamicCount] = {};
-
     if(graphics.pipeline != ResourceId())
     {
       VkPipeline pipe = vk->GetResourceManager()->GetCurrentHandle<VkPipeline>(graphics.pipeline);
@@ -324,24 +322,12 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
         ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(layout), pushRanges[i].stageFlags,
                                        pushRanges[i].offset, pushRanges[i].size,
                                        pushconsts + pushRanges[i].offset);
-
-      for(size_t i = 0; i < VkDynamicCount; i++)
-        dynamicStates[i] = pipeinfo.dynamicStates[i];
     }
     else if(binding == BindInitial)
     {
       if(vk->GetDriverInfo().NVStaticPipelineRebindStates())
         ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
                                       Unwrap(vk->GetDebugManager()->GetDummyPipeline()));
-
-      // if we're setting up a partial command buffer, bind all dynamic state we have. This will
-      // then get overridden, but we need it in case a pipeline expects to inherit some dynamic
-      // state from earlier in the command buffer but there's no pipeline bound yet.
-      for(size_t i = 0; i < VkDynamicCount; i++)
-        dynamicStates[i] = true;
-
-      if(vk->GetDriverInfo().QualcommLineWidthDynamicStateCrash())
-        dynamicStates[VkDynamicLineWidth] = false;
 
       if(pushLayout != ResourceId())
       {
@@ -533,7 +519,7 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
         ObjDisp(cmd)->CmdSetTessellationDomainOriginEXT(Unwrap(cmd), domainOrigin);
     }
 
-    if(dynamicStates[VkDynamicLineWidth])
+    if(dynamicStates[VkDynamicLineWidth] && !vk->GetDriverInfo().QualcommLineWidthDynamicStateCrash())
       ObjDisp(cmd)->CmdSetLineWidth(Unwrap(cmd), lineWidth);
 
     if(dynamicStates[VkDynamicDepthBias])
@@ -577,7 +563,7 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
       ObjDisp(cmd)->CmdSetDiscardRectangleEXT(Unwrap(cmd), 0, (uint32_t)discardRectangles.size(),
                                               &discardRectangles[0]);
 
-    if(stippleFactor && dynamicStates[VkDynamicLineStippleEXT])
+    if(stippleFactor && dynamicStates[VkDynamicLineStippleKHR])
       ObjDisp(cmd)->CmdSetLineStippleEXT(Unwrap(cmd), stippleFactor, stipplePattern);
 
     if(vk->FragmentShadingRate())
@@ -604,7 +590,7 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
       if(ibuffer.bytewidth == 4)
         type = VK_INDEX_TYPE_UINT32;
       else if(ibuffer.bytewidth == 1)
-        type = VK_INDEX_TYPE_UINT8_EXT;
+        type = VK_INDEX_TYPE_UINT8_KHR;
 
       ObjDisp(cmd)->CmdBindIndexBuffer(
           Unwrap(cmd), Unwrap(vk->GetResourceManager()->GetCurrentHandle<VkBuffer>(ibuffer.buf)),
@@ -876,9 +862,9 @@ void VulkanRenderState::BindDescriptorSetsWithoutPipeline(WrappedVulkan *vk, VkC
               break;
 
             const DescSetLayout &iDescLayout =
-                vk->GetDebugManager()->GetDescSetLayout(iPipeLayout.descSetLayouts[i]);
+                vk->GetDebugManager()->GetDescSetLayout(iPipeLayout.descSetLayouts[j]);
             const DescSetLayout &refDescLayout =
-                vk->GetDebugManager()->GetDescSetLayout(refPipeLayout.descSetLayouts[i]);
+                vk->GetDebugManager()->GetDescSetLayout(refPipeLayout.descSetLayouts[j]);
 
             if(iPipeLayout.descSetLayouts[j] != refPipeLayout.descSetLayouts[j] &&
                !iDescLayout.isCompatible(refDescLayout))
@@ -1105,6 +1091,11 @@ void VulkanRenderState::BindDescriptorSet(WrappedVulkan *vk, const DescSetLayout
     for(VkWriteDescriptorSetInlineUniformBlock *a : allocInlineWrites)
       delete a;
   }
+}
+
+void VulkanRenderState::SetDynamicStatesFromPipeline(WrappedVulkan *vk)
+{
+  dynamicStates = vk->GetDebugManager()->GetPipelineInfo(graphics.pipeline).dynamicStates;
 }
 
 void VulkanRenderState::SetFramebuffer(WrappedVulkan *vk, ResourceId fb,

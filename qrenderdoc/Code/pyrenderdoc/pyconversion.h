@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <map>
 #include <type_traits>
+
+#include "3rdparty/pythoncapi_compat.h"
 
 // struct to allow partial specialisation for enums
 template <typename T, bool isEnum = std::is_enum<T>::value>
@@ -79,17 +81,12 @@ struct TypeConversion<PyObject *, false>
 {
   static int ConvertFromPy(PyObject *in, PyObject *&out)
   {
-    out = in;
-    Py_XINCREF(out);
+    out = Py_XNewRef(in);
 
     return 0;
   }
 
-  static PyObject *ConvertToPy(PyObject *in)
-  {
-    Py_XINCREF(in);
-    return in;
-  }
+  static PyObject *ConvertToPy(PyObject *in) { return Py_XNewRef(in); }
 };
 
 // specialisations for pointer types (opaque handles to be moved not copied)
@@ -143,7 +140,7 @@ struct TypeConversion<bool, false>
     if(!PyBool_Check(in))
       return SWIG_TypeError;
 
-    if(in == Py_True)
+    if(Py_IsTrue(in))
       out = true;
     else
       out = false;

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -191,6 +191,8 @@ private:
 
   static rdcstr GetChunkName(uint32_t idx);
   D3D12ResourceManager *GetResourceManager() { return m_pDevice->GetResourceManager(); }
+
+  rdcarray<std::function<bool()>> m_accStructPostBuildQueueFunc;
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12GraphicsCommandList);
 
@@ -236,6 +238,24 @@ public:
                         bool fakeCreationReset);
 
   bool ValidateRootGPUVA(D3D12_GPU_VIRTUAL_ADDRESS buffer);
+
+  void EnqueueAccStructPostBuild(const std::function<bool()> &postBldExec)
+  {
+    m_accStructPostBuildQueueFunc.push_back(postBldExec);
+  }
+
+  bool ExecuteAccStructPostBuilds()
+  {
+    bool success = true;
+
+    for(std::function<bool()> &func : m_accStructPostBuildQueueFunc)
+    {
+      success &= func();
+    }
+
+    m_accStructPostBuildQueueFunc.clear();
+    return success;
+  }
 
   //////////////////////////////
   // implement IUnknown
@@ -547,6 +567,10 @@ public:
                                 _In_reads_bytes_opt_(ExecutionParametersDataSizeInBytes)
                                     const void *pExecutionParametersData,
                                 _In_ SIZE_T ExecutionParametersDataSizeInBytes);
+
+  bool PatchAccStructBlasAddress(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *accStructInput,
+                                 ID3D12GraphicsCommandList4 *dxrCmd,
+                                 BakedCmdListInfo::PatchRaytracing *patchRaytracing);
 
   IMPLEMENT_FUNCTION_SERIALISED(
       virtual void STDMETHODCALLTYPE, BuildRaytracingAccelerationStructure,

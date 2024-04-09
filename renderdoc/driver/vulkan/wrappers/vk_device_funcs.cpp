@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -553,8 +553,7 @@ RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion
 }
 
 VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
-                                         const VkAllocationCallbacks *pAllocator,
-                                         VkInstance *pInstance)
+                                         const VkAllocationCallbacks *, VkInstance *pInstance)
 {
   RDCASSERT(pCreateInfo);
 
@@ -809,7 +808,7 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
   // if we forced on API validation, it's also available
   m_LayersEnabled[VkCheckLayer_unique_objects] |= RenderDoc::Inst().GetCaptureOptions().apiValidation;
 
-  VkResult ret = createFunc(&modifiedCreateInfo, pAllocator, pInstance);
+  VkResult ret = createFunc(&modifiedCreateInfo, NULL, pInstance);
 
   m_Instance = *pInstance;
 
@@ -1072,7 +1071,7 @@ void WrappedVulkan::Shutdown()
     vit->DestroyInstance(inst, NULL);
 }
 
-void WrappedVulkan::vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator)
+void WrappedVulkan::vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *)
 {
   if(instance == VK_NULL_HANDLE)
     return;
@@ -1974,7 +1973,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         // We don't care about sparse binding - it's just treated as a requirement.
         enum class SearchType
         {
-          Failed,
+          Other,
           Universal,
           GraphicsTransfer,
           ComputeTransfer,
@@ -2000,16 +1999,15 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
             break;
           case VK_QUEUE_TRANSFER_BIT: search = SearchType::TransferOnly; break;
           default:
-            search = SearchType::Failed;
-            RDCERR("Unexpected set of flags: %s",
-                   ToStr(VkQueueFlagBits(origprops[origQIndex].queueFlags & mask)).c_str());
+            search = SearchType::Other;
+            // video queue, NV optical flow, some type of queue we don't handle
             break;
         }
 
         bool needSparse = (origprops[origQIndex].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;
         VkExtent3D needGranularity = origprops[origQIndex].minImageTransferGranularity;
 
-        while(search != SearchType::Failed)
+        while(search != SearchType::Other)
         {
           bool found = false;
 
@@ -2027,7 +2025,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
             switch(search)
             {
-              case SearchType::Failed: break;
+              case SearchType::Other: break;
               case SearchType::Universal:
                 if((queueProps[replayQIndex].queueFlags & mask) ==
                    (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))
@@ -2081,8 +2079,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
           // no such queue family found, fall back to the next type of queue to search for
           switch(search)
           {
-            case SearchType::Failed: break;
-            case SearchType::Universal: search = SearchType::Failed; break;
+            case SearchType::Other: break;
+            case SearchType::Universal: search = SearchType::Other; break;
             case SearchType::GraphicsTransfer:
             case SearchType::ComputeTransfer:
             case SearchType::GraphicsOrComputeTransfer:
@@ -2558,8 +2556,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
-      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT,
-                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT);
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR);
       {
         CHECK_PHYS_EXT_FEATURE(vertexAttributeInstanceRateDivisor);
         CHECK_PHYS_EXT_FEATURE(vertexAttributeInstanceRateZeroDivisor);
@@ -2750,8 +2748,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
-      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceIndexTypeUint8FeaturesEXT,
-                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT);
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceIndexTypeUint8FeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR);
       {
         CHECK_PHYS_EXT_FEATURE(indexTypeUint8);
       }
@@ -3272,6 +3270,46 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
           ext->meshShaderQueries = true;
         else
           RDCWARN("meshShaderQueries = false, mesh shader performance counters unavailable");
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceAccelerationStructureFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(accelerationStructure)
+        CHECK_PHYS_EXT_FEATURE(accelerationStructureCaptureReplay)
+        CHECK_PHYS_EXT_FEATURE(accelerationStructureIndirectBuild)
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingAccelerationStructureUpdateAfterBind)
+
+        if(ext->accelerationStructure && !avail.accelerationStructureCaptureReplay)
+        {
+          SET_ERROR_RESULT(
+              m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+              "Capture requires accelerationStructure support, which is available, but "
+              "accelerationStructureCaptureReplay support is not available which is required to "
+              "replay\n"
+              "\n%s",
+              GetPhysDeviceCompatString(false, false).c_str());
+          return false;
+        }
+
+        m_AccelerationStructures = ext->accelerationStructure != VK_FALSE;
+        if(m_AccelerationStructures)
+        {
+          RDCLOG(
+              "Ray tracing acceleration structures requested, allocating all device memory with "
+              "VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT");
+          ext->accelerationStructureCaptureReplay = VK_TRUE;
+        }
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceNestedCommandBufferFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(nestedCommandBuffer);
+        CHECK_PHYS_EXT_FEATURE(nestedCommandBufferRendering);
+        CHECK_PHYS_EXT_FEATURE(nestedCommandBufferSimultaneousUse);
       }
       END_PHYS_EXT_CHECK();
     }
@@ -4050,6 +4088,22 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     for(size_t i = 0; i < queueProps.size(); i++)
       m_PhysicalDeviceData.queueProps[i] = queueProps[i];
 
+    if(RDCMIN(m_EnabledExtensions.vulkanVersion, physProps.apiVersion) >= VK_MAKE_VERSION(1, 1, 0))
+    {
+      VkPhysicalDeviceVulkan11Properties vulkan11Props = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
+      };
+
+      VkPhysicalDeviceProperties2 devProps2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+      devProps2.pNext = &vulkan11Props;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), &devProps2);
+      m_PhysicalDeviceData.maxMemoryAllocationSize = vulkan11Props.maxMemoryAllocationSize;
+    }
+    else
+    {
+      m_PhysicalDeviceData.maxMemoryAllocationSize = 0x80000000U;
+    }
+
     ChooseMemoryIndices();
 
     APIProps.vendor = GetDriverInfo().Vendor();
@@ -4073,7 +4127,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
 VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
                                        const VkDeviceCreateInfo *pCreateInfo,
-                                       const VkAllocationCallbacks *pAllocator, VkDevice *pDevice)
+                                       const VkAllocationCallbacks *, VkDevice *pDevice)
 {
   VkDeviceCreateInfo createInfo = *pCreateInfo;
 
@@ -4303,8 +4357,20 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
   if(separateDepthStencilFeatures)
     m_SeparateDepthStencil |= (separateDepthStencilFeatures->separateDepthStencilLayouts != VK_FALSE);
 
+  // we need to enable acceleration structure capture/replay. We verified that this is OK before
+  // whitelisting the extension
+
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR *accFeatures =
+      (VkPhysicalDeviceAccelerationStructureFeaturesKHR *)FindNextStruct(
+          &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
+  if(accFeatures && accFeatures->accelerationStructure)
+  {
+    accFeatures->accelerationStructureCaptureReplay = VK_TRUE;
+    m_AccelerationStructures = true;
+  }
+
   VkResult ret;
-  SERIALISE_TIME_CALL(ret = createFunc(Unwrap(physicalDevice), &createInfo, pAllocator, pDevice));
+  SERIALISE_TIME_CALL(ret = createFunc(Unwrap(physicalDevice), &createInfo, NULL, pDevice));
 
   if(ret == VK_SUCCESS)
   {
@@ -4514,6 +4580,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
       RDCLOG("Forcing 200MB soft memory limit");
     }
 
+    m_PhysicalDeviceData.maxMemoryAllocationSize = 0;
     ChooseMemoryIndices();
 
     m_PhysicalDeviceData.queueCount = (uint32_t)queueProps.size();
@@ -4532,7 +4599,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
   return ret;
 }
 
-void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
+void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *)
 {
   if(device == VK_NULL_HANDLE)
     return;
@@ -4629,7 +4696,7 @@ void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
   // should be deleted by now.
   // If there were any leaks, we will leak them ourselves in vkDestroyInstance
   // rather than try to delete API objects after the device has gone
-  ObjDisp(m_Device)->DestroyDevice(Unwrap(m_Device), pAllocator);
+  ObjDisp(m_Device)->DestroyDevice(Unwrap(m_Device), NULL);
   GetResourceManager()->ReleaseWrappedResource(m_Device);
   m_Device = VK_NULL_HANDLE;
   m_PhysicalDevice = VK_NULL_HANDLE;
@@ -4673,6 +4740,6 @@ INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkEnumeratePhysicalDevices, VkInstance
 
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkCreateDevice, VkPhysicalDevice physicalDevice,
                                 const VkDeviceCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkDevice *pDevice);
+                                const VkAllocationCallbacks *, VkDevice *pDevice);
 
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkDeviceWaitIdle, VkDevice device);

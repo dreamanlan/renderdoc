@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -68,10 +68,10 @@ struct QueueReadbackData
   byte *readbackMapped = NULL;
   uint64_t readbackSize = 0;
 
-  static const uint32_t NumCommandTypes = 7;
-
-  ID3D12GraphicsCommandList *lists[NumCommandTypes] = {};
-  ID3D12CommandAllocator *allocs[NumCommandTypes] = {};
+  ID3D12CommandQueue *unwrappedQueue = NULL;
+  ID3D12GraphicsCommandList *list = NULL;
+  ID3D12CommandAllocator *alloc = NULL;
+  ID3D12Fence *fence = NULL;
 
   void Resize(uint64_t size);
 
@@ -848,6 +848,15 @@ public:
   WriteSerialiser &GetThreadSerialiser();
 
   ID3D12Device *GetReal() { return m_pDevice; }
+  ID3D12Device1 *GetReal1() const { return m_pDevice1; }
+  ID3D12Device2 *GetReal2() const { return m_pDevice2; }
+  ID3D12Device3 *GetReal3() const { return m_pDevice3; }
+  ID3D12Device4 *GetReal4() const { return m_pDevice4; }
+  ID3D12Device5 *GetReal5() const { return m_pDevice5; }
+  ID3D12Device6 *GetReal6() const { return m_pDevice6; }
+  ID3D12Device7 *GetReal7() const { return m_pDevice7; }
+  ID3D12Device8 *GetReal8() const { return m_pDevice8; }
+  ID3D12Device9 *GetReal9() const { return m_pDevice9; }
   static rdcstr GetChunkName(uint32_t idx);
   D3D12ResourceManager *GetResourceManager() { return m_ResourceManager; }
   D3D12ShaderCache *GetShaderCache() { return m_ShaderCache; }
@@ -1004,6 +1013,7 @@ public:
 
   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
   void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType);
+  void ReplayDraw(ID3D12GraphicsCommandListX *cmd, const ActionDescription &action);
 
   void SetStructuredExport(uint64_t sectionVersion)
   {
@@ -1222,6 +1232,12 @@ public:
     SCOPED_LOCK(m_SparseLock);
     m_SparseHeaps.insert(heap);
   }
+
+  void UploadBLASBufferAddresses();
+  ID3D12Resource *GetBLASAddressBufferResource() const { return m_blasAddressBufferResource; }
+  ID3D12Resource *m_blasAddressBufferResource = NULL;
+  ID3D12Resource *m_blasAddressBufferUploadResource = NULL;
+  bool m_addressBufferUploaded = false;
 
   void ReleaseResource(ID3D12DeviceChild *pResource);
 
@@ -1624,10 +1640,10 @@ public:
 
   //////////////////////////////
   // implement ID3D12Device7
-  virtual HRESULT STDMETHODCALLTYPE AddToStateObject(const D3D12_STATE_OBJECT_DESC *pAddition,
-                                                     ID3D12StateObject *pStateObjectToGrowFrom,
-                                                     REFIID riid,
-                                                     _COM_Outptr_ void **ppNewStateObject);
+  IMPLEMENT_FUNCTION_THREAD_SERIALISED(virtual HRESULT STDMETHODCALLTYPE, AddToStateObject,
+                                       const D3D12_STATE_OBJECT_DESC *pAddition,
+                                       ID3D12StateObject *pStateObjectToGrowFrom, REFIID riid,
+                                       _COM_Outptr_ void **ppNewStateObject);
 
   virtual HRESULT STDMETHODCALLTYPE
   CreateProtectedResourceSession1(_In_ const D3D12_PROTECTED_RESOURCE_SESSION_DESC1 *pDesc,

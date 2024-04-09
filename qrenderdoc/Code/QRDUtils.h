@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -35,6 +35,7 @@
 #include <QSharedPointer>
 #include <QSortFilterProxyModel>
 #include <QStyledItemDelegate>
+#include <QToolButton>
 #include "Code/Interface/QRDInterface.h"
 
 #if !defined(RELEASE) && !defined(__FreeBSD__)
@@ -988,3 +989,20 @@ void *AccessWaylandPlatformInterface(const QByteArray &resource, QWindow *window
 
 void UpdateVisibleColumns(rdcstr windowTitle, int columnCount, QHeaderView *header,
                           const QStringList &headers);
+
+// A version of QToolButton that can also handle right clicks
+class QRClickToolButton : public QToolButton
+{
+  Q_OBJECT
+
+public:
+  explicit QRClickToolButton(QWidget *parent = 0);
+
+private slots:
+  void mousePressEvent(QMouseEvent *e);
+
+signals:
+  void rightClicked();
+
+public slots:
+};

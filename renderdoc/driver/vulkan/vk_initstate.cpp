@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -571,6 +571,26 @@ bool WrappedVulkan::Prepare_InitialState(WrappedVkRes *res)
 
     return true;
   }
+  else if(type == eResAccelerationStructureKHR)
+  {
+    VulkanAccelerationStructureManager::ASMemory result;
+    VkAccelerationStructureKHR as = ToUnwrappedHandle<VkAccelerationStructureKHR>(res);
+    if(!GetAccelerationStructureManager()->Prepare(as, m_QueueFamilyIndices, result))
+    {
+      SET_ERROR_RESULT(m_LastCaptureError, ResultCode::OutOfMemory,
+                       "Couldn't allocate readback memory");
+      m_CaptureFailure = true;
+      return false;
+    }
+
+    VkInitialContents ic = VkInitialContents(type, result.alloc);
+    ic.isTLAS = result.isTLAS;
+
+    GetResourceManager()->SetInitialContents(id, ic);
+    m_PreparedNotSerialisedInitStates.push_back(id);
+
+    return true;
+  }
   else
   {
     RDCERR("Unhandled resource type %d", type);
@@ -608,7 +628,8 @@ uint64_t WrappedVulkan::GetSize_InitialState(ResourceId id, const VkInitialConte
     // buffers only have initial states when they're sparse
     return ret;
   }
-  else if(initial.type == eResImage || initial.type == eResDeviceMemory)
+  else if(initial.type == eResImage || initial.type == eResDeviceMemory ||
+          initial.type == eResAccelerationStructureKHR)
   {
     // the size primarily comes from the buffer, the size of which we conveniently have stored.
     return ret + uint64_t(128 + initial.mem.size + WriteSerialiser::GetChunkAlignment());
@@ -626,6 +647,7 @@ static rdcliteral NameOfType(VkResourceType type)
     case eResDeviceMemory: return "VkDeviceMemory"_lit;
     case eResBuffer: return "VkBuffer"_lit;
     case eResImage: return "VkImage"_lit;
+    case eResAccelerationStructureKHR: return "VkAccelerationStructureKHR"_lit;
     default: break;
   }
   return "VkResource"_lit;
@@ -1636,6 +1658,10 @@ bool WrappedVulkan::Serialise_InitialState(SerialiserType &ser, ResourceId id, V
       }
     }
   }
+  else if(type == eResAccelerationStructureKHR)
+  {
+    ret = GetAccelerationStructureManager()->Serialise(ser, id, initial, m_State);
+  }
   else
   {
     RDCERR("Unhandled resource type %s", ToStr(type).c_str());
@@ -1693,7 +1719,7 @@ void WrappedVulkan::Create_InitialState(ResourceId id, WrappedVkRes *live, bool)
 
     GetResourceManager()->SetInitialContents(id, VkInitialContents(type, tag));
   }
-  else if(type == eResDeviceMemory || type == eResBuffer)
+  else if(type == eResDeviceMemory || type == eResBuffer || type == eResAccelerationStructureKHR)
   {
     // ignore, it was probably dirty but not referenced in the frame
   }
@@ -2310,6 +2336,10 @@ void WrappedVulkan::Apply_InitialState(WrappedVkRes *live, const VkInitialConten
       SubmitCmds();
       FlushQ();
     }
+  }
+  else if(type == eResAccelerationStructureKHR)
+  {
+    GetAccelerationStructureManager()->Apply(id, initial);
   }
   else
   {

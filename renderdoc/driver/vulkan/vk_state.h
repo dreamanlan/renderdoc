@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -71,7 +71,13 @@ struct VulkanRenderState
 
   void EndConditionalRendering(VkCommandBuffer cmd);
 
-  // dynamic state
+  // dynamic state - this mask tracks which dynamic states have been set, since we can't rely on the
+  // bound pipeline to know which ones to re-bind if we're reapplying state. It's possible to bind
+  // a static pipeline then set some dynamic state. If we want to push and pop state at that point
+  // (say for a discard pattern) we need to restore the dynamic state even if it's "invalid" for the
+  // pipeline, as the application presumably then binds a dynamic pipeline afterwards before drawing
+  rdcfixedarray<bool, VkDynamicCount> dynamicStates = {};
+
   rdcarray<VkViewport> views;
   rdcarray<VkRect2D> scissors;
   float lineWidth = 1.0f;
@@ -119,6 +125,11 @@ struct VulkanRenderState
 
   uint32_t subpass = 0;
   VkSubpassContents subpassContents;
+
+  // helper function - if the pipeline has been changed, this forces all dynamic state to be bound
+  // that the pipeline needs (and no other dynamic state). Helpful if the state is mutated just
+  // before a draw, before replaying that draw
+  void SetDynamicStatesFromPipeline(WrappedVulkan *m_pDriver);
 
   // framebuffer accessors - to allow for imageless framebuffers and prevent accidentally changing
   // only the framebuffer without updating the attachments
@@ -224,7 +235,7 @@ struct VulkanRenderState
   VkBool32 depthClipEnable = VK_FALSE;
   VkBool32 negativeOneToOne = VK_FALSE;
   float primOverestimationSize = 0.0f;
-  VkLineRasterizationModeEXT lineRasterMode = VK_LINE_RASTERIZATION_MODE_DEFAULT_EXT;
+  VkLineRasterizationModeKHR lineRasterMode = VK_LINE_RASTERIZATION_MODE_DEFAULT_KHR;
   VkBool32 stippledLineEnable = VK_FALSE;
   VkBool32 logicOpEnable = VK_FALSE;
   VkPolygonMode polygonMode = VK_POLYGON_MODE_FILL;

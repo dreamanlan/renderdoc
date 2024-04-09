@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -725,11 +725,11 @@ bool WrappedOpenGL::Serialise_glTextureView(SerialiserType &ser, GLuint textureH
     m_Textures[liveTexId].curType = TextureTarget(target);
     m_Textures[liveTexId].internalFormat = internalformat;
     m_Textures[liveTexId].view = true;
-    m_Textures[liveTexId].width = m_Textures[liveOrigId].width;
-    m_Textures[liveTexId].height = m_Textures[liveOrigId].height;
+    m_Textures[liveTexId].width = RDCMAX(1, m_Textures[liveOrigId].width >> minlevel);
+    m_Textures[liveTexId].height = RDCMAX(1, m_Textures[liveOrigId].height >> minlevel);
     m_Textures[liveTexId].depth = numlayers;
     if(target == eGL_TEXTURE_3D)
-      m_Textures[liveTexId].depth = m_Textures[liveOrigId].depth;
+      m_Textures[liveTexId].depth = RDCMAX(1, m_Textures[liveOrigId].depth >> minlevel);
     m_Textures[liveTexId].mipsValid = (1 << numlevels) - 1;
     m_Textures[liveTexId].emulated = emulated;
 

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -124,6 +124,7 @@ RWTexture2D<float> unbounduav2 : register(u5);
 
 SamplerState linearclamp : register(s0);
 SamplerState linearwrap : register(s1);
+SamplerState unboundsamp : register(s2);
 
 float4 main(v2f IN) : SV_Target0
 {
@@ -739,6 +740,16 @@ float4 main(v2f IN) : SV_Target0
   {
     float2 uv = posone * float2(1.81f, 0.48f);
     return smileyuint.Load(int3(uv*16,0));
+  }
+  if(IN.tri == 91)
+  {
+    float2 uv = posone * float2(0.55f, 0.48f);
+    return smiley.Sample(unboundsamp, uv);
+  }
+  if(IN.tri == 92)
+  {
+    float2 uv = posone * float2(0.55f, 0.48f);
+    return smiley.SampleBias(unboundsamp, uv, 0.5f);
   }
 
   return float4(0.4f, 0.4f, 0.4f, 0.4f);

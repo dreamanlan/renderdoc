@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -852,6 +852,17 @@ void WrappedVulkan::vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice
   }
 
 #undef DISABLE_EDS3_FEATURE
+
+  // we don't want to report support for acceleration structure host commands
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR *accStruct =
+      (VkPhysicalDeviceAccelerationStructureFeaturesKHR *)FindNextStruct(
+          pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
+
+  if(accStruct && accStruct->accelerationStructureHostCommands)
+  {
+    RDCWARN("Disabling support for acceleration structure host commands");
+    accStruct->accelerationStructureHostCommands = VK_FALSE;
+  }
 }
 
 void WrappedVulkan::vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
@@ -912,35 +923,41 @@ VkResult WrappedVulkan::vkEnumeratePhysicalDeviceGroups(
     VkInstance instance, uint32_t *pPhysicalDeviceGroupCount,
     VkPhysicalDeviceGroupProperties *pPhysicalDeviceGroupProperties)
 {
-  // we ignore the 'real' physical device groups, and report one group per physical device. We use
-  // our internal enumerate function to make sure we handle wrapping the objects.
-  uint32_t numPhys = 0;
-  vkEnumeratePhysicalDevices(instance, &numPhys, NULL);
+  // We ignore the 'real' physical device groups, and report one group per physical device.
+  // We use our internal enumerate function to make sure we handle wrapping the objects.
+  RDCASSERT(pPhysicalDeviceGroupCount);
 
-  VkPhysicalDevice *phys = new VkPhysicalDevice[numPhys];
-  vkEnumeratePhysicalDevices(instance, &numPhys, phys);
+  // Total number of available physical device groups.
+  uint32_t physicalDevicesNumber = 0;
+  vkEnumeratePhysicalDevices(instance, &physicalDevicesNumber, NULL);
 
-  uint32_t outputSpace = pPhysicalDeviceGroupCount ? *pPhysicalDeviceGroupCount : 0;
-
-  if(pPhysicalDeviceGroupCount)
-    *pPhysicalDeviceGroupCount = numPhys;
-
-  if(pPhysicalDeviceGroupProperties)
+  // vkEnumeratePhysicalDeviceGroups - Return number of available physical device groups.
+  if(pPhysicalDeviceGroupProperties == NULL)
   {
-    // list one group per device
-    for(uint32_t i = 0; i < outputSpace; i++)
-    {
-      RDCEraseEl(pPhysicalDeviceGroupProperties[i]);
-      pPhysicalDeviceGroupProperties[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
-      pPhysicalDeviceGroupProperties[i].physicalDeviceCount = 1;
-      pPhysicalDeviceGroupProperties[i].physicalDevices[0] = phys[i];
-      pPhysicalDeviceGroupProperties[i].subsetAllocation = VK_FALSE;
-    }
+    *pPhysicalDeviceGroupCount = physicalDevicesNumber;
+    return VK_SUCCESS;
   }
 
-  delete[] phys;
+  // vkEnumeratePhysicalDeviceGroups - Query properties of available physical device groups.
 
-  if(pPhysicalDeviceGroupProperties && outputSpace < numPhys)
+  // Number of physical device groups to query.
+  *pPhysicalDeviceGroupCount = RDCMIN(*pPhysicalDeviceGroupCount, physicalDevicesNumber);
+
+  rdcarray<VkPhysicalDevice> physicalDevices;
+  physicalDevices.resize(*pPhysicalDeviceGroupCount);
+  vkEnumeratePhysicalDevices(instance, pPhysicalDeviceGroupCount, physicalDevices.data());
+
+  // List one group per device.
+  for(uint32_t i = 0; i < *pPhysicalDeviceGroupCount; i++)
+  {
+    RDCEraseEl(pPhysicalDeviceGroupProperties[i]);
+    pPhysicalDeviceGroupProperties[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GROUP_PROPERTIES;
+    pPhysicalDeviceGroupProperties[i].physicalDeviceCount = 1;
+    pPhysicalDeviceGroupProperties[i].physicalDevices[0] = physicalDevices[i];
+    pPhysicalDeviceGroupProperties[i].subsetAllocation = VK_FALSE;
+  }
+
+  if(*pPhysicalDeviceGroupCount < physicalDevicesNumber)
     return VK_INCOMPLETE;
 
   return VK_SUCCESS;
@@ -957,17 +974,17 @@ void WrappedVulkan::vkGetDeviceGroupPeerMemoryFeatures(VkDevice device, uint32_t
 
 VkResult WrappedVulkan::vkCreateValidationCacheEXT(VkDevice device,
                                                    const VkValidationCacheCreateInfoEXT *pCreateInfo,
-                                                   const VkAllocationCallbacks *pAllocator,
+                                                   const VkAllocationCallbacks *,
                                                    VkValidationCacheEXT *pValidationCache)
 {
-  return ObjDisp(device)->CreateValidationCacheEXT(Unwrap(device), pCreateInfo, pAllocator,
+  return ObjDisp(device)->CreateValidationCacheEXT(Unwrap(device), pCreateInfo, NULL,
                                                    pValidationCache);
 }
 
 void WrappedVulkan::vkDestroyValidationCacheEXT(VkDevice device, VkValidationCacheEXT validationCache,
-                                                const VkAllocationCallbacks *pAllocator)
+                                                const VkAllocationCallbacks *)
 {
-  return ObjDisp(device)->DestroyValidationCacheEXT(Unwrap(device), validationCache, pAllocator);
+  return ObjDisp(device)->DestroyValidationCacheEXT(Unwrap(device), validationCache, NULL);
 }
 
 VkResult WrappedVulkan::vkMergeValidationCachesEXT(VkDevice device, VkValidationCacheEXT dstCache,
@@ -995,7 +1012,7 @@ void WrappedVulkan::vkGetPhysicalDeviceMultisamplePropertiesEXT(
 }
 
 VkResult WrappedVulkan::vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(
-    VkPhysicalDevice physicalDevice, uint32_t *pTimeDomainCount, VkTimeDomainEXT *pTimeDomains)
+    VkPhysicalDevice physicalDevice, uint32_t *pTimeDomainCount, VkTimeDomainKHR *pTimeDomains)
 {
   return ObjDisp(physicalDevice)
       ->GetPhysicalDeviceCalibrateableTimeDomainsEXT(Unwrap(physicalDevice), pTimeDomainCount,
@@ -1003,10 +1020,26 @@ VkResult WrappedVulkan::vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(
 }
 
 VkResult WrappedVulkan::vkGetCalibratedTimestampsEXT(VkDevice device, uint32_t timestampCount,
-                                                     const VkCalibratedTimestampInfoEXT *pTimestampInfos,
+                                                     const VkCalibratedTimestampInfoKHR *pTimestampInfos,
                                                      uint64_t *pTimestamps, uint64_t *pMaxDeviation)
 {
   return ObjDisp(device)->GetCalibratedTimestampsEXT(Unwrap(device), timestampCount,
+                                                     pTimestampInfos, pTimestamps, pMaxDeviation);
+}
+
+VkResult WrappedVulkan::vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(
+    VkPhysicalDevice physicalDevice, uint32_t *pTimeDomainCount, VkTimeDomainKHR *pTimeDomains)
+{
+  return ObjDisp(physicalDevice)
+      ->GetPhysicalDeviceCalibrateableTimeDomainsKHR(Unwrap(physicalDevice), pTimeDomainCount,
+                                                     pTimeDomains);
+}
+
+VkResult WrappedVulkan::vkGetCalibratedTimestampsKHR(VkDevice device, uint32_t timestampCount,
+                                                     const VkCalibratedTimestampInfoKHR *pTimestampInfos,
+                                                     uint64_t *pTimestamps, uint64_t *pMaxDeviation)
+{
+  return ObjDisp(device)->GetCalibratedTimestampsKHR(Unwrap(device), timestampCount,
                                                      pTimestampInfos, pTimestamps, pMaxDeviation);
 }
 
@@ -1154,4 +1187,44 @@ VkResult WrappedVulkan::vkGetPhysicalDeviceFragmentShadingRatesKHR(
   return ObjDisp(physicalDevice)
       ->GetPhysicalDeviceFragmentShadingRatesKHR(Unwrap(physicalDevice), pFragmentShadingRateCount,
                                                  pFragmentShadingRates);
+}
+
+uint32_t WrappedVulkan::vkGetDeferredOperationMaxConcurrencyKHR(VkDevice device,
+                                                                VkDeferredOperationKHR operation)
+{
+  return ObjDisp(device)->GetDeferredOperationMaxConcurrencyKHR(Unwrap(device), operation);
+}
+
+VkResult WrappedVulkan::vkGetDeferredOperationResultKHR(VkDevice device,
+                                                        VkDeferredOperationKHR operation)
+{
+  return ObjDisp(device)->GetDeferredOperationResultKHR(Unwrap(device), operation);
+}
+
+void WrappedVulkan::vkGetAccelerationStructureBuildSizesKHR(
+    VkDevice device, VkAccelerationStructureBuildTypeKHR buildType,
+    const VkAccelerationStructureBuildGeometryInfoKHR *pBuildInfo,
+    const uint32_t *pMaxPrimitiveCounts, VkAccelerationStructureBuildSizesInfoKHR *pSizeInfo)
+{
+  VkAccelerationStructureBuildGeometryInfoKHR unwrapped = *pBuildInfo;
+  unwrapped.srcAccelerationStructure = Unwrap(unwrapped.srcAccelerationStructure);
+  unwrapped.dstAccelerationStructure = Unwrap(unwrapped.dstAccelerationStructure);
+
+  ObjDisp(device)->GetAccelerationStructureBuildSizesKHR(Unwrap(device), buildType, pBuildInfo,
+                                                         pMaxPrimitiveCounts, pSizeInfo);
+}
+
+VkDeviceAddress WrappedVulkan::vkGetAccelerationStructureDeviceAddressKHR(
+    VkDevice device, const VkAccelerationStructureDeviceAddressInfoKHR *pInfo)
+{
+  VkAccelerationStructureDeviceAddressInfoKHR info = *pInfo;
+  info.accelerationStructure = Unwrap(info.accelerationStructure);
+  return ObjDisp(device)->GetAccelerationStructureDeviceAddressKHR(Unwrap(device), &info);
+}
+
+void WrappedVulkan::vkGetDeviceAccelerationStructureCompatibilityKHR(
+    VkDevice device, const VkAccelerationStructureVersionInfoKHR *pVersionInfo,
+    VkAccelerationStructureCompatibilityKHR *pCompatibility)
+{
+  *pCompatibility = VK_ACCELERATION_STRUCTURE_COMPATIBILITY_INCOMPATIBLE_KHR;
 }

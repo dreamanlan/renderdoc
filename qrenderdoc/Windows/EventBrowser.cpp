@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,6 +28,7 @@
 #include <QComboBox>
 #include <QCompleter>
 #include <QDialogButtonBox>
+#include <QInputDialog>
 #include <QKeyEvent>
 #include <QLineEdit>
 #include <QMenu>
@@ -1166,6 +1167,9 @@ private:
     if(eid == 0)
       return tr("Capture Start");
 
+    if(eid >= m_Actions.size())
+      return QVariant();
+
     const ActionDescription *action = m_Actions[eid];
 
     QString name;
@@ -1199,7 +1203,16 @@ private:
       {
         const APIEvent &e = *eidit;
 
-        const SDChunk *chunk = m_Ctx.GetStructuredFile().chunks[e.chunkIndex];
+        const StructuredChunkList &chunks = m_Ctx.GetStructuredFile().chunks;
+
+        if(e.chunkIndex >= chunks.size())
+          return QVariant();
+
+        const SDChunk *chunk = chunks[e.chunkIndex];
+
+        if(chunk == NULL)
+          return QVariant();
+
         name = chunk->name;
 
         // don't display any "ClassName::" prefix. We keep it for the API inspector which is more
@@ -5286,6 +5299,11 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
   RDDialog::show(&contextMenu, ui->events->viewport()->mapToGlobal(pos));
 }
 
+static QString GetBookmarkDisplayText(const EventBookmark &bookmark)
+{
+  return bookmark.text.empty() ? QString::number(bookmark.eventId) : (QString)bookmark.text;
+}
+
 void EventBrowser::clearBookmarks()
 {
   for(QToolButton *b : m_BookmarkButtons)
@@ -5307,18 +5325,20 @@ void EventBrowser::repopulateBookmarks()
     {
       uint32_t EID = mark.eventId;
 
-      QToolButton *but = new QToolButton(this);
+      QRClickToolButton *but = new QRClickToolButton(this);
 
-      but->setText(QString::number(EID));
+      but->setText(GetBookmarkDisplayText(mark));
       but->setCheckable(true);
       but->setAutoRaise(true);
       but->setProperty("eid", EID);
-      QObject::connect(but, &QToolButton::clicked, [this, but, EID]() {
+      QObject::connect(but, &QRClickToolButton::clicked, [this, but, EID]() {
         but->setChecked(true);
         if(!SelectEvent(EID))
           ui->events->setCurrentIndex(QModelIndex());
         highlightBookmarks();
       });
+      QObject::connect(but, &QRClickToolButton::rightClicked,
+                       [this, but, EID]() { bookmarkContextMenu(but, EID); });
 
       m_BookmarkButtons[EID] = but;
 
@@ -5365,6 +5385,52 @@ void EventBrowser::highlightBookmarks()
     else
       m_BookmarkButtons[eid]->setChecked(false);
   }
+}
+
+void EventBrowser::bookmarkContextMenu(QRClickToolButton *button, uint32_t EID)
+{
+  QMenu contextMenu(this);
+
+  QAction renameBookmark(tr("&Rename"), this);
+  QAction deleteBookmark(tr("&Delete"), this);
+
+  renameBookmark.setIcon(Icons::page_white_edit());
+  deleteBookmark.setIcon(Icons::del());
+
+  contextMenu.addAction(&renameBookmark);
+  contextMenu.addAction(&deleteBookmark);
+
+  QObject::connect(&deleteBookmark, &QAction::triggered, [this, EID]() {
+    m_Ctx.RemoveBookmark(EID);
+    repopulateBookmarks();
+  });
+
+  QObject::connect(&renameBookmark, &QAction::triggered, [this, button, EID]() {
+    EventBookmark editedBookmark;
+    for(const EventBookmark &bookmark : m_Ctx.GetBookmarks())
+    {
+      if(bookmark.eventId == EID)
+      {
+        editedBookmark = bookmark;
+        break;
+      }
+    }
+
+    if(editedBookmark.eventId == EID)
+    {
+      bool ok;
+      editedBookmark.text =
+          QInputDialog::getText(this, lit("Rename"), lit("New name:"), QLineEdit::Normal,
+                                GetBookmarkDisplayText(editedBookmark), &ok);
+      if(ok)
+      {
+        button->setText(GetBookmarkDisplayText(editedBookmark));
+        m_Ctx.SetBookmark(editedBookmark);
+      }
+    }
+  });
+
+  RDDialog::show(&contextMenu, QCursor::pos());
 }
 
 void EventBrowser::ExpandNode(QModelIndex idx)
@@ -5618,11 +5684,17 @@ APIEvent EventBrowser::GetAPIEventForEID(uint32_t eid)
 
 const ActionDescription *EventBrowser::GetActionForEID(uint32_t eid)
 {
+  if(!m_Ctx.IsCaptureLoaded())
+    return NULL;
+
   return m_Model->GetActionForEID(eid);
 }
 
 rdcstr EventBrowser::GetEventName(uint32_t eid)
 {
+  if(!m_Ctx.IsCaptureLoaded())
+    return rdcstr();
+
   return m_Model->GetEventName(eid);
 }
 

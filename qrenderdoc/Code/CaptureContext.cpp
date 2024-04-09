@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -2620,9 +2620,9 @@ IBufferViewer *CaptureContext::ViewConstantBuffer(ShaderStage stage, uint32_t sl
 }
 
 IPixelHistoryView *CaptureContext::ViewPixelHistory(ResourceId texID, uint32_t x, uint32_t y,
-                                                    const TextureDisplay &display)
+                                                    uint32_t view, const TextureDisplay &display)
 {
-  return new PixelHistoryView(*this, texID, QPoint(x, y), display, m_MainWindow);
+  return new PixelHistoryView(*this, texID, QPoint(x, y), view, display, m_MainWindow);
 }
 
 QWidget *CaptureContext::CreateBuiltinWindow(const rdcstr &objectName)

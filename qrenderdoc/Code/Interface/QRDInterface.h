@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -2624,12 +2624,13 @@ operation.
 :param renderdoc.ResourceId id: The ID of the texture to show the history of.
 :param int x: The x co-ordinate of the pixel to search for.
 :param int y: The y co-ordinate of the pixel to search for.
+:param int view: The layered or multiview rendering view index of the pixel to search for.
 :param renderdoc.TextureDisplay display: The texture display configuration to use when looking up
   the history.
 :return: The new :class:`PixelHistoryView` window opened, but not shown.
 :rtype: PixelHistoryView
 )");
-  virtual IPixelHistoryView *ViewPixelHistory(ResourceId id, uint32_t x, uint32_t y,
+  virtual IPixelHistoryView *ViewPixelHistory(ResourceId id, uint32_t x, uint32_t y, uint32_t view,
                                               const TextureDisplay &display) = 0;
 
   DOCUMENT(R"(Creates and returns a built-in window.

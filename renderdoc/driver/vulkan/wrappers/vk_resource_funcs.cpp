@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -433,8 +433,7 @@ bool WrappedVulkan::Serialise_vkAllocateMemory(SerialiserType &ser, VkDevice dev
 }
 
 VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
-                                         const VkAllocationCallbacks *pAllocator,
-                                         VkDeviceMemory *pMemory)
+                                         const VkAllocationCallbacks *, VkDeviceMemory *pMemory)
 {
   VkMemoryAllocateInfo info = *pAllocateInfo;
 
@@ -499,7 +498,7 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
 
   VkResult ret;
   SERIALISE_TIME_CALL(
-      ret = ObjDisp(device)->AllocateMemory(Unwrap(device), &unwrapped, pAllocator, pMemory));
+      ret = ObjDisp(device)->AllocateMemory(Unwrap(device), &unwrapped, NULL, pMemory));
 
   // restore the memoryTypeIndex to the original, as that's what we want to serialise,
   // but maintain any potential modifications we made to info.allocationSize
@@ -658,7 +657,7 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
         memFlags->flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
 
         {
-          SCOPED_READLOCK(m_CapTransitionLock);
+          SCOPED_LOCK(m_DeviceAddressResourcesLock);
           m_DeviceAddressResources.IDs.push_back(record->GetResourceID());
         }
       }
@@ -743,8 +742,7 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   return ret;
 }
 
-void WrappedVulkan::vkFreeMemory(VkDevice device, VkDeviceMemory memory,
-                                 const VkAllocationCallbacks *pAllocator)
+void WrappedVulkan::vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks *)
 {
   if(memory == VK_NULL_HANDLE)
     return;
@@ -774,10 +772,9 @@ void WrappedVulkan::vkFreeMemory(VkDevice device, VkDeviceMemory memory,
     // opaque capture address isn't re-used before the capture completes
     {
       SCOPED_READLOCK(m_CapTransitionLock);
+      SCOPED_LOCK(m_DeviceAddressResourcesLock);
       if(IsActiveCapturing(m_State) && m_DeviceAddressResources.IDs.contains(GetResID(memory)))
       {
-        // we can't hold onto the user callback so we'll be freeing with NULL.
-        RDCASSERT(pAllocator == NULL);
         m_DeviceAddressResources.DeadMemories.push_back(memory);
         return;
       }
@@ -820,7 +817,7 @@ void WrappedVulkan::vkFreeMemory(VkDevice device, VkDeviceMemory memory,
     GetResourceManager()->ReleaseWrappedResource(wholeMemDestroy);
   }
 
-  ObjDisp(device)->FreeMemory(Unwrap(device), unwrappedMem, pAllocator);
+  ObjDisp(device)->FreeMemory(Unwrap(device), unwrappedMem, NULL);
 }
 
 VkResult WrappedVulkan::vkMapMemory(VkDevice device, VkDeviceMemory mem, VkDeviceSize offset,
@@ -1706,7 +1703,7 @@ bool WrappedVulkan::Serialise_vkCreateBuffer(SerialiserType &ser, VkDevice devic
 }
 
 VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
-                                       const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer)
+                                       const VkAllocationCallbacks *, VkBuffer *pBuffer)
 {
   VkBufferCreateInfo adjusted_info = *pCreateInfo;
 
@@ -1722,10 +1719,17 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
   // effectively free as a usage bit for all sensible implementations so we just add it here.
   adjusted_info.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-  // If we're using this buffer for device addresses, ensure we force on capture replay bit.
-  // We ensured the physical device can support this feature before whitelisting the extension.
-  if(IsCaptureMode(m_State) && (adjusted_info.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT))
-    adjusted_info.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+  if(IsCaptureMode(m_State))
+  {
+    // If we're using this buffer for AS storage we need to enable BDA
+    if(adjusted_info.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
+      adjusted_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+    // If we're using this buffer for device addresses, ensure we force on capture replay bit.
+    // We ensured the physical device can support this feature before whitelisting the extension.
+    if(adjusted_info.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+      adjusted_info.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+  }
 
   byte *tempMem = GetTempMemory(GetNextPatchSize(adjusted_info.pNext));
 
@@ -1733,7 +1737,7 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
 
   VkResult ret;
   SERIALISE_TIME_CALL(
-      ret = ObjDisp(device)->CreateBuffer(Unwrap(device), &adjusted_info, pAllocator, pBuffer));
+      ret = ObjDisp(device)->CreateBuffer(Unwrap(device), &adjusted_info, NULL, pBuffer));
 
   if(ret == VK_SUCCESS)
   {
@@ -1802,7 +1806,7 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
         AddForcedReference(record);
 
         {
-          SCOPED_READLOCK(m_CapTransitionLock);
+          SCOPED_LOCK(m_DeviceAddressResourcesLock);
           m_DeviceAddressResources.IDs.push_back(record->GetResourceID());
         }
       }
@@ -1978,14 +1982,13 @@ bool WrappedVulkan::Serialise_vkCreateBufferView(SerialiserType &ser, VkDevice d
 }
 
 VkResult WrappedVulkan::vkCreateBufferView(VkDevice device, const VkBufferViewCreateInfo *pCreateInfo,
-                                           const VkAllocationCallbacks *pAllocator,
-                                           VkBufferView *pView)
+                                           const VkAllocationCallbacks *, VkBufferView *pView)
 {
   VkBufferViewCreateInfo unwrappedInfo = *pCreateInfo;
   unwrappedInfo.buffer = Unwrap(unwrappedInfo.buffer);
   VkResult ret;
   SERIALISE_TIME_CALL(
-      ret = ObjDisp(device)->CreateBufferView(Unwrap(device), &unwrappedInfo, pAllocator, pView));
+      ret = ObjDisp(device)->CreateBufferView(Unwrap(device), &unwrappedInfo, NULL, pView));
 
   if(ret == VK_SUCCESS)
   {
@@ -2267,7 +2270,7 @@ bool WrappedVulkan::Serialise_vkCreateImage(SerialiserType &ser, VkDevice device
 }
 
 VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
-                                      const VkAllocationCallbacks *pAllocator, VkImage *pImage)
+                                      const VkAllocationCallbacks *, VkImage *pImage)
 {
   VkImageCreateInfo createInfo_adjusted = *pCreateInfo;
 
@@ -2396,7 +2399,7 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
 
   VkResult ret;
   SERIALISE_TIME_CALL(
-      ret = ObjDisp(device)->CreateImage(Unwrap(device), &createInfo_adjusted, pAllocator, pImage));
+      ret = ObjDisp(device)->CreateImage(Unwrap(device), &createInfo_adjusted, NULL, pImage));
 
   if(ret == VK_SUCCESS)
   {
@@ -2711,7 +2714,7 @@ bool WrappedVulkan::Serialise_vkCreateImageView(SerialiserType &ser, VkDevice de
 }
 
 VkResult WrappedVulkan::vkCreateImageView(VkDevice device, const VkImageViewCreateInfo *pCreateInfo,
-                                          const VkAllocationCallbacks *pAllocator, VkImageView *pView)
+                                          const VkAllocationCallbacks *, VkImageView *pView)
 {
   byte *tempMem = GetTempMemory(GetNextPatchSize(pCreateInfo));
   VkImageViewCreateInfo *unwrappedInfo = UnwrapStructAndChain(m_State, tempMem, pCreateInfo);
@@ -2732,7 +2735,7 @@ VkResult WrappedVulkan::vkCreateImageView(VkDevice device, const VkImageViewCrea
 
   VkResult ret;
   SERIALISE_TIME_CALL(
-      ret = ObjDisp(device)->CreateImageView(Unwrap(device), unwrappedInfo, pAllocator, pView));
+      ret = ObjDisp(device)->CreateImageView(Unwrap(device), unwrappedInfo, NULL, pView));
 
   if(ret == VK_SUCCESS)
   {
@@ -3123,9 +3126,157 @@ void WrappedVulkan::vkSetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory
   }
 }
 
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkCreateAccelerationStructureKHR(
+    SerialiserType &ser, VkDevice device, const VkAccelerationStructureCreateInfoKHR *pCreateInfo,
+    const VkAllocationCallbacks *pAllocator, VkAccelerationStructureKHR *pAccelerationStructure)
+{
+  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT_LOCAL(CreateInfo, *pCreateInfo).Important();
+  SERIALISE_ELEMENT_OPT(pAllocator);
+  SERIALISE_ELEMENT_LOCAL(AccelerationStructure, GetResID(*pAccelerationStructure))
+      .TypedAs("VkAccelerationStructureKHR"_lit);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    VkAccelerationStructureCreateInfoKHR unwrappedInfo = CreateInfo;
+    unwrappedInfo.buffer = Unwrap(unwrappedInfo.buffer);
+
+    VkAccelerationStructureKHR acc = VK_NULL_HANDLE;
+    VkResult ret =
+        ObjDisp(device)->CreateAccelerationStructureKHR(Unwrap(device), &unwrappedInfo, NULL, &acc);
+
+    if(ret != VK_SUCCESS)
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "Error creating acceleration structure, VkResult: %s", ToStr(ret).c_str());
+      return false;
+    }
+    else
+    {
+      ResourceId live;
+
+      if(GetResourceManager()->HasWrapper(ToTypedHandle(acc)))
+      {
+        live = GetResourceManager()->GetNonDispWrapper(acc)->id;
+
+        // destroy this instance of the duplicate, as we must have matching create/destroy
+        // calls and there won't be a wrapped resource hanging around to destroy this one.
+        ObjDisp(device)->DestroyAccelerationStructureKHR(Unwrap(device), acc, NULL);
+
+        // whenever the new ID is requested, return the old ID, via replacements.
+        GetResourceManager()->ReplaceResource(AccelerationStructure,
+                                              GetResourceManager()->GetOriginalID(live));
+      }
+      else
+      {
+        live = GetResourceManager()->WrapResource(Unwrap(device), acc);
+        GetResourceManager()->AddLiveResource(AccelerationStructure, acc);
+
+        m_CreationInfo.m_AccelerationStructure[live].Init(GetResourceManager(), m_CreationInfo,
+                                                          &CreateInfo);
+      }
+    }
+
+    AddResource(AccelerationStructure, ResourceType::AccelerationStructure, "AccelerationStructure");
+    DerivedResource(device, AccelerationStructure);
+    DerivedResource(CreateInfo.buffer, AccelerationStructure);
+  }
+
+  return true;
+}
+
+VkResult WrappedVulkan::vkCreateAccelerationStructureKHR(
+    VkDevice device, const VkAccelerationStructureCreateInfoKHR *pCreateInfo,
+    const VkAllocationCallbacks *, VkAccelerationStructureKHR *pAccelerationStructure)
+{
+  VkAccelerationStructureCreateInfoKHR unwrappedInfo = *pCreateInfo;
+
+  // Ensure we force on capture replay bit. We ensured the physical device can support this feature
+  // before whitelisting the extension.
+  if(IsCaptureMode(m_State))
+    unwrappedInfo.createFlags |=
+        VK_ACCELERATION_STRUCTURE_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT_KHR;
+
+  unwrappedInfo.buffer = Unwrap(unwrappedInfo.buffer);
+  VkResult ret;
+  SERIALISE_TIME_CALL(ret = ObjDisp(device)->CreateAccelerationStructureKHR(
+                          Unwrap(device), &unwrappedInfo, NULL, pAccelerationStructure));
+
+  if(ret == VK_SUCCESS)
+  {
+    ResourceId id = GetResourceManager()->WrapResource(Unwrap(device), *pAccelerationStructure);
+
+    if(IsCaptureMode(m_State))
+    {
+      // We're capturing, so get the device address of the created AS
+      VkAccelerationStructureCreateInfoKHR serialisedCreateInfo = *pCreateInfo;
+      serialisedCreateInfo.createFlags |=
+          VK_ACCELERATION_STRUCTURE_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT_KHR;
+
+      const VkAccelerationStructureDeviceAddressInfoKHR getInfo = {
+          VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+          NULL,
+          Unwrap(*pAccelerationStructure),
+      };
+      const VkDeviceAddress addr =
+          ObjDisp(device)->GetAccelerationStructureDeviceAddressKHR(Unwrap(device), &getInfo);
+      serialisedCreateInfo.deviceAddress = addr;
+
+      Chunk *chunk = NULL;
+
+      {
+        CACHE_THREAD_SERIALISER();
+
+        SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCreateAccelerationStructureKHR);
+        Serialise_vkCreateAccelerationStructureKHR(ser, device, &serialisedCreateInfo, NULL,
+                                                   pAccelerationStructure);
+
+        chunk = scope.Get();
+      }
+
+      VkResourceRecord *bufferRecord = GetRecord(pCreateInfo->buffer);
+
+      VkResourceRecord *record = GetResourceManager()->AddResourceRecord(*pAccelerationStructure);
+      record->AddChunk(chunk);
+      record->AddParent(bufferRecord);
+
+      // store the base resource
+      record->baseResource = bufferRecord->GetResourceID();
+      record->baseResourceMem = bufferRecord->baseResource;
+      record->dedicated = bufferRecord->dedicated;
+      record->resInfo = bufferRecord->resInfo;
+      record->storable = bufferRecord->storable;
+      record->memOffset = bufferRecord->memOffset + pCreateInfo->offset;
+      record->memSize = pCreateInfo->size;
+
+      GetResourceManager()->MarkDirtyResource(id);
+      if(pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
+         pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR)
+      {
+        // We force reference BLASs as it is not feasible to track at the API level which TLASs
+        // reference them.  We force ref generics too as they could bottom or top level so we
+        // conservatively assume they are bottom
+        AddForcedReference(record);
+      }
+    }
+    else
+    {
+      GetResourceManager()->AddLiveResource(id, *pAccelerationStructure);
+
+      m_CreationInfo.m_AccelerationStructure[id].Init(GetResourceManager(), m_CreationInfo,
+                                                      pCreateInfo);
+    }
+  }
+
+  return ret;
+}
+
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkAllocateMemory, VkDevice device,
                                 const VkMemoryAllocateInfo *pAllocateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMemory);
+                                const VkAllocationCallbacks *, VkDeviceMemory *pMemory);
 
 INSTANTIATE_FUNCTION_SERIALISED(void, vkUnmapMemory, VkDevice device, VkDeviceMemory memory);
 
@@ -3140,19 +3291,19 @@ INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkBindImageMemory, VkDevice device, Vk
 
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkCreateBuffer, VkDevice device,
                                 const VkBufferCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer);
+                                const VkAllocationCallbacks *, VkBuffer *pBuffer);
 
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkCreateBufferView, VkDevice device,
                                 const VkBufferViewCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkBufferView *pView);
+                                const VkAllocationCallbacks *, VkBufferView *pView);
 
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkCreateImage, VkDevice device,
-                                const VkImageCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkImage *pImage);
+                                const VkImageCreateInfo *pCreateInfo, const VkAllocationCallbacks *,
+                                VkImage *pImage);
 
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkCreateImageView, VkDevice device,
                                 const VkImageViewCreateInfo *pCreateInfo,
-                                const VkAllocationCallbacks *pAllocator, VkImageView *pView);
+                                const VkAllocationCallbacks *, VkImageView *pView);
 
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkBindBufferMemory2, VkDevice device,
                                 uint32_t bindInfoCount, const VkBindBufferMemoryInfo *pBindInfos);
@@ -3162,3 +3313,8 @@ INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkBindImageMemory2, VkDevice device,
 
 INSTANTIATE_FUNCTION_SERIALISED(void, vkSetDeviceMemoryPriorityEXT, VkDevice device,
                                 VkDeviceMemory memory, float priority);
+
+INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkCreateAccelerationStructureKHR, VkDevice device,
+                                const VkAccelerationStructureCreateInfoKHR *pCreateInfo,
+                                const VkAllocationCallbacks *,
+                                VkAccelerationStructureKHR *pAccelerationStructure);

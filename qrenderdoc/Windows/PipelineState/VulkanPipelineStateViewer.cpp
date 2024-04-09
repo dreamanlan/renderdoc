@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -690,7 +690,7 @@ bool VulkanPipelineStateViewer::setViewDetails(RDTreeWidgetItem *node, const bin
         text += tr("The texture has %1 array slices, the view covers slices %2-%3.\n")
                     .arg(tex->arraysize)
                     .arg(view.firstSlice)
-                    .arg(view.firstSlice + view.numSlices);
+                    .arg(view.firstSlice + view.numSlices - 1);
 
       viewdetails = true;
     }
@@ -705,7 +705,7 @@ bool VulkanPipelineStateViewer::setViewDetails(RDTreeWidgetItem *node, const bin
         text += tr("The texture has %1 3D slices, the view covers slices %2-%3.\n")
                     .arg(tex->depth)
                     .arg(view.firstSlice)
-                    .arg(view.firstSlice + view.numSlices);
+                    .arg(view.firstSlice + view.numSlices - 1);
 
       viewdetails = true;
     }

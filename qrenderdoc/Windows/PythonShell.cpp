@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -851,10 +851,10 @@ struct CaptureContextInvoker : ObjectForwarder<ICaptureContext>
   }
 
   virtual IPixelHistoryView *ViewPixelHistory(ResourceId texID, uint32_t x, uint32_t y,
-                                              const TextureDisplay &display) override
+                                              uint32_t view, const TextureDisplay &display) override
   {
     return InvokeRetFunction<IPixelHistoryView *>(&ICaptureContext::ViewPixelHistory, texID, x, y,
-                                                  display);
+                                                  view, display);
   }
 
   virtual QWidget *CreateBuiltinWindow(const rdcstr &objectName) override

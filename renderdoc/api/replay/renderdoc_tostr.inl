@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2023 Baldur Karlsson
+ * Copyright (c) 2017-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -693,6 +693,7 @@ rdcstr DoStringise(const ShaderBuiltin &el)
     STRINGISE_ENUM_CLASS_NAMED(Barycentrics, "Barycentrics");
     STRINGISE_ENUM_CLASS_NAMED(CullPrimitive, "Cull Primitive Output");
     STRINGISE_ENUM_CLASS_NAMED(OutputIndices, "Output Indices");
+    STRINGISE_ENUM_CLASS_NAMED(MultiViewIndex, "Multiview Index");
   }
   END_ENUM_STRINGISE();
 }
@@ -1042,6 +1043,7 @@ rdcstr DoStringise(const ShaderEncoding &el)
     STRINGISE_ENUM_CLASS(DXIL);
     STRINGISE_ENUM_CLASS_NAMED(OpenGLSPIRV, "SPIR-V (OpenGL)");
     STRINGISE_ENUM_CLASS_NAMED(OpenGLSPIRVAsm, "SPIR-V Asm (OpenGL)");
+    STRINGISE_ENUM_CLASS(Slang);
   }
   END_ENUM_STRINGISE();
 }
@@ -1064,6 +1066,8 @@ rdcstr DoStringise(const KnownShaderTool &el)
     STRINGISE_ENUM_CLASS_NAMED(SPIRV_Cross_OpenGL, "SPIRV-Cross (OpenGL SPIR-V)");
     STRINGISE_ENUM_CLASS_NAMED(spirv_as_OpenGL, "spirv-as (OpenGL SPIR-V)");
     STRINGISE_ENUM_CLASS_NAMED(spirv_dis_OpenGL, "spirv-dis (OpenGL SPIR-V)");
+    STRINGISE_ENUM_CLASS_NAMED(slangSPIRV, "slang (Vulkan SPIR-V)");
+    STRINGISE_ENUM_CLASS_NAMED(slangDXIL, "slang (DXIL)");
   }
   END_ENUM_STRINGISE();
 }

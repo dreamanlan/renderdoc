@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -305,6 +305,9 @@ public:
   // If we do have a pipeline to bind, we should never be perturbing dynamic state in between static
   // pipeline binds.
   bool NVStaticPipelineRebindStates() const { return nvidiaStaticPipelineRebindStates; }
+  // On Mali there are some known issues regarding acceleration structure serialisation to device
+  // memory, for the affected driver versions we switch to the host command variants
+  bool MaliBrokenASDeviceSerialisation() const { return maliBrokenASDeviceSerialisation; }
 private:
   GPUVendor m_Vendor;
 
@@ -320,6 +323,7 @@ private:
   bool qualcommLineWidthCrash = false;
   bool intelBrokenOcclusionQueries = false;
   bool nvidiaStaticPipelineRebindStates = false;
+  bool maliBrokenASDeviceSerialisation = false;
 };
 
 enum
@@ -527,6 +531,7 @@ enum class DescriptorSlotType : EnumBaseType
   StorageBufferDynamic,
   InputAttachment,
   InlineBlock,
+  AccelerationStructure,
   Count,
 };
 
@@ -550,7 +555,9 @@ constexpr VkDescriptorType convert(DescriptorSlotType type)
              ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
          : type == DescriptorSlotType::InputAttachment ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT
          : type == DescriptorSlotType::InlineBlock     ? VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
-                                                       : VK_DESCRIPTOR_TYPE_MAX_ENUM;
+         : type == DescriptorSlotType::AccelerationStructure
+             ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+             : VK_DESCRIPTOR_TYPE_MAX_ENUM;
 }
 
 constexpr DescriptorSlotType convert(VkDescriptorType type)
@@ -599,6 +606,7 @@ enum class DescriptorSlotImageLayout : EnumBaseType
   FragmentDensity,
   FragmentShadingRate,
   FeedbackLoop,
+  DynamicLocalRead,
 
   Count,
 };
@@ -630,6 +638,7 @@ constexpr VkImageLayout convert(DescriptorSlotImageLayout layout)
        : layout == DescriptorSlotImageLayout::FragmentDensity        ? VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT
        : layout == DescriptorSlotImageLayout::FragmentShadingRate    ? VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR
        : layout == DescriptorSlotImageLayout::FeedbackLoop           ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+       : layout == DescriptorSlotImageLayout::DynamicLocalRead       ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR
        : VK_IMAGE_LAYOUT_MAX_ENUM;
   // clang-format on
 }
@@ -661,6 +670,7 @@ constexpr DescriptorSlotImageLayout convert(VkImageLayout layout)
        : layout == VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT             ? DescriptorSlotImageLayout::FragmentDensity
        : layout == VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR ? DescriptorSlotImageLayout::FragmentShadingRate
        : layout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT         ? DescriptorSlotImageLayout::FeedbackLoop
+       : layout == VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR                     ? DescriptorSlotImageLayout::DynamicLocalRead
        : DescriptorSlotImageLayout::Count;
   // clang-format on
 }
@@ -679,6 +689,8 @@ struct DescriptorSetSlot
   void SetBuffer(VkDescriptorType writeType, const VkDescriptorBufferInfo &bufInfo);
   void SetImage(VkDescriptorType writeType, const VkDescriptorImageInfo &imInfo, bool useSampler);
   void SetTexelBuffer(VkDescriptorType writeType, ResourceId id);
+  void SetAccelerationStructure(VkDescriptorType writeType,
+                                VkAccelerationStructureKHR accelerationStructure);
 
   // 48-bit truncated VK_WHOLE_SIZE
   static const VkDeviceSize WholeSizeRange = 0xFFFFFFFFFFFF;
@@ -711,8 +723,8 @@ struct DescriptorSetSlot
   // as a different type and the resource ID is partly trampled. Since these are disjoint we know
   // that even if they're stale they're valid IDs.
 
-  // main contents: buffer, image, texel buffer view. NOT the sampler for sampler-only descriptors,
-  // just to avoid confusion
+  // main contents: buffer, image, texel buffer view, or acceleration structure. NOT the sampler for
+  // sampler-only descriptors, just to avoid confusion
   ResourceId resource;
   // sampler for sampler-only descriptors, or sampler for combined image-sampler descriptors
   ResourceId sampler;
@@ -774,6 +786,84 @@ DECLARE_REFLECTION_STRUCT(DescriptorSetSlot);
   (VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |           \
    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | \
    VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT)
+
+// linearised version of VkDynamicState
+enum VulkanDynamicStateIndex
+{
+  VkDynamicViewport,
+  VkDynamicScissor,
+  VkDynamicLineWidth,
+  VkDynamicDepthBias,
+  VkDynamicBlendConstants,
+  VkDynamicDepthBounds,
+  VkDynamicStencilCompareMask,
+  VkDynamicStencilWriteMask,
+  VkDynamicStencilReference,
+  VkDynamicViewportWScalingNV,
+  VkDynamicDiscardRectangleEXT,
+  VkDynamicDiscardRectangleEnableEXT,
+  VkDynamicDiscardRectangleModeEXT,
+  VkDynamicSampleLocationsEXT,
+  VkDynamicViewportShadingRatePaletteNV,
+  VkDynamicViewportCoarseSampleOrderNV,
+  VkDynamicExclusiveScissorNV,
+  VkDynamicExclusiveScissorEnableNV,
+  VkDynamicShadingRateKHR,
+  VkDynamicLineStippleKHR,
+  VkDynamicCullMode,
+  VkDynamicFrontFace,
+  VkDynamicPrimitiveTopology,
+  VkDynamicViewportCount,
+  VkDynamicScissorCount,
+  VkDynamicVertexInputBindingStride,
+  VkDynamicDepthTestEnable,
+  VkDynamicDepthWriteEnable,
+  VkDynamicDepthCompareOp,
+  VkDynamicDepthBoundsTestEnable,
+  VkDynamicStencilTestEnable,
+  VkDynamicStencilOp,
+  VkDynamicRayTracingStackSizeKHR,
+  VkDynamicVertexInputEXT,
+  VkDynamicControlPointsEXT,
+  VkDynamicRastDiscard,
+  VkDynamicDepthBiasEnable,
+  VkDynamicLogicOpEXT,
+  VkDynamicPrimRestart,
+  VkDynamicColorWriteEXT,
+  VkDynamicTessDomainOriginEXT,
+  VkDynamicDepthClampEnableEXT,
+  VkDynamicPolygonModeEXT,
+  VkDynamicRasterizationSamplesEXT,
+  VkDynamicSampleMaskEXT,
+  VkDynamicAlphaToCoverageEXT,
+  VkDynamicAlphaToOneEXT,
+  VkDynamicLogicOpEnableEXT,
+  VkDynamicColorBlendEnableEXT,
+  VkDynamicColorBlendEquationEXT,
+  VkDynamicColorWriteMaskEXT,
+  VkDynamicRasterizationStreamEXT,
+  VkDynamicConservativeRastModeEXT,
+  VkDynamicOverstimationSizeEXT,
+  VkDynamicDepthClipEnableEXT,
+  VkDynamicSampleLocationsEnableEXT,
+  VkDynamicStateColorBlendAdvancedEXT,
+  VkDynamicProvokingVertexModeEXT,
+  VkDynamicLineRastModeEXT,
+  VkDynamicLineStippleEnableEXT,
+  VkDynamicDepthClipNegativeOneEXT,
+  VkDynamicViewportWScalingEXT,
+  VkDynamicViewportSwizzleEXT,
+  VkDynamicCoverageToColorEnableEXT,
+  VkDynamicCoverageToColorLocationEXT,
+  VkDynamicCoverageModulationModeEXT,
+  VkDynamicCoverageModulationTableEnableEXT,
+  VkDynamicCoverageModulationTableEXT,
+  VkDynamicShadingRateImageEnableEXT,
+  VkDynamicRepresentativeFragTestEXT,
+  VkDynamicCoverageReductionModeEXT,
+  VkDynamicAttachmentFeedbackLoopEnableEXT,
+  VkDynamicCount,
+};
 
 enum class VulkanChunk : uint32_t
 {
@@ -912,7 +1002,7 @@ enum class VulkanChunk : uint32_t
   DeviceMemoryRefs,
   vkResetQueryPool,
   ImageRefs,
-  vkCmdSetLineStippleEXT,
+  vkCmdSetLineStippleKHR,
   vkGetSemaphoreCounterValue,
   vkWaitSemaphores,
   vkSignalSemaphore,
@@ -978,6 +1068,12 @@ enum class VulkanChunk : uint32_t
   vkCmdDrawMeshTasksEXT,
   vkCmdDrawMeshTasksIndirectEXT,
   vkCmdDrawMeshTasksIndirectCountEXT,
+  vkCmdBuildAccelerationStructuresIndirectKHR,
+  vkCmdBuildAccelerationStructuresKHR,
+  vkCmdCopyAccelerationStructureKHR,
+  vkCmdCopyAccelerationStructureToMemoryKHR,
+  vkCmdCopyMemoryToAccelerationStructureKHR,
+  vkCreateAccelerationStructureKHR,
   Max,
 };
 
@@ -1016,7 +1112,8 @@ DECLARE_REFLECTION_ENUM(VulkanChunk);
   SERIALISE_HANDLE(VkSwapchainKHR)             \
   SERIALISE_HANDLE(VkSurfaceKHR)               \
   SERIALISE_HANDLE(VkDescriptorUpdateTemplate) \
-  SERIALISE_HANDLE(VkSamplerYcbcrConversion)
+  SERIALISE_HANDLE(VkSamplerYcbcrConversion)   \
+  SERIALISE_HANDLE(VkAccelerationStructureKHR)
 
 #define SERIALISE_HANDLE(type) DECLARE_REFLECTION_STRUCT(type)
 
@@ -1025,6 +1122,15 @@ SERIALISE_VK_HANDLES();
 // declare reflect-able types
 
 // pNext structs - always have deserialise for the next chain
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureBuildGeometryInfoKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureBuildSizesInfoKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureCreateInfoKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureDeviceAddressInfoKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureGeometryAabbsDataKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureGeometryInstancesDataKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureGeometryKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureGeometryTrianglesDataKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureVersionInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkAcquireNextImageInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkAcquireProfilingLockInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkApplicationInfo);
@@ -1051,7 +1157,7 @@ DECLARE_REFLECTION_STRUCT(VkBufferMemoryBarrier2);
 DECLARE_REFLECTION_STRUCT(VkBufferMemoryRequirementsInfo2);
 DECLARE_REFLECTION_STRUCT(VkBufferOpaqueCaptureAddressCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkBufferViewCreateInfo);
-DECLARE_REFLECTION_STRUCT(VkCalibratedTimestampInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkCalibratedTimestampInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkCommandBufferAllocateInfo);
 DECLARE_REFLECTION_STRUCT(VkCommandBufferBeginInfo);
 DECLARE_REFLECTION_STRUCT(VkCommandBufferInheritanceConditionalRenderingInfoEXT);
@@ -1061,11 +1167,14 @@ DECLARE_REFLECTION_STRUCT(VkCommandBufferSubmitInfo);
 DECLARE_REFLECTION_STRUCT(VkCommandPoolCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkComputePipelineCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkConditionalRenderingBeginInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkCopyAccelerationStructureInfoKHR);
+DECLARE_REFLECTION_STRUCT(VkCopyAccelerationStructureToMemoryInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkCopyBufferInfo2);
 DECLARE_REFLECTION_STRUCT(VkCopyBufferToImageInfo2);
 DECLARE_REFLECTION_STRUCT(VkCopyDescriptorSet);
 DECLARE_REFLECTION_STRUCT(VkCopyImageInfo2);
 DECLARE_REFLECTION_STRUCT(VkCopyImageToBufferInfo2);
+DECLARE_REFLECTION_STRUCT(VkCopyMemoryToAccelerationStructureInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkDebugMarkerMarkerInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkDebugMarkerObjectNameInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkDebugMarkerObjectTagInfoEXT);
@@ -1184,6 +1293,8 @@ DECLARE_REFLECTION_STRUCT(VkPerformanceQuerySubmitInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevice16BitStorageFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevice4444FormatsFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevice8BitStorageFeatures);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceAccelerationStructureFeaturesKHR);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceAccelerationStructurePropertiesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceASTCDecodeFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT);
@@ -1257,6 +1368,8 @@ DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceMultisampledRenderToSingleSampledFeatu
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceMultiviewFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceMultiviewProperties);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceNestedCommandBufferFeaturesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceNestedCommandBufferPropertiesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevicePCIBusInfoPropertiesEXT);
@@ -1277,6 +1390,7 @@ DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProtectedMemoryFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProtectedMemoryProperties);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevicePushDescriptorPropertiesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRayQueryFeaturesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRGBA10X6FormatsFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRobustness2FeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRobustness2PropertiesEXT);
@@ -1317,8 +1431,9 @@ DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceTransformFeedbackFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceTransformFeedbackPropertiesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceUniformBufferStandardLayoutFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceVariablePointerFeatures);
-DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceVulkan11Features);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceVulkan11Properties);
@@ -1360,7 +1475,7 @@ DECLARE_REFLECTION_STRUCT(VkPipelineShaderStageCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkPipelineShaderStageRequiredSubgroupSizeCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkPipelineTessellationDomainOriginStateCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkPipelineTessellationStateCreateInfo);
-DECLARE_REFLECTION_STRUCT(VkPipelineVertexInputDivisorStateCreateInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkPipelineVertexInputDivisorStateCreateInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkPipelineVertexInputStateCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkPipelineViewportDepthClipControlCreateInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkPipelineViewportStateCreateInfo);
@@ -1441,8 +1556,18 @@ DECLARE_REFLECTION_STRUCT(VkValidationFlagsEXT);
 DECLARE_REFLECTION_STRUCT(VkVertexInputAttributeDescription2EXT);
 DECLARE_REFLECTION_STRUCT(VkVertexInputBindingDescription2EXT);
 DECLARE_REFLECTION_STRUCT(VkWriteDescriptorSet);
+DECLARE_REFLECTION_STRUCT(VkWriteDescriptorSetAccelerationStructureKHR);
 DECLARE_REFLECTION_STRUCT(VkWriteDescriptorSetInlineUniformBlock);
 
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureBuildGeometryInfoKHR);
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureBuildSizesInfoKHR);
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureCreateInfoKHR);
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureDeviceAddressInfoKHR);
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureGeometryAabbsDataKHR);
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureGeometryInstancesDataKHR);
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureGeometryKHR);
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureGeometryTrianglesDataKHR);
+DECLARE_DESERIALISE_TYPE(VkAccelerationStructureVersionInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkAcquireNextImageInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkAcquireProfilingLockInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkApplicationInfo);
@@ -1467,7 +1592,7 @@ DECLARE_DESERIALISE_TYPE(VkBufferMemoryBarrier2);
 DECLARE_DESERIALISE_TYPE(VkBufferMemoryRequirementsInfo2);
 DECLARE_DESERIALISE_TYPE(VkBufferOpaqueCaptureAddressCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkBufferViewCreateInfo);
-DECLARE_DESERIALISE_TYPE(VkCalibratedTimestampInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkCalibratedTimestampInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkCommandBufferAllocateInfo);
 DECLARE_DESERIALISE_TYPE(VkCommandBufferBeginInfo);
 DECLARE_DESERIALISE_TYPE(VkCommandBufferInheritanceConditionalRenderingInfoEXT);
@@ -1477,11 +1602,14 @@ DECLARE_DESERIALISE_TYPE(VkCommandBufferSubmitInfo);
 DECLARE_DESERIALISE_TYPE(VkCommandPoolCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkComputePipelineCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkConditionalRenderingBeginInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkCopyAccelerationStructureInfoKHR);
+DECLARE_DESERIALISE_TYPE(VkCopyAccelerationStructureToMemoryInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkCopyBufferInfo2);
 DECLARE_DESERIALISE_TYPE(VkCopyBufferToImageInfo2);
 DECLARE_DESERIALISE_TYPE(VkCopyDescriptorSet);
 DECLARE_DESERIALISE_TYPE(VkCopyImageInfo2);
 DECLARE_DESERIALISE_TYPE(VkCopyImageToBufferInfo2);
+DECLARE_DESERIALISE_TYPE(VkCopyMemoryToAccelerationStructureInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkDebugMarkerMarkerInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkDebugMarkerObjectNameInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkDebugMarkerObjectTagInfoEXT);
@@ -1598,6 +1726,8 @@ DECLARE_DESERIALISE_TYPE(VkPerformanceQuerySubmitInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevice16BitStorageFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevice4444FormatsFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevice8BitStorageFeatures);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceAccelerationStructureFeaturesKHR);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceAccelerationStructurePropertiesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceASTCDecodeFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT);
@@ -1669,6 +1799,8 @@ DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceMultisampledRenderToSingleSampledFeatur
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceMultiviewFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceMultiviewProperties);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceNestedCommandBufferFeaturesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceNestedCommandBufferPropertiesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevicePCIBusInfoPropertiesEXT);
@@ -1689,6 +1821,7 @@ DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProtectedMemoryFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProtectedMemoryProperties);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevicePushDescriptorPropertiesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRayQueryFeaturesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRGBA10X6FormatsFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRobustness2FeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRobustness2PropertiesEXT);
@@ -1729,8 +1862,9 @@ DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceTransformFeedbackFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceTransformFeedbackPropertiesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceUniformBufferStandardLayoutFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceVariablePointerFeatures);
-DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceVulkan11Features);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceVulkan11Properties);
@@ -1772,7 +1906,7 @@ DECLARE_DESERIALISE_TYPE(VkPipelineShaderStageCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkPipelineShaderStageRequiredSubgroupSizeCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkPipelineTessellationDomainOriginStateCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkPipelineTessellationStateCreateInfo);
-DECLARE_DESERIALISE_TYPE(VkPipelineVertexInputDivisorStateCreateInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkPipelineVertexInputDivisorStateCreateInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkPipelineVertexInputStateCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkPipelineViewportDepthClipControlCreateInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkPipelineViewportStateCreateInfo);
@@ -1850,9 +1984,13 @@ DECLARE_DESERIALISE_TYPE(VkValidationFlagsEXT);
 DECLARE_DESERIALISE_TYPE(VkVertexInputAttributeDescription2EXT);
 DECLARE_DESERIALISE_TYPE(VkVertexInputBindingDescription2EXT);
 DECLARE_DESERIALISE_TYPE(VkWriteDescriptorSet);
+DECLARE_DESERIALISE_TYPE(VkWriteDescriptorSetAccelerationStructureKHR);
 DECLARE_DESERIALISE_TYPE(VkWriteDescriptorSetInlineUniformBlock);
 
 // plain structs with no next chain
+DECLARE_REFLECTION_STRUCT(VkAabbPositionsKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureBuildRangeInfoKHR);
+DECLARE_REFLECTION_STRUCT(VkAccelerationStructureInstanceKHR);
 DECLARE_REFLECTION_STRUCT(VkAllocationCallbacks);
 DECLARE_REFLECTION_STRUCT(VkAttachmentDescription);
 DECLARE_REFLECTION_STRUCT(VkAttachmentReference);
@@ -1871,6 +2009,8 @@ DECLARE_REFLECTION_STRUCT(VkDescriptorImageInfo);
 DECLARE_REFLECTION_STRUCT(VkDescriptorPoolSize);
 DECLARE_REFLECTION_STRUCT(VkDescriptorSetLayoutBinding);
 DECLARE_REFLECTION_STRUCT(VkDescriptorUpdateTemplateEntry);
+DECLARE_REFLECTION_STRUCT(VkDeviceOrHostAddressConstKHR);
+DECLARE_REFLECTION_STRUCT(VkDeviceOrHostAddressKHR);
 DECLARE_REFLECTION_STRUCT(VkDispatchIndirectCommand);
 DECLARE_REFLECTION_STRUCT(VkDisplayModeParametersKHR);
 DECLARE_REFLECTION_STRUCT(VkDisplayModePropertiesKHR);
@@ -1927,11 +2067,15 @@ DECLARE_REFLECTION_STRUCT(VkSubpassDependency);
 DECLARE_REFLECTION_STRUCT(VkSubpassDescription);
 DECLARE_REFLECTION_STRUCT(VkSurfaceCapabilitiesKHR);
 DECLARE_REFLECTION_STRUCT(VkSurfaceFormatKHR);
+DECLARE_REFLECTION_STRUCT(VkTransformMatrixKHR);
 DECLARE_REFLECTION_STRUCT(VkVertexInputAttributeDescription);
 DECLARE_REFLECTION_STRUCT(VkVertexInputBindingDescription);
 DECLARE_REFLECTION_STRUCT(VkVertexInputBindingDivisorDescriptionEXT);
 DECLARE_REFLECTION_STRUCT(VkViewport);
 DECLARE_REFLECTION_STRUCT(VkXYColorEXT);
+
+// rdcarray serialisation is generic but the stringification is not
+DECLARE_STRINGISE_TYPE(rdcarray<VkAccelerationStructureBuildRangeInfoKHR>);
 
 DECLARE_DESERIALISE_TYPE(VkDescriptorSetLayoutBinding);
 DECLARE_DESERIALISE_TYPE(VkPresentRegionKHR);
@@ -2028,6 +2172,10 @@ enum VkFormatFeatureFlagBits2 : uint64_t
 
 // enums
 
+DECLARE_REFLECTION_ENUM(VkAccelerationStructureBuildTypeKHR);
+DECLARE_REFLECTION_ENUM(VkAccelerationStructureCompatibilityKHR);
+DECLARE_REFLECTION_ENUM(VkAccelerationStructureCreateFlagBitsKHR);
+DECLARE_REFLECTION_ENUM(VkAccelerationStructureTypeKHR);
 DECLARE_REFLECTION_ENUM(VkAccessFlagBits);
 DECLARE_REFLECTION_ENUM(VkAccessFlagBits2);
 DECLARE_REFLECTION_ENUM(VkAcquireProfilingLockFlagBitsKHR);
@@ -2039,6 +2187,8 @@ DECLARE_REFLECTION_ENUM(VkBlendOp);
 DECLARE_REFLECTION_ENUM(VkBorderColor);
 DECLARE_REFLECTION_ENUM(VkBufferCreateFlagBits);
 DECLARE_REFLECTION_ENUM(VkBufferUsageFlagBits);
+DECLARE_REFLECTION_ENUM(VkBuildAccelerationStructureFlagBitsKHR);
+DECLARE_REFLECTION_ENUM(VkBuildAccelerationStructureModeKHR);
 DECLARE_REFLECTION_ENUM(VkChromaLocation);
 DECLARE_REFLECTION_ENUM(VkColorComponentFlagBits);
 DECLARE_REFLECTION_ENUM(VkColorSpaceKHR);
@@ -2051,6 +2201,7 @@ DECLARE_REFLECTION_ENUM(VkComponentSwizzle);
 DECLARE_REFLECTION_ENUM(VkCompositeAlphaFlagBitsKHR);
 DECLARE_REFLECTION_ENUM(VkConditionalRenderingFlagBitsEXT);
 DECLARE_REFLECTION_ENUM(VkConservativeRasterizationModeEXT);
+DECLARE_REFLECTION_ENUM(VkCopyAccelerationStructureModeKHR);
 DECLARE_REFLECTION_ENUM(VkCullModeFlagBits);
 DECLARE_REFLECTION_ENUM(VkDebugReportFlagBitsEXT);
 DECLARE_REFLECTION_ENUM(VkDebugUtilsMessageSeverityFlagBitsEXT);
@@ -2087,6 +2238,9 @@ DECLARE_REFLECTION_ENUM(VkFormatFeatureFlagBits);
 DECLARE_REFLECTION_ENUM(VkFormatFeatureFlagBits2);
 DECLARE_REFLECTION_ENUM(VkFragmentShadingRateCombinerOpKHR);
 DECLARE_REFLECTION_ENUM(VkFramebufferCreateFlagBits);
+DECLARE_REFLECTION_ENUM(VkGeometryFlagBitsKHR);
+DECLARE_REFLECTION_ENUM(VkGeometryInstanceFlagBitsKHR);
+DECLARE_REFLECTION_ENUM(VkGeometryTypeKHR);
 DECLARE_REFLECTION_ENUM(VkGraphicsPipelineLibraryFlagBitsEXT);
 DECLARE_REFLECTION_ENUM(VkFrontFace);
 DECLARE_REFLECTION_ENUM(VkImageAspectFlagBits);
@@ -2098,7 +2252,7 @@ DECLARE_REFLECTION_ENUM(VkImageUsageFlagBits);
 DECLARE_REFLECTION_ENUM(VkImageViewCreateFlagBits);
 DECLARE_REFLECTION_ENUM(VkImageViewType);
 DECLARE_REFLECTION_ENUM(VkIndexType);
-DECLARE_REFLECTION_ENUM(VkLineRasterizationModeEXT);
+DECLARE_REFLECTION_ENUM(VkLineRasterizationModeKHR);
 DECLARE_REFLECTION_ENUM(VkLogicOp);
 DECLARE_REFLECTION_ENUM(VkMemoryAllocateFlagBits);
 DECLARE_REFLECTION_ENUM(VkMemoryHeapFlagBits);

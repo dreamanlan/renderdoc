@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -208,7 +208,7 @@ inline bool check_interface(rdcstr &log, swig_type_info **swig_types, size_t num
               }
 
               // if it's a callable it's a method, ignore it
-              if(!PyCallable_Check(value) && !PyType_IsSubtype(value->ob_type, &PyStaticMethod_Type))
+              if(!PyCallable_Check(value) && !PyType_IsSubtype(Py_TYPE(value), &PyStaticMethod_Type))
               {
                 // some hardcoded exclusions that we allow to break the naming scheme
                 if(typeName == "KnownShaderTool")

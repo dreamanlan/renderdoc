@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -1439,6 +1439,13 @@ The first entry in the list is always the file where the entry point is.
 :type: List[ShaderSourceFile]
 )");
   rdcarray<ShaderSourceFile> files;
+
+  DOCUMENT(R"(The name of the entry point in the source code, not necessarily the same as the
+entry point name exported to the API.
+
+:type: str
+)");
+  rdcstr entrySourceName;
 
   DOCUMENT(R"(The source location of the first executable line or the entry point.
 

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -106,6 +106,7 @@ struct D3D12QuadOverdrawCallback : public D3D12ActionCallback
       range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
       range.OffsetInDescriptorsFromTableStart = 0;
 
+      modsig.Flags &= ~D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS;
       modsig.Parameters.push_back(D3D12RootSignatureParameter());
       D3D12RootSignatureParameter &param = modsig.Parameters.back();
       param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;

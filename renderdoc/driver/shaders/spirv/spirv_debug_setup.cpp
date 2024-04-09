@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2020-2023 Baldur Karlsson
+ * Copyright (c) 2020-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -721,7 +721,7 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
       case Capability::FPGABufferLocationINTEL:
       case Capability::USMStorageClassesINTEL:
       case Capability::IOPipesINTEL:
-      case Capability::LongConstantCompositeINTEL:
+      case Capability::LongCompositesINTEL:
       case Capability::DebugInfoModuleINTEL:
       case Capability::BindlessTextureNV:
       case Capability::MemoryAccessAliasingINTEL:
@@ -743,6 +743,21 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
       case Capability::FPGAKernelAttributesv2INTEL:
       case Capability::FPGALatencyControlINTEL:
       case Capability::FPGAArgumentInterfacesINTEL:
+      case Capability::TextureBlockMatch2QCOM:
+      case Capability::ShaderEnqueueAMDX:
+      case Capability::QuadControlKHR:
+      case Capability::DisplacementMicromapNV:
+      case Capability::AtomicFloat16VectorNV:
+      case Capability::RayTracingDisplacementMicromapNV:
+      case Capability::CooperativeMatrixKHR:
+      case Capability::FloatControls2:
+      case Capability::FPGAClusterAttributesV2INTEL:
+      case Capability::FPMaxErrorINTEL:
+      case Capability::GlobalVariableFPGADecorationsINTEL:
+      case Capability::MaskedGatherScatterINTEL:
+      case Capability::CacheControlsINTEL:
+      case Capability::RegisterLimitsINTEL:
+      case Capability::GlobalVariableHostAccessINTEL:
       case Capability::Max:
       case Capability::Invalid:
       {
@@ -923,6 +938,12 @@ ShaderDebugTrace *Debugger::BeginDebug(DebugAPIWrapper *api, const ShaderStage s
               StringFormat::Fmt("_%s%u", isInput ? "input" : "output", decorations[v.id].location);
         else
           sourceName = StringFormat::Fmt("_sig%u", v.id.value());
+
+        for(const DecorationAndParamData &d : decorations[v.id].others)
+        {
+          if(d.value == Decoration::Component)
+            sourceName += StringFormat::Fmt("_%u", d.component);
+        }
       }
 
       const DataType &type = dataTypes[v.type];

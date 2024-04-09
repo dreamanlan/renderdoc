@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -40,7 +40,7 @@ class PixelHistoryView : public QFrame, public IPixelHistoryView, public ICaptur
   Q_OBJECT
 
 public:
-  explicit PixelHistoryView(ICaptureContext &ctx, ResourceId id, QPoint point,
+  explicit PixelHistoryView(ICaptureContext &ctx, ResourceId id, QPoint point, uint32_t view,
                             const TextureDisplay &display, QWidget *parent = 0);
   ~PixelHistoryView();
 
@@ -74,6 +74,7 @@ private:
   ResourceId m_ID;
   TextureDisplay m_Display;
   QPoint m_Pixel;
+  uint32_t m_View;
   PixelHistoryItemModel *m_Model;
   bool m_ShowFailures = true;
   void startDebug(EventTag tag);

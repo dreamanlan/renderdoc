@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1215,6 +1215,13 @@ ParsedFormat BufferFormatter::ParseFormatString(const QString &formatString, uin
       if(structContext.singleDef)
       {
         reportError(tr("[[single]] annotated structs can't be used, only defined."));
+        success = false;
+        break;
+      }
+
+      if(!isPointer && structContext.structDef.type.name == cur->structDef.type.name)
+      {
+        reportError(tr("Invalid nested struct declaration, only allowed for pointers."));
         success = false;
         break;
       }

@@ -438,7 +438,35 @@ void DescSetLayout::CreateBindingsArray(BindingStorage &bindingStorage, uint32_t
     if(inlineByteSize == 0)
     {
       for(size_t i = 0; i < bindings.size(); i++)
+      {
         bindingStorage.binds[i] = bindingStorage.elems.data() + bindings[i].elemOffset;
+
+        if(bindings[i].immutableSampler)
+        {
+          for(uint32_t a = 0; a < bindings[i].descriptorCount; a++)
+          {
+            // set immutable samplers here so it's always present in the descriptor and we don't
+            // have to do a per-descriptor lookup of immutable samplers later
+            bindingStorage.binds[i][a].sampler = bindings[i].immutableSampler[a];
+
+            // immutable samplers cannot be used with mutable descriptors, so if we have immutable
+            // samplers set the type from the layout. That way even if the descriptor is never
+            // written we still process immutable samplers properly.
+            bindingStorage.binds[i][a].type = convert(bindings[i].layoutDescType);
+
+            bindingStorage.binds[i][a].offset = 1;
+          }
+        }
+
+        // set the type for dynamic descriptors so we always know which descriptors consume dynamic
+        // offsets, even if they are unwritten.
+        if(bindings[i].layoutDescType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+           bindings[i].layoutDescType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+        {
+          for(uint32_t a = 0; a < bindings[i].descriptorCount; a++)
+            bindingStorage.binds[i][a].type = convert(bindings[i].layoutDescType);
+        }
+      }
 
       bindingStorage.inlineBytes.clear();
     }
@@ -455,6 +483,10 @@ void DescSetLayout::CreateBindingsArray(BindingStorage &bindingStorage, uint32_t
           bindingStorage.binds[i]->offset = inlineOffset;
           bindingStorage.binds[i]->range = bindings[i].descriptorCount;
           inlineOffset = AlignUp4(inlineOffset + bindings[i].descriptorCount);
+
+          // update range with variable allocation here
+          if(bindings[i].variableSize)
+            bindingStorage.binds[i]->range = variableAllocSize;
         }
       }
 
@@ -787,6 +819,144 @@ bool CreateDescriptorWritesForSlotData(WrappedVulkan *vk, rdcarray<VkWriteDescri
   return ret;
 }
 
+void VulkanCreationInfo::Pipeline::Shader::ProcessStaticDescriptorAccess(
+    ResourceId pushStorage, ResourceId specStorage, rdcarray<DescriptorAccess> &descriptorAccess,
+    rdcarray<const DescSetLayout *> setLayoutInfos) const
+{
+  if(!refl)
+    return;
+
+  DescriptorAccess access;
+  access.stage = refl->stage;
+
+  // we will store the descriptor set in byteSize to be decoded into descriptorStore later
+  access.byteSize = 0;
+
+  descriptorAccess.reserve(descriptorAccess.size() + refl->constantBlocks.size() +
+                           refl->samplers.size() + refl->readOnlyResources.size() +
+                           refl->readWriteResources.size());
+
+  RDCASSERT(refl->constantBlocks.size() < 0xffff, refl->constantBlocks.size());
+  for(uint16_t i = 0; i < refl->constantBlocks.size(); i++)
+  {
+    const ConstantBlock &bind = refl->constantBlocks[i];
+    // arrayed descriptors will be handled with bindless feedback
+    if(bind.bindArraySize > 1)
+      continue;
+
+    access.type = DescriptorType::ConstantBuffer;
+    access.index = i;
+
+    if(!bind.bufferBacked)
+    {
+      if(bind.compileConstants)
+      {
+        // spec constants
+        access.descriptorStore = specStorage;
+        access.byteSize = 1;
+        access.byteOffset = 0;
+        descriptorAccess.push_back(access);
+      }
+      else
+      {
+        // push constants
+        access.descriptorStore = pushStorage;
+        access.byteSize = 1;
+        access.byteOffset = 0;
+        descriptorAccess.push_back(access);
+      }
+    }
+    else
+    {
+      access.descriptorStore = ResourceId();
+
+      // VkShaderStageFlagBits and ShaderStageMask are identical bit-for-bit.
+      // this might be deliberate if the binding is never actually used dynamically, only
+      // statically used bindings must be declared
+      if((setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].stageFlags &
+          (VkShaderStageFlags)MaskForStage(refl->stage)) == 0)
+        continue;
+
+      access.byteSize = bind.fixedBindSetOrSpace;
+      access.byteOffset =
+          setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset +
+          setLayoutInfos[bind.fixedBindSetOrSpace]->inlineByteSize;
+      descriptorAccess.push_back(access);
+    }
+  }
+
+  access.descriptorStore = ResourceId();
+
+  RDCASSERT(refl->samplers.size() < 0xffff, refl->samplers.size());
+  for(uint16_t i = 0; i < refl->samplers.size(); i++)
+  {
+    const ShaderSampler &bind = refl->samplers[i];
+    // arrayed descriptors will be handled with bindless feedback
+    if(bind.bindArraySize > 1)
+      continue;
+
+    // VkShaderStageFlagBits and ShaderStageMask are identical bit-for-bit.
+    // this might be deliberate if the binding is never actually used dynamically, only
+    // statically used bindings must be declared
+    if((setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].stageFlags &
+        (VkShaderStageFlags)MaskForStage(refl->stage)) == 0)
+      continue;
+
+    access.type = DescriptorType::Sampler;
+    access.index = i;
+    access.byteSize = bind.fixedBindSetOrSpace;
+    access.byteOffset =
+        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset;
+    descriptorAccess.push_back(access);
+  }
+
+  RDCASSERT(refl->readOnlyResources.size() < 0xffff, refl->readOnlyResources.size());
+  for(uint16_t i = 0; i < refl->readOnlyResources.size(); i++)
+  {
+    const ShaderResource &bind = refl->readOnlyResources[i];
+    // arrayed descriptors will be handled with bindless feedback
+    if(bind.bindArraySize > 1)
+      continue;
+
+    // VkShaderStageFlagBits and ShaderStageMask are identical bit-for-bit.
+    // this might be deliberate if the binding is never actually used dynamically, only
+    // statically used bindings must be declared
+    if((setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].stageFlags &
+        (VkShaderStageFlags)MaskForStage(refl->stage)) == 0)
+      continue;
+
+    access.type = refl->readOnlyResources[i].descriptorType;
+    access.index = i;
+    access.byteSize = bind.fixedBindSetOrSpace;
+    access.byteOffset =
+        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset;
+    descriptorAccess.push_back(access);
+  }
+
+  RDCASSERT(refl->readWriteResources.size() < 0xffff, refl->readWriteResources.size());
+  for(uint16_t i = 0; i < refl->readWriteResources.size(); i++)
+  {
+    const ShaderResource &bind = refl->readWriteResources[i];
+    // arrayed descriptors will be handled with bindless feedback
+    if(bind.bindArraySize > 1)
+      continue;
+
+    // VkShaderStageFlagBits and ShaderStageMask are identical bit-for-bit.
+    // this might be deliberate if the binding is never actually used dynamically, only
+    // statically used bindings must be declared
+    if((setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].stageFlags &
+        (VkShaderStageFlags)MaskForStage(refl->stage)) == 0)
+      continue;
+
+    access.type = refl->readWriteResources[i].descriptorType;
+    access.index = i;
+    access.byteSize = bind.fixedBindSetOrSpace;
+    access.byteOffset =
+        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset;
+    descriptorAccess.push_back(access);
+  }
+}
+
 void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
                                         VulkanCreationInfo &info, ResourceId id,
                                         const VkGraphicsPipelineCreateInfo *pCreateInfo)
@@ -893,6 +1063,9 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
         memcpy(&spec.value, data + maps[s].offset, maps[s].size);
         spec.dataSize = maps[s].size;
         shad.specialization.push_back(spec);
+
+        virtualSpecialisationByteSize =
+            RDCMAX(virtualSpecialisationByteSize, uint32_t((spec.specID + 1) * sizeof(uint64_t)));
       }
     }
 
@@ -902,7 +1075,6 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
                   pCreateInfo->pStages[i].stage, shad.specialization);
 
     shad.refl = reflData.refl;
-    shad.mapping = &reflData.mapping;
     shad.patchData = &reflData.patchData;
   }
 
@@ -1457,6 +1629,15 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
       }
     }
   }
+
+  rdcarray<const DescSetLayout *> setLayoutInfos;
+  for(ResourceId setLayout : descSetLayouts)
+    setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
+
+  for(const Shader &shad : shaders)
+    shad.ProcessStaticDescriptorAccess(info.pushConstantDescriptorStorage,
+                                       resourceMan->GetOriginalID(id), staticDescriptorAccess,
+                                       setLayoutInfos);
 }
 
 void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,
@@ -1486,6 +1667,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
 
     shad.module = shadid;
     shad.entryPoint = pCreateInfo->stage.pName;
+    shad.stage = ShaderStage::Compute;
 
     ShaderModuleReflectionKey key(ShaderStage::Compute, shad.entryPoint, ResourceId());
 
@@ -1503,6 +1685,9 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
         memcpy(&spec.value, data + maps[s].offset, maps[s].size);
         spec.dataSize = maps[s].size;
         shad.specialization.push_back(spec);
+
+        virtualSpecialisationByteSize =
+            RDCMAX(virtualSpecialisationByteSize, uint32_t((spec.specID + 1) * sizeof(uint64_t)));
       }
     }
 
@@ -1512,7 +1697,6 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
                   pCreateInfo->stage.stage, shad.specialization);
 
     shad.refl = reflData.refl;
-    shad.mapping = &reflData.mapping;
     shad.patchData = &reflData.patchData;
   }
 
@@ -1555,6 +1739,15 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
   alphaToCoverageEnable = false;
   logicOpEnable = false;
   logicOp = VK_LOGIC_OP_NO_OP;
+
+  rdcarray<const DescSetLayout *> setLayoutInfos;
+  for(ResourceId setLayout : descSetLayouts)
+    setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
+
+  for(const Shader &shad : shaders)
+    shad.ProcessStaticDescriptorAccess(info.pushConstantDescriptorStorage,
+                                       resourceMan->GetOriginalID(id), staticDescriptorAccess,
+                                       setLayoutInfos);
 }
 
 void VulkanCreationInfo::PipelineLayout::Init(VulkanResourceManager *resourceMan,
@@ -2292,7 +2485,7 @@ void VulkanCreationInfo::ShaderModuleReflection::Init(VulkanResourceManager *res
     stageIndex = StageIndex(stage);
 
     spv.MakeReflection(GraphicsAPI::Vulkan, ShaderStage(stageIndex), entryPoint, specInfo, *refl,
-                       mapping, patchData);
+                       patchData);
 
     refl->resourceId = resourceMan->GetOriginalID(id);
   }

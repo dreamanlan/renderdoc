@@ -166,6 +166,11 @@ void VkMarkerRegion::End(VkQueue q)
 }
 
 template <>
+VkObjectType objType<VkBuffer>()
+{
+  return VK_OBJECT_TYPE_BUFFER;
+}
+template <>
 VkObjectType objType<VkImage>()
 {
   return VK_OBJECT_TYPE_IMAGE;
@@ -565,6 +570,8 @@ VkShaderStageFlags ShaderMaskFromIndex(size_t index)
       VK_SHADER_STAGE_TASK_BIT_EXT,
       VK_SHADER_STAGE_MESH_BIT_EXT,
   };
+
+  RDCCOMPILE_ASSERT(ARRAY_COUNT(mask) == NumShaderStages, "Array is out of date");
 
   if(index < ARRAY_COUNT(mask))
     return mask[index];

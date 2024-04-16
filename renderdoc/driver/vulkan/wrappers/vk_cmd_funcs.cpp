@@ -1090,9 +1090,15 @@ bool WrappedVulkan::Serialise_vkBeginCommandBuffer(SerialiserType &ser, VkComman
     if(IsLoading(m_State))
     {
       for(int p = 0; p < 2; p++)
+      {
         for(size_t i = 0; i < ARRAY_COUNT(BakedCmdBufferInfo::pushDescriptorID[p]); i++)
-          m_BakedCmdBufferInfo[BakedCommandBuffer].pushDescriptorID[p][i] =
-              ResourceIDGen::GetNewUniqueID();
+        {
+          VkDescriptorSet descset = MakeFakePushDescSet();
+          ResourceId id = GetResourceManager()->WrapResource(Unwrap(device), descset);
+          m_BakedCmdBufferInfo[BakedCommandBuffer].pushDescriptorID[p][i] = id;
+          GetResourceManager()->AddLiveResource(id, descset);
+        }
+      }
     }
 
     // clear/invalidate descriptor set state for this command buffer.
@@ -3919,6 +3925,8 @@ bool WrappedVulkan::Serialise_vkCmdPushConstants(SerialiserType &ser, VkCommandB
 
           renderstate.pushConstSize = RDCMAX(renderstate.pushConstSize, start + length);
           renderstate.pushLayout = GetResID(layout);
+
+          m_PushCommandBuffer = m_LastCmdBufferID;
         }
       }
     }

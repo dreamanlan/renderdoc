@@ -487,54 +487,62 @@ rdcarray<ID3D12Resource *> WrappedID3D12Resource::AddRefBuffersBeforeCapture(D3D
   return ret;
 }
 
-bool WrappedID3D12DescriptorHeap::HasValidViewCache(uint32_t index)
+void WrappedID3D12DescriptorHeap::MarkMutableIndex(uint32_t index)
 {
-  if(!mutableViewBitmask)
+  if(!mutableDescriptorBitmask)
+    return;
+
+  mutableDescriptorBitmask[index / 64] |= (1ULL << (index % 64));
+}
+
+bool WrappedID3D12DescriptorHeap::HasValidDescriptorCache(uint32_t index)
+{
+  if(!mutableDescriptorBitmask)
     return false;
 
   // don't cache mutable views. In theory we could but we'd need to know which ones were modified
   // mid-frame, to mark the cache as stale when initial contents are re-applied. This optimisation
   // is aimed at the assumption of a huge number of descriptors that don't change so we just don't
   // cache ones that change mid-frame
-  if((mutableViewBitmask[index / 64] & (1ULL << (index % 64))) != 0)
+  if((mutableDescriptorBitmask[index / 64] & (1ULL << (index % 64))) != 0)
     return false;
+
+  EnsureDescriptorCache();
 
   // anything that's not mutable is valid once it's been set at least once. Since we
   // zero-initialise, we use bind as a flag (it isn't retrieved from the cache since it depends on
   // the binding)
-  return cachedViews[index].bind == 1;
+  return cachedDescriptors[index].type != DescriptorType::Unknown;
 }
 
-void WrappedID3D12DescriptorHeap::MarkMutableView(uint32_t index)
+void WrappedID3D12DescriptorHeap::GetFromDescriptorCache(uint32_t index, Descriptor &view)
 {
-  if(!mutableViewBitmask)
+  if(!mutableDescriptorBitmask)
     return;
 
-  mutableViewBitmask[index / 64] |= (1ULL << (index % 64));
+  EnsureDescriptorCache();
+
+  view = cachedDescriptors[index];
 }
 
-void WrappedID3D12DescriptorHeap::GetFromViewCache(uint32_t index, D3D12Pipe::View &view)
+void WrappedID3D12DescriptorHeap::EnsureDescriptorCache()
 {
-  if(!mutableViewBitmask)
-    return;
-
-  bool dynamicallyUsed = view.dynamicallyUsed;
-  uint32_t bind = view.bind;
-  uint32_t tableIndex = view.tableIndex;
-  view = cachedViews[index];
-  view.dynamicallyUsed = dynamicallyUsed;
-  view.bind = bind;
-  view.tableIndex = tableIndex;
+  if(!cachedDescriptors)
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC desc = GetDesc();
+    cachedDescriptors = new Descriptor[desc.NumDescriptors];
+    RDCEraseMem(cachedDescriptors, sizeof(Descriptor) * desc.NumDescriptors);
+  }
 }
 
-void WrappedID3D12DescriptorHeap::SetToViewCache(uint32_t index, const D3D12Pipe::View &view)
+void WrappedID3D12DescriptorHeap::SetToDescriptorCache(uint32_t index, const Descriptor &view)
 {
-  if(!mutableViewBitmask)
+  if(!mutableDescriptorBitmask)
     return;
 
-  cachedViews[index] = view;
-  // we re-use bind as the indicator that this view is valid
-  cachedViews[index].bind = 1;
+  EnsureDescriptorCache();
+
+  cachedDescriptors[index] = view;
 }
 
 WrappedID3D12DescriptorHeap::WrappedID3D12DescriptorHeap(ID3D12DescriptorHeap *real,
@@ -562,16 +570,15 @@ WrappedID3D12DescriptorHeap::WrappedID3D12DescriptorHeap(ID3D12DescriptorHeap *r
   {
     size_t bitmaskSize = AlignUp(desc.NumDescriptors, 64U) / 64;
 
-    cachedViews = new D3D12Pipe::View[desc.NumDescriptors];
-    RDCEraseMem(cachedViews, sizeof(D3D12Pipe::View) * desc.NumDescriptors);
+    cachedDescriptors = NULL;
 
-    mutableViewBitmask = new uint64_t[bitmaskSize];
-    RDCEraseMem(mutableViewBitmask, sizeof(uint64_t) * bitmaskSize);
+    mutableDescriptorBitmask = new uint64_t[bitmaskSize];
+    RDCEraseMem(mutableDescriptorBitmask, sizeof(uint64_t) * bitmaskSize);
   }
   else
   {
-    cachedViews = NULL;
-    mutableViewBitmask = NULL;
+    cachedDescriptors = NULL;
+    mutableDescriptorBitmask = NULL;
   }
 }
 
@@ -579,8 +586,8 @@ WrappedID3D12DescriptorHeap::~WrappedID3D12DescriptorHeap()
 {
   Shutdown();
   SAFE_DELETE_ARRAY(descriptors);
-  SAFE_DELETE_ARRAY(cachedViews);
-  SAFE_DELETE_ARRAY(mutableViewBitmask);
+  SAFE_DELETE_ARRAY(cachedDescriptors);
+  SAFE_DELETE_ARRAY(mutableDescriptorBitmask);
 }
 
 void WrappedID3D12PipelineState::ShaderEntry::BuildReflection()
@@ -589,8 +596,198 @@ void WrappedID3D12PipelineState::ShaderEntry::BuildReflection()
       D3Dx_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT == D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT,
       "Mismatched vertex input count");
 
-  MakeShaderReflection(m_DXBCFile, m_Details, &m_Mapping);
+  MakeShaderReflection(m_DXBCFile, m_Details);
   m_Details->resourceId = GetResourceID();
+}
+
+rdcpair<uint32_t, uint32_t> FindMatchingRootParameter(const D3D12RootSignature *sig,
+                                                      D3D12_SHADER_VISIBILITY visibility,
+                                                      D3D12_DESCRIPTOR_RANGE_TYPE rangeType,
+                                                      uint32_t space, uint32_t bind)
+{
+  // search the root signature to find the matching entry and figure out the offset from the root binding
+  for(uint32_t root = 0; root < sig->Parameters.size(); root++)
+  {
+    const D3D12RootSignatureParameter &param = sig->Parameters[root];
+
+    if(param.ShaderVisibility != visibility && param.ShaderVisibility != D3D12_SHADER_VISIBILITY_ALL)
+      continue;
+
+    // identify root parameters
+    if((
+           // root constants
+           (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
+            rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) ||
+           // root CBV
+           (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+            rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) ||
+           // root SRV
+           (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV &&
+            rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) ||
+           // root UAV
+           (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV &&
+            rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV)) &&
+       // and matching space/binding
+       param.Descriptor.RegisterSpace == space && param.Descriptor.ShaderRegister == bind)
+    {
+      // offset is unused since it's just the root parameter, so we indicate that with the offset
+      return {root, ~0U};
+    }
+
+    uint32_t descOffset = 0;
+    for(const D3D12_DESCRIPTOR_RANGE1 &range : param.ranges)
+    {
+      uint32_t rangeOffset = range.OffsetInDescriptorsFromTableStart;
+      if(range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+        rangeOffset = descOffset;
+
+      if(range.RangeType == rangeType && range.RegisterSpace == space &&
+         range.BaseShaderRegister <= bind &&
+         (range.NumDescriptors == ~0U || bind < range.BaseShaderRegister + range.NumDescriptors))
+      {
+        return {root, rangeOffset + (bind - range.BaseShaderRegister)};
+      }
+
+      descOffset = rangeOffset + range.NumDescriptors;
+    }
+  }
+
+  // if not found above, and looking for samplers, look at static samplers next
+  if(rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+  {
+    // indicate that we're looking up static samplers
+    uint32_t numRoots = (uint32_t)sig->Parameters.size();
+    for(uint32_t samp = 0; samp < sig->StaticSamplers.size(); samp++)
+    {
+      if(sig->StaticSamplers[samp].RegisterSpace == space &&
+         sig->StaticSamplers[samp].ShaderRegister == bind)
+      {
+        return {numRoots, samp};
+      }
+    }
+  }
+
+  return {~0U, 0};
+}
+
+void WrappedID3D12PipelineState::ProcessDescriptorAccess()
+{
+  if(m_AccessProcessed)
+    return;
+  m_AccessProcessed = true;
+
+  const D3D12RootSignature *sig = NULL;
+  if(graphics)
+    sig = &((WrappedID3D12RootSignature *)graphics->pRootSignature)->sig;
+  else if(compute)
+    sig = &((WrappedID3D12RootSignature *)compute->pRootSignature)->sig;
+
+  for(ShaderEntry *shad : {VS(), HS(), DS(), GS(), PS(), AS(), MS(), CS()})
+  {
+    if(!shad)
+      continue;
+
+    const ShaderReflection &refl = shad->GetDetails();
+
+    D3D12_SHADER_VISIBILITY visibility;
+    switch(refl.stage)
+    {
+      case ShaderStage::Vertex: visibility = D3D12_SHADER_VISIBILITY_VERTEX; break;
+      case ShaderStage::Hull: visibility = D3D12_SHADER_VISIBILITY_HULL; break;
+      case ShaderStage::Domain: visibility = D3D12_SHADER_VISIBILITY_DOMAIN; break;
+      case ShaderStage::Geometry: visibility = D3D12_SHADER_VISIBILITY_GEOMETRY; break;
+      case ShaderStage::Pixel: visibility = D3D12_SHADER_VISIBILITY_PIXEL; break;
+      case ShaderStage::Amplification: visibility = D3D12_SHADER_VISIBILITY_AMPLIFICATION; break;
+      case ShaderStage::Mesh: visibility = D3D12_SHADER_VISIBILITY_MESH; break;
+      default: visibility = D3D12_SHADER_VISIBILITY_ALL; break;
+    }
+
+    DescriptorAccess access;
+    access.stage = refl.stage;
+
+    // we will store the root signature element in byteSize to be decoded into descriptorStore later
+    access.byteSize = 0;
+
+    staticDescriptorAccess.reserve(staticDescriptorAccess.size() + refl.constantBlocks.size() +
+                                   refl.samplers.size() + refl.readOnlyResources.size() +
+                                   refl.readWriteResources.size());
+
+    RDCASSERT(refl.constantBlocks.size() < 0xffff, refl.constantBlocks.size());
+    for(uint16_t i = 0; i < refl.constantBlocks.size(); i++)
+    {
+      const ConstantBlock &bind = refl.constantBlocks[i];
+
+      // arrayed descriptors will be handled with bindless feedback
+      if(bind.bindArraySize > 1)
+        continue;
+
+      access.type = DescriptorType::ConstantBuffer;
+      access.index = i;
+      rdctie(access.byteSize, access.byteOffset) =
+          FindMatchingRootParameter(sig, visibility, D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                                    bind.fixedBindSetOrSpace, bind.fixedBindNumber);
+
+      if(access.byteSize != ~0U)
+        staticDescriptorAccess.push_back(access);
+    }
+
+    RDCASSERT(refl.samplers.size() < 0xffff, refl.samplers.size());
+    for(uint16_t i = 0; i < refl.samplers.size(); i++)
+    {
+      const ShaderSampler &bind = refl.samplers[i];
+
+      // arrayed descriptors will be handled with bindless feedback
+      if(bind.bindArraySize > 1)
+        continue;
+
+      access.type = DescriptorType::Sampler;
+      access.index = i;
+      rdctie(access.byteSize, access.byteOffset) =
+          FindMatchingRootParameter(sig, visibility, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+                                    bind.fixedBindSetOrSpace, bind.fixedBindNumber);
+
+      if(access.byteSize != ~0U)
+        staticDescriptorAccess.push_back(access);
+    }
+
+    RDCASSERT(refl.readOnlyResources.size() < 0xffff, refl.readOnlyResources.size());
+    for(uint16_t i = 0; i < refl.readOnlyResources.size(); i++)
+    {
+      const ShaderResource &bind = refl.readOnlyResources[i];
+
+      // arrayed descriptors will be handled with bindless feedback
+      if(bind.bindArraySize > 1)
+        continue;
+
+      access.type = refl.readOnlyResources[i].descriptorType;
+      access.index = i;
+      rdctie(access.byteSize, access.byteOffset) =
+          FindMatchingRootParameter(sig, visibility, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                                    bind.fixedBindSetOrSpace, bind.fixedBindNumber);
+
+      if(access.byteSize != ~0U)
+        staticDescriptorAccess.push_back(access);
+    }
+
+    RDCASSERT(refl.readWriteResources.size() < 0xffff, refl.readWriteResources.size());
+    for(uint16_t i = 0; i < refl.readWriteResources.size(); i++)
+    {
+      const ShaderResource &bind = refl.readWriteResources[i];
+
+      // arrayed descriptors will be handled with bindless feedback
+      if(bind.bindArraySize > 1)
+        continue;
+
+      access.type = refl.readWriteResources[i].descriptorType;
+      access.index = i;
+      rdctie(access.byteSize, access.byteOffset) =
+          FindMatchingRootParameter(sig, visibility, D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                                    bind.fixedBindSetOrSpace, bind.fixedBindNumber);
+
+      if(access.byteSize != ~0U)
+        staticDescriptorAccess.push_back(access);
+    }
+  }
 }
 
 UINT GetPlaneForSubresource(ID3D12Resource *res, int Subresource)

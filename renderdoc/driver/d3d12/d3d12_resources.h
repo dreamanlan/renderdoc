@@ -29,6 +29,10 @@
 #include "d3d12_device.h"
 #include "d3d12_manager.h"
 
+rdcpair<uint32_t, uint32_t> FindMatchingRootParameter(const D3D12RootSignature *sig,
+                                                      D3D12_SHADER_VISIBILITY visibility,
+                                                      D3D12_DESCRIPTOR_RANGE_TYPE rangeType,
+                                                      uint32_t space, uint32_t bind);
 UINT GetPlaneForSubresource(ID3D12Resource *res, int Subresource);
 UINT GetMipForSubresource(ID3D12Resource *res, int Subresource);
 UINT GetSliceForSubresource(ID3D12Resource *res, int Subresource);
@@ -395,8 +399,8 @@ class WrappedID3D12DescriptorHeap : public WrappedDeviceChild12<ID3D12Descriptor
 
   D3D12Descriptor *descriptors;
 
-  D3D12Pipe::View *cachedViews;
-  uint64_t *mutableViewBitmask;
+  Descriptor *cachedDescriptors;
+  uint64_t *mutableDescriptorBitmask;
 
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12DescriptorHeap);
@@ -412,10 +416,13 @@ public:
 
   D3D12Descriptor *GetDescriptors() { return descriptors; }
   UINT GetNumDescriptors() { return numDescriptors; }
-  bool HasValidViewCache(uint32_t index);
-  void MarkMutableView(uint32_t index);
-  void GetFromViewCache(uint32_t index, D3D12Pipe::View &view);
-  void SetToViewCache(uint32_t index, const D3D12Pipe::View &view);
+
+  void MarkMutableIndex(uint32_t index);
+
+  void EnsureDescriptorCache();
+  bool HasValidDescriptorCache(uint32_t index);
+  void GetFromDescriptorCache(uint32_t index, Descriptor &view);
+  void SetToDescriptorCache(uint32_t index, const Descriptor &view);
 
   //////////////////////////////
   // implement ID3D12DescriptorHeap
@@ -625,6 +632,9 @@ public:
   D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC *graphics = NULL;
   D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC *compute = NULL;
 
+  rdcarray<DescriptorAccess> staticDescriptorAccess;
+  bool m_AccessProcessed = false;
+
   void Fill(D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC &desc)
   {
     if(graphics)
@@ -821,14 +831,6 @@ public:
       return *m_Details;
     }
 
-    const ShaderBindpointMapping &GetMapping()
-    {
-      if(!m_Built && GetDXBC() != NULL)
-        BuildReflection();
-      m_Built = true;
-      return m_Mapping;
-    }
-
   private:
     void TryReplaceOriginalByteCode();
 
@@ -842,7 +844,6 @@ public:
     bool m_Built;
     DXBC::DXBCContainer *m_DXBCFile;
     ShaderReflection *m_Details;
-    ShaderBindpointMapping m_Mapping;
 
     static std::map<DXBCKey, ShaderEntry *> m_Shaders;
   };
@@ -852,14 +853,14 @@ public:
     TypeEnum = Resource_PipelineState,
   };
 
-  ShaderEntry *VS() { return (ShaderEntry *)graphics->VS.pShaderBytecode; }
-  ShaderEntry *HS() { return (ShaderEntry *)graphics->HS.pShaderBytecode; }
-  ShaderEntry *DS() { return (ShaderEntry *)graphics->DS.pShaderBytecode; }
-  ShaderEntry *GS() { return (ShaderEntry *)graphics->GS.pShaderBytecode; }
-  ShaderEntry *PS() { return (ShaderEntry *)graphics->PS.pShaderBytecode; }
-  ShaderEntry *AS() { return (ShaderEntry *)graphics->AS.pShaderBytecode; }
-  ShaderEntry *MS() { return (ShaderEntry *)graphics->MS.pShaderBytecode; }
-  ShaderEntry *CS() { return (ShaderEntry *)compute->CS.pShaderBytecode; }
+  ShaderEntry *VS() { return graphics ? (ShaderEntry *)graphics->VS.pShaderBytecode : NULL; }
+  ShaderEntry *HS() { return graphics ? (ShaderEntry *)graphics->HS.pShaderBytecode : NULL; }
+  ShaderEntry *DS() { return graphics ? (ShaderEntry *)graphics->DS.pShaderBytecode : NULL; }
+  ShaderEntry *GS() { return graphics ? (ShaderEntry *)graphics->GS.pShaderBytecode : NULL; }
+  ShaderEntry *PS() { return graphics ? (ShaderEntry *)graphics->PS.pShaderBytecode : NULL; }
+  ShaderEntry *AS() { return graphics ? (ShaderEntry *)graphics->AS.pShaderBytecode : NULL; }
+  ShaderEntry *MS() { return graphics ? (ShaderEntry *)graphics->MS.pShaderBytecode : NULL; }
+  ShaderEntry *CS() { return compute ? (ShaderEntry *)compute->CS.pShaderBytecode : NULL; }
   WrappedID3D12PipelineState(ID3D12PipelineState *real, WrappedID3D12Device *device)
       : WrappedDeviceChild12(real, device)
   {
@@ -898,6 +899,8 @@ public:
       SAFE_DELETE(compute);
     }
   }
+
+  void ProcessDescriptorAccess();
 
   //////////////////////////////
   // implement ID3D12PipelineState

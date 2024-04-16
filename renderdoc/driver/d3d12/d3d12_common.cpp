@@ -660,22 +660,22 @@ TextureFilter MakeFilter(D3D12_FILTER filter)
   return ret;
 }
 
-D3DBufferViewFlags MakeBufferFlags(D3D12_BUFFER_SRV_FLAGS flags)
+DescriptorFlags MakeDescriptorFlags(D3D12_BUFFER_SRV_FLAGS flags)
 {
-  D3DBufferViewFlags ret = D3DBufferViewFlags::NoFlags;
+  DescriptorFlags ret = DescriptorFlags::NoFlags;
 
   if(flags & D3D12_BUFFER_SRV_FLAG_RAW)
-    ret |= D3DBufferViewFlags::Raw;
+    ret |= DescriptorFlags::RawBuffer;
 
   return ret;
 }
 
-D3DBufferViewFlags MakeBufferFlags(D3D12_BUFFER_UAV_FLAGS flags)
+DescriptorFlags MakeDescriptorFlags(D3D12_BUFFER_UAV_FLAGS flags)
 {
-  D3DBufferViewFlags ret = D3DBufferViewFlags::NoFlags;
+  DescriptorFlags ret = DescriptorFlags::NoFlags;
 
   if(flags & D3D12_BUFFER_UAV_FLAG_RAW)
-    ret |= D3DBufferViewFlags::Raw;
+    ret |= DescriptorFlags::RawBuffer;
 
   return ret;
 }
@@ -1067,6 +1067,50 @@ rdcstr PIX3DecodeEventString(const UINT64 *pData, UINT64 &color)
   // sprintf remaining args
   formatString = PIX3SprintfParams(formatString, pData);
   return formatString;
+}
+
+D3D12_SAMPLER_DESC2 ConvertStaticSampler(const D3D12_STATIC_SAMPLER_DESC1 &samp)
+{
+  D3D12_SAMPLER_DESC2 desc;
+  desc.Filter = samp.Filter;
+  desc.AddressU = samp.AddressU;
+  desc.AddressV = samp.AddressV;
+  desc.AddressW = samp.AddressW;
+  desc.MipLODBias = samp.MipLODBias;
+  desc.MaxAnisotropy = samp.MaxAnisotropy;
+  desc.ComparisonFunc = samp.ComparisonFunc;
+  switch(samp.BorderColor)
+  {
+    default:
+    case D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK:
+      desc.FloatBorderColor[0] = desc.FloatBorderColor[1] = desc.FloatBorderColor[2] =
+          desc.FloatBorderColor[3] = 0.0f;
+      break;
+    case D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK:
+      desc.FloatBorderColor[0] = desc.FloatBorderColor[1] = desc.FloatBorderColor[2] = 0.0f;
+      desc.FloatBorderColor[3] = 1.0f;
+      break;
+    case D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE:
+      desc.FloatBorderColor[0] = desc.FloatBorderColor[1] = desc.FloatBorderColor[2] =
+          desc.FloatBorderColor[3] = 1.0f;
+      break;
+    case D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT:
+      desc.UintBorderColor[0] = desc.UintBorderColor[1] = desc.UintBorderColor[2] = 0;
+      desc.UintBorderColor[3] = 1;
+      // this flag is optional in D3D, add it here to ensure we can check it elsewhere
+      desc.Flags |= D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+      break;
+    case D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT:
+      desc.UintBorderColor[0] = desc.UintBorderColor[1] = desc.UintBorderColor[2] =
+          desc.UintBorderColor[3] = 1;
+      // this flag is optional in D3D, add it here to ensure we can check it elsewhere
+      desc.Flags |= D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR;
+      break;
+  }
+  desc.MinLOD = samp.MinLOD;
+  desc.MaxLOD = samp.MaxLOD;
+  desc.Flags = samp.Flags;
+  return desc;
 }
 
 D3D12_DEPTH_STENCILOP_DESC1 Upconvert(const D3D12_DEPTH_STENCILOP_DESC &face)

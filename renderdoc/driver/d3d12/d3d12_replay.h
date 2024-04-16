@@ -114,6 +114,9 @@ public:
   ResourceDescription &GetResourceDesc(ResourceId id);
   rdcarray<ResourceDescription> GetResources();
 
+  rdcarray<DescriptorStoreDescription> GetDescriptorStores();
+  void RegisterDescriptorStore(const DescriptorStoreDescription &desc);
+
   rdcarray<BufferDescription> GetBuffers();
   BufferDescription GetBuffer(ResourceId id);
 
@@ -138,6 +141,13 @@ public:
     m_D3D12PipelineState = d3d12;
   }
   void SavePipelineState(uint32_t eventId);
+  rdcarray<Descriptor> GetDescriptors(ResourceId descriptorStore,
+                                      const rdcarray<DescriptorRange> &ranges);
+  rdcarray<SamplerDescriptor> GetSamplerDescriptors(ResourceId descriptorStore,
+                                                    const rdcarray<DescriptorRange> &ranges);
+  rdcarray<DescriptorAccess> GetDescriptorAccess(uint32_t eventId);
+  rdcarray<DescriptorLogicalLocation> GetDescriptorLocations(ResourceId descriptorStore,
+                                                             const rdcarray<DescriptorRange> &ranges);
   void FreeTargetResource(ResourceId id);
   void FreeCustomShader(ResourceId id);
 
@@ -261,11 +271,9 @@ public:
                         bool dxil);
 
 private:
-  void FillRootElements(uint32_t eventId, const D3D12RenderState::RootSignature &rootSig,
-                        const ShaderBindpointMapping *mappings[NumShaderStages],
-                        rdcarray<D3D12Pipe::RootSignatureRange> &rootElements);
-  void FillResourceView(D3D12Pipe::View &view, const D3D12Descriptor *desc);
-  void FillSampler(D3D12Pipe::Sampler &view, const D3D12_SAMPLER_DESC2 &desc);
+  void FillDescriptor(Descriptor &dst, const D3D12Descriptor *src);
+  void FillRootDescriptor(Descriptor &dst, const D3D12RenderState::SignatureElement &src);
+  void FillSamplerDescriptor(SamplerDescriptor &dst, const D3D12_SAMPLER_DESC2 &src);
 
   bool CreateSOBuffers();
   void ClearPostVSCache();
@@ -291,7 +299,7 @@ private:
   struct D3D12DynamicShaderFeedback
   {
     bool compute = false, valid = false;
-    rdcarray<D3D12FeedbackBindIdentifier> used;
+    rdcarray<DescriptorAccess> access;
   };
 
   struct Feedback
@@ -537,6 +545,7 @@ private:
   } m_Histogram;
 
   rdcarray<ResourceDescription> m_Resources;
+  rdcarray<DescriptorStoreDescription> m_DescriptorStores;
   std::map<ResourceId, size_t> m_ResourceIdx;
 
   bool m_ISAChecked = false;

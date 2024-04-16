@@ -118,8 +118,8 @@ TextureType MakeTextureDim(D3D12_UAV_DIMENSION dim);
 AddressMode MakeAddressMode(D3D12_TEXTURE_ADDRESS_MODE addr);
 CompareFunction MakeCompareFunc(D3D12_COMPARISON_FUNC func);
 TextureFilter MakeFilter(D3D12_FILTER filter);
-D3DBufferViewFlags MakeBufferFlags(D3D12_BUFFER_SRV_FLAGS flags);
-D3DBufferViewFlags MakeBufferFlags(D3D12_BUFFER_UAV_FLAGS flags);
+DescriptorFlags MakeDescriptorFlags(D3D12_BUFFER_SRV_FLAGS flags);
+DescriptorFlags MakeDescriptorFlags(D3D12_BUFFER_UAV_FLAGS flags);
 LogicOperation MakeLogicOp(D3D12_LOGIC_OP op);
 BlendMultiplier MakeBlendMultiplier(D3D12_BLEND blend, bool alpha);
 BlendOperation MakeBlendOp(D3D12_BLEND_OP op);
@@ -231,6 +231,7 @@ struct BarrierSet
 
 D3D12_DEPTH_STENCIL_DESC2 Upconvert(const D3D12_DEPTH_STENCIL_DESC1 &desc);
 D3D12_RASTERIZER_DESC2 Upconvert(const D3D12_RASTERIZER_DESC &desc);
+D3D12_SAMPLER_DESC2 ConvertStaticSampler(const D3D12_STATIC_SAMPLER_DESC1 &samp);
 
 ShaderStageMask ConvertVisibility(D3D12_SHADER_VISIBILITY ShaderVisibility);
 UINT GetNumSubresources(ID3D12Device *dev, const D3D12_RESOURCE_DESC *desc);

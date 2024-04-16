@@ -109,6 +109,13 @@ struct DescSetLayout
     VkShaderStageFlags stageFlags : 31;
     uint32_t variableSize : 1;
     ResourceId *immutableSampler;
+
+    inline uint32_t GetDescriptorCount(uint32_t varDescriptorSize) const
+    {
+      if(variableSize)
+        return varDescriptorSize;
+      return descriptorCount;
+    }
   };
   rdcarray<Binding> bindings;
 
@@ -205,7 +212,6 @@ struct VulkanCreationInfo
     rdcstr entryPoint;
     rdcstr disassembly;
     ShaderReflection *refl;
-    ShaderBindpointMapping mapping;
     SPIRVPatchData patchData;
     std::map<size_t, uint32_t> instructionLines;
 
@@ -268,15 +274,24 @@ struct VulkanCreationInfo
       ShaderStage stage = ShaderStage::Count;
       rdcstr entryPoint;
       ShaderReflection *refl = NULL;
-      ShaderBindpointMapping *mapping = NULL;
       SPIRVPatchData *patchData = NULL;
 
       rdcarray<SpecConstant> specialization;
 
       // VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
       uint32_t requiredSubgroupSize = 0;
+
+      void ProcessStaticDescriptorAccess(ResourceId pushStorage, ResourceId specStorage,
+                                         rdcarray<DescriptorAccess> &staticDescriptorAccess,
+                                         rdcarray<const DescSetLayout *> setLayoutInfos) const;
     };
     Shader shaders[NumShaderStages];
+
+    // this is the total size of the 'virtualised' specialisation data, where all constants are stored
+    // 64-bit aligned and with an offset equal to their ID. In other words this is big enough for the max ID
+    uint32_t virtualSpecialisationByteSize = 0;
+
+    rdcarray<DescriptorAccess> staticDescriptorAccess;
 
     // VkPipelineVertexInputStateCreateInfo
     struct VertBinding
@@ -730,6 +745,9 @@ struct VulkanCreationInfo
 
   // just contains the queueFamilyIndex (after remapping)
   std::unordered_map<ResourceId, uint32_t> m_Queue;
+
+  // the fake ID of the 'command buffer' descriptor store for push constants
+  ResourceId pushConstantDescriptorStorage;
 
   void erase(ResourceId id)
   {

@@ -651,7 +651,7 @@ void Reflector::RegisterOp(Iter it)
   {
     loopBlocks.insert(curBlock);
   }
-  else if(opdata.op == Op::ExtInst)
+  else if(opdata.op == Op::ExtInst || opdata.op == Op::ExtInstWithForwardRefsKHR)
   {
     OpShaderDbg dbg(it);
 
@@ -851,6 +851,14 @@ void Reflector::PostParse()
       {
         type.name = StringFormat::Fmt("Sampled%s",
                                       dataTypes[sampledImageTypes[type.id].baseId].name.c_str());
+      }
+      else if(type.type == DataType::RayQueryType)
+      {
+        type.name = StringFormat::Fmt("rayQuery%u", type.id.value());
+      }
+      else if(type.type == DataType::AccelerationStructureType)
+      {
+        type.name = StringFormat::Fmt("accelerationStructure%u", type.id.value());
       }
     }
   }
@@ -1120,8 +1128,10 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
             if(topLevelChildChain.find(access.base) != topLevelChildChain.end())
               globalId = topLevelChildChain[access.base];
 
-            usedStructChildren[globalId].insert(
-                EvaluateConstant(access.indexes[0], specInfo).value.u32v[0]);
+            // It is legal to have zero indexes
+            if(!access.indexes.empty())
+              usedStructChildren[globalId].insert(
+                  EvaluateConstant(access.indexes[0], specInfo).value.u32v[0]);
           }
         }
 
@@ -1146,6 +1156,15 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
     usedIds.clear();
     usedIds.insert(entry->usedIds.begin(), entry->usedIds.end());
   }
+  else
+  {
+    // before that, still consider all entry interface used just not exclusively
+    usedIds.insert(entry->usedIds.begin(), entry->usedIds.end());
+  }
+
+  patchData.usedIds.reserve(usedIds.size());
+  for(Id id : usedIds)
+    patchData.usedIds.push_back(id);
 
   // arrays of elements, which can be appended to in any order and then sorted
   rdcarray<SigParameter> inputs;
@@ -1437,6 +1456,15 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
           samp.bindArraySize = arraySize;
 
           samplers.push_back(sortedsamp(global.id, samp));
+        }
+        else if(varType->type == DataType::AccelerationStructureType)
+        {
+          res.descriptorType = DescriptorType::AccelerationStructure;
+          res.variableType.baseType = VarType::ReadOnlyResource;
+          res.isTexture = false;
+          res.isReadOnly = true;
+
+          roresources.push_back(sortedres(global.id, res));
         }
         else
         {

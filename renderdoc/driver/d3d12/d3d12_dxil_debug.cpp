@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,43 +22,6 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include <dlfcn.h>
-#include "hooks/hooks.h"
+#pragma once
 
-// No hooks needed for GGP.
-void LibraryHooks::BeginHookRegistration()
-{
-}
-
-bool LibraryHooks::Detect(const char *identifier)
-{
-  return dlsym(RTLD_DEFAULT, identifier) != NULL;
-}
-
-void LibraryHooks::EndHookRegistration()
-{
-}
-
-void LibraryHooks::RemoveHooks()
-{
-}
-
-void LibraryHooks::ReplayInitialise()
-{
-}
-
-void LibraryHooks::Refresh()
-{
-}
-
-void LibraryHooks::IgnoreLibrary(const char *libraryName)
-{
-}
-
-void LibraryHooks::RegisterLibraryHook(char const *name, FunctionLoadCallback cb)
-{
-}
-
-void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionHook &hook)
-{
-}
+#include "d3d12_dxil_debug.h"

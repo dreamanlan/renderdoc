@@ -1364,6 +1364,12 @@ void MakeShaderReflection(GLenum shadType, GLuint sepProg, ShaderReflection &ref
       res.variableType.name = "samplerCubeArray";
       res.variableType.baseType = VarType::Float;
     }
+    else if(values[0] == eGL_SAMPLER_CUBE_MAP_ARRAY_SHADOW)
+    {
+      res.textureType = TextureType::TextureCubeArray;
+      res.variableType.name = "samplerCubeArrayShadow";
+      res.variableType.baseType = VarType::Float;
+    }
     else if(values[0] == eGL_SAMPLER_2D_MULTISAMPLE)
     {
       res.textureType = TextureType::Texture2DMS;
@@ -2414,14 +2420,6 @@ void EvaluateVertexAttributeBinds(GLuint curProg, const ShaderReflection *refl, 
 
   if(!refl)
     return;
-
-  if(spirv)
-  {
-    for(size_t i = 0; i < refl->inputSignature.size(); i++)
-      if(refl->inputSignature[i].systemValue == ShaderBuiltin::Undefined)
-
-        return;
-  }
 
   for(int32_t i = 0; i < refl->inputSignature.count(); i++)
   {

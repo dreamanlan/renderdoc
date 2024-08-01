@@ -163,8 +163,7 @@ static void StripUnwantedExtensions(rdcarray<rdcstr> &Extensions)
     if(ext == "VK_KHR_xlib_surface" || ext == "VK_KHR_xcb_surface" ||
        ext == "VK_KHR_wayland_surface" || ext == "VK_KHR_mir_surface" ||
        ext == "VK_MVK_macos_surface" || ext == "VK_KHR_android_surface" ||
-       ext == "VK_KHR_win32_surface" || ext == "VK_GGP_stream_descriptor_surface" ||
-       ext == "VK_GGP_frame_token")
+       ext == "VK_KHR_win32_surface")
     {
       return true;
     }
@@ -3310,6 +3309,42 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         CHECK_PHYS_EXT_FEATURE(nestedCommandBuffer);
         CHECK_PHYS_EXT_FEATURE(nestedCommandBufferRendering);
         CHECK_PHYS_EXT_FEATURE(nestedCommandBufferSimultaneousUse);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderObjectFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderObject);
+
+        m_ShaderObject = ext->shaderObject != VK_FALSE;
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceShaderRelaxedExtendedInstructionFeaturesKHR,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_RELAXED_EXTENDED_INSTRUCTION_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderRelaxedExtendedInstruction);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceRayTracingPipelineFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(rayTracingPipeline);
+        CHECK_PHYS_EXT_FEATURE(rayTracingPipelineShaderGroupHandleCaptureReplay);
+        CHECK_PHYS_EXT_FEATURE(rayTracingPipelineShaderGroupHandleCaptureReplayMixed);
+        CHECK_PHYS_EXT_FEATURE(rayTracingPipelineTraceRaysIndirect);
+        CHECK_PHYS_EXT_FEATURE(rayTraversalPrimitiveCulling);
+
+        VkPhysicalDeviceRayTracingPipelinePropertiesKHR rayProps = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR,
+        };
+
+        VkPhysicalDeviceProperties2 availPropsBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        availPropsBase.pNext = &rayProps;
+        ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), &availPropsBase);
       }
       END_PHYS_EXT_CHECK();
     }

@@ -34,6 +34,11 @@ COM_SMARTPTR(ID3DBlob);
 COM_SMARTPTR(ID3D12Debug);
 COM_SMARTPTR(ID3D12Debug1);
 
+COM_SMARTPTR(ID3D12SDKConfiguration);
+COM_SMARTPTR(ID3D12SDKConfiguration1);
+COM_SMARTPTR(ID3D12DeviceFactory);
+COM_SMARTPTR(ID3D12DeviceConfiguration);
+
 COM_SMARTPTR(ID3D12Device);
 COM_SMARTPTR(ID3D12Device1);
 COM_SMARTPTR(ID3D12Device2);
@@ -83,6 +88,8 @@ public:
   D3D12PSOCreator(ID3D12DevicePtr dev);
 
   D3D12PSOCreator &VS(ID3DBlobPtr blob);
+  D3D12PSOCreator &AS(ID3DBlobPtr blob);
+  D3D12PSOCreator &MS(ID3DBlobPtr blob);
   D3D12PSOCreator &HS(ID3DBlobPtr blob);
   D3D12PSOCreator &DS(ID3DBlobPtr blob);
   D3D12PSOCreator &GS(ID3DBlobPtr blob);
@@ -108,7 +115,12 @@ public:
   D3D12_GRAPHICS_PIPELINE_STATE_DESC GraphicsDesc = {};
   D3D12_COMPUTE_PIPELINE_STATE_DESC ComputeDesc = {};
 
+  const D3D12_SHADER_BYTECODE &GetAS() const { return m_AS; };
+  const D3D12_SHADER_BYTECODE &GetMS() const { return m_MS; };
+
 private:
+  D3D12_SHADER_BYTECODE m_AS = {};
+  D3D12_SHADER_BYTECODE m_MS = {};
   ID3D12DevicePtr m_Dev;
 };
 

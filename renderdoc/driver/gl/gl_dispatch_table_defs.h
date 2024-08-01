@@ -343,6 +343,7 @@
   FUNC(glDepthRangeIndexed, glDepthRangeIndexed); \
   FUNC(glDepthRangeArrayv, glDepthRangeArrayv); \
   FUNC(glClipControl, glClipControl); \
+  FUNC(glClipControl, glClipControlEXT); \
   FUNC(glProvokingVertex, glProvokingVertex); \
   FUNC(glProvokingVertex, glProvokingVertexEXT); \
   FUNC(glPrimitiveRestartIndex, glPrimitiveRestartIndex); \
@@ -1607,6 +1608,7 @@
   FuncWrapper3(void, glDepthRangeIndexed, GLuint, index, GLdouble, n, GLdouble, f); \
   FuncWrapper3(void, glDepthRangeArrayv, GLuint, first, GLsizei, count, const GLdouble *, v); \
   FuncWrapper2(void, glClipControl, GLenum, origin, GLenum, depth); \
+  AliasWrapper2(void, glClipControlEXT, glClipControl, GLenum, origin, GLenum, depth); \
   FuncWrapper1(void, glProvokingVertex, GLenum, mode); \
   AliasWrapper1(void, glProvokingVertexEXT, glProvokingVertex, GLenum, mode); \
   FuncWrapper1(void, glPrimitiveRestartIndex, GLuint, index); \

@@ -56,6 +56,7 @@ static const char *LiveDriverDisassemblyTarget = "Live driver disassembly";
 ID3DDevice *GetD3D12DeviceIfAlloc(IUnknown *dev);
 
 static const char *DXBCDXILDisassemblyTarget = "DXBC/DXIL";
+static const char *DXCDXILDisassemblyTarget = "DXC DXIL";
 
 D3D12Replay::D3D12Replay(WrappedID3D12Device *d)
 {
@@ -73,6 +74,18 @@ void D3D12Replay::Shutdown()
 
   SAFE_DELETE(m_RGP);
 
+  if(m_DevConfig)
+  {
+    SAFE_RELEASE(m_DevConfig->debug);
+    SAFE_RELEASE(m_DevConfig->devconfig);
+    SAFE_RELEASE(m_DevConfig->devfactory);
+
+    m_DevConfig->sdkconfig->FreeUnusedSDKs();
+    SAFE_RELEASE(m_DevConfig->sdkconfig);
+    SAFE_DELETE(m_DevConfig);
+  }
+
+  // this destroys the replay object
   m_pDevice->Release();
 
   // the this pointer is free'd after this point
@@ -90,9 +103,10 @@ void D3D12Replay::Shutdown()
   }
 }
 
-void D3D12Replay::Initialise(IDXGIFactory1 *factory)
+void D3D12Replay::Initialise(IDXGIFactory1 *factory, D3D12DevConfiguration *config)
 {
   m_pFactory = factory;
+  m_DevConfig = config;
 
   RDCEraseEl(m_DriverInfo);
 
@@ -400,6 +414,7 @@ BufferDescription D3D12Replay::GetBuffer(ResourceId id)
   ret.length = desc.Width;
 
   ret.creationFlags = BufferCategory::NoFlags;
+  ret.gpuAddress = it->second->GetOriginalVA();
 
   const rdcarray<EventUsage> &usage = m_pDevice->GetQueue()->GetUsage(id);
 
@@ -524,8 +539,10 @@ rdcarray<rdcstr> D3D12Replay::GetDisassemblyTargets(bool withPipeline)
 {
   rdcarray<rdcstr> ret;
 
-  // DXBC is always first
+  // DXBC/DXIL is always first
   ret.push_back(DXBCDXILDisassemblyTarget);
+  // DXC DXIL
+  ret.push_back(DXCDXILDisassemblyTarget);
 
   if(!m_ISAChecked && m_TexRender.BlendPipe)
   {
@@ -568,7 +585,10 @@ rdcstr D3D12Replay::DisassembleShader(ResourceId pipeline, const ShaderReflectio
   DXBC::DXBCContainer *dxbc = sh->GetDXBC();
 
   if(target == DXBCDXILDisassemblyTarget || target.empty())
-    return dxbc->GetDisassembly();
+    return dxbc->GetDisassembly(false);
+
+  if(target == DXCDXILDisassemblyTarget)
+    return dxbc->GetDisassembly(true);
 
   if(target == LiveDriverDisassemblyTarget)
   {
@@ -724,15 +744,21 @@ void D3D12Replay::FillDescriptor(Descriptor &dst, const D3D12Descriptor *src)
 
   if(dst.resource == ResourceId())
   {
-    src->GetHeap()->GetFromDescriptorCache(src->GetHeapIndex(), dst);
-    return;
+    // TLASs annoyingly don't have a resource
+    if(src->GetType() != D3D12DescriptorType::SRV ||
+       src->GetSRV().ViewDimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+    {
+      src->GetHeap()->GetFromDescriptorCache(src->GetHeapIndex(), dst);
+      return;
+    }
   }
 
-  D3D12_RESOURCE_DESC res;
+  D3D12_RESOURCE_DESC res = {};
 
   {
     ID3D12Resource *r = rm->GetCurrentAs<ID3D12Resource>(src->GetResResourceId());
-    res = r->GetDesc();
+    if(r)
+      res = r->GetDesc();
   }
 
   {
@@ -776,6 +802,31 @@ void D3D12Replay::FillDescriptor(Descriptor &dst, const D3D12Descriptor *src)
         {
           dst.elementByteSize = srv.Buffer.StructureByteStride;
           dst.type = DescriptorType::Buffer;
+        }
+      }
+      else if(srv.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+      {
+        dst.type = DescriptorType::AccelerationStructure;
+
+        ResourceId asID;
+        WrappedID3D12Resource::GetResIDFromAddr(srv.RaytracingAccelerationStructure.Location, asID,
+                                                dst.byteOffset);
+
+        WrappedID3D12Resource *asRes = rm->GetCurrentAs<WrappedID3D12Resource>(asID);
+
+        // we *should* get an AS here
+        D3D12AccelerationStructure *as = NULL;
+        asRes->GetAccStructIfExist(dst.byteOffset, &as);
+
+        if(as)
+        {
+          dst.resource = rm->GetOriginalID(as->GetResourceID());
+          dst.byteOffset = 0;
+          dst.byteSize = as->Size();
+        }
+        else
+        {
+          dst.resource = rm->GetOriginalID(asID);
         }
       }
       else if(srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D)
@@ -1913,6 +1964,14 @@ rdcarray<DescriptorAccess> D3D12Replay::GetDescriptorAccess(uint32_t eventId)
         continue;
       }
 
+      // otherwise the access may be to a rootsig element that's not bound if the current event is
+      // not a valid draw or dispatch
+      if(rootIndex >= rootSig.sigelems.size())
+      {
+        access.descriptorStore = ResourceId();
+        continue;
+      }
+
       const D3D12RenderState::SignatureElement &rootEl = rootSig.sigelems[rootIndex];
 
       // this indicates a root parameter
@@ -1931,6 +1990,10 @@ rdcarray<DescriptorAccess> D3D12Replay::GetDescriptorAccess(uint32_t eventId)
         access.byteOffset += (uint32_t)rootEl.offset;
       }
     }
+
+    // remove any invalid / unbound root element accesses
+    ret.removeIf(
+        [](const DescriptorAccess &access) { return access.descriptorStore == ResourceId(); });
   }
 
   return ret;
@@ -1986,10 +2049,6 @@ rdcarray<DescriptorLogicalLocation> D3D12Replay::GetDescriptorLocations(
   {
     WrappedID3D12PipelineState *pipe = (WrappedID3D12PipelineState *)res;
 
-    WrappedID3D12RootSignature *sig =
-        (WrappedID3D12RootSignature *)(pipe->IsGraphics() ? pipe->graphics->pRootSignature
-                                                          : pipe->compute->pRootSignature);
-
     // root constants
     size_t dst = 0;
     for(const DescriptorRange &r : ranges)
@@ -1998,7 +2057,7 @@ rdcarray<DescriptorLogicalLocation> D3D12Replay::GetDescriptorLocations(
 
       for(uint32_t i = 0; i < r.count; i++, rootIndex++, dst++)
       {
-        const D3D12RootSignatureParameter &param = sig->sig.Parameters[rootIndex];
+        const D3D12RootSignatureParameter &param = pipe->usedSig.Parameters[rootIndex];
 
         DescriptorLogicalLocation &l = ret[dst];
 
@@ -4526,8 +4585,8 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
   if(initParams.MinimumFeatureLevel < D3D_FEATURE_LEVEL_11_0)
     initParams.MinimumFeatureLevel = D3D_FEATURE_LEVEL_11_0;
 
-  D3D12_PrepareReplaySDKVersion(rdc && rdc->IsUntrusted(), initParams.SDKVersion, D3D12Core,
-                                D3D12SDKLayers, D3D12Lib);
+  D3D12DevConfiguration *config = D3D12_PrepareReplaySDKVersion(
+      rdc && rdc->IsUntrusted(), initParams.SDKVersion, D3D12Core, D3D12SDKLayers, D3D12Lib);
 
   const bool isProxy = (rdc == NULL);
 
@@ -4617,7 +4676,7 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
 
   if(shouldEnableDebugLayer)
   {
-    debugLayerEnabled = EnableD3D12DebugLayer();
+    debugLayerEnabled = EnableD3D12DebugLayer(config, NULL);
 
     if(!debugLayerEnabled && !isProxy)
     {
@@ -4628,7 +4687,11 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
   }
 
   ID3D12Device *dev = NULL;
-  hr = createDevice(adapter, initParams.MinimumFeatureLevel, __uuidof(ID3D12Device), (void **)&dev);
+  if(config)
+    hr = config->devfactory->CreateDevice(adapter, initParams.MinimumFeatureLevel,
+                                          __uuidof(ID3D12Device), (void **)&dev);
+  else
+    hr = createDevice(adapter, initParams.MinimumFeatureLevel, __uuidof(ID3D12Device), (void **)&dev);
 
   if((FAILED(hr) || !dev) && adapter)
   {
@@ -4637,7 +4700,12 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
     RDCWARN("Couldn't replay on selected adapter, falling back to default adapter");
 
     SAFE_RELEASE(adapter);
-    hr = createDevice(adapter, initParams.MinimumFeatureLevel, __uuidof(ID3D12Device), (void **)&dev);
+    if(config)
+      hr = config->devfactory->CreateDevice(adapter, initParams.MinimumFeatureLevel,
+                                            __uuidof(ID3D12Device), (void **)&dev);
+    else
+      hr = createDevice(adapter, initParams.MinimumFeatureLevel, __uuidof(ID3D12Device),
+                        (void **)&dev);
   }
 
   SAFE_RELEASE(adapter);
@@ -4692,7 +4760,7 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
   replay->SetProxy(isProxy);
   replay->SetRGP(rgp);
 
-  replay->Initialise(factory);
+  replay->Initialise(factory, config);
 
   *driver = (IReplayDriver *)replay;
   return ResultCode::Succeeded;

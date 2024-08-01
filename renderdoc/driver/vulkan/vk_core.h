@@ -481,6 +481,9 @@ private:
   bool m_TaskShaders = false;
   bool m_ListRestart = false;
   bool m_AccelerationStructures = false;
+  bool m_ShaderObject = false;
+
+  uint32_t m_RTCaptureReplayHandleSize = 0;
 
   PFN_vkSetDeviceLoaderData m_SetDeviceLoaderData;
 
@@ -1088,7 +1091,8 @@ private:
                                    rdcarray<VkResourceRecord *> &cmdsWithReferences,
                                    std::unordered_set<ResourceId> &refdIDs);
   void AddRecordsForSecondaries(VkResourceRecord *record);
-  void UpdateImageStatesForSecondaries(VkResourceRecord *record);
+  void UpdateImageStatesForSecondaries(VkResourceRecord *record,
+                                       rdcarray<VkResourceRecord *> &accelerationStructures);
   void CaptureQueueSubmit(VkQueue queue, const rdcarray<VkCommandBuffer> &commandBuffers,
                           VkFence fence);
 
@@ -1346,6 +1350,7 @@ public:
   bool MeshShaders() const { return m_MeshShaders; }
   bool ListRestart() const { return m_ListRestart; }
   bool AccelerationStructures() const { return m_AccelerationStructures; }
+  bool ShaderObject() const { return m_ShaderObject; }
   VulkanRenderState &GetRenderState() { return m_RenderState; }
   void SetActionCB(VulkanActionCallback *cb) { m_ActionCallback = cb; }
   void SetSubmitChain(void *submitChain) { m_SubmitChain = submitChain; }
@@ -2099,12 +2104,6 @@ public:
   VkResult vkGetRandROutputDisplayEXT(VkPhysicalDevice physicalDevice, Display *dpy,
                                       RROutput rrOutput, VkDisplayKHR *pDisplay);
 
-#endif
-
-#if defined(VK_USE_PLATFORM_GGP)
-  VkResult vkCreateStreamDescriptorSurfaceGGP(VkInstance instance,
-                                              const VkStreamDescriptorSurfaceCreateInfoGGP *pCreateInfo,
-                                              const VkAllocationCallbacks *, VkSurfaceKHR *pSurface);
 #endif
 
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR)
@@ -2938,4 +2937,55 @@ public:
       VkDevice device, uint32_t accelerationStructureCount,
       const VkAccelerationStructureKHR *pAccelerationStructures, VkQueryType queryType,
       size_t dataSize, void *pData, size_t stride);
+
+  // VK_EXT_shader_object
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindShadersEXT, VkCommandBuffer commandBuffer,
+                                uint32_t stageCount, const VkShaderStageFlagBits *pStages,
+                                const VkShaderEXT *pShaders);
+
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateShadersEXT, VkDevice device,
+                                uint32_t createInfoCount, const VkShaderCreateInfoEXT *pCreateInfos,
+                                const VkAllocationCallbacks *pAllocator, VkShaderEXT *pShaders);
+
+  void vkDestroyShaderEXT(VkDevice device, VkShaderEXT shader,
+                          const VkAllocationCallbacks *pAllocator);
+
+  VkResult vkGetShaderBinaryDataEXT(VkDevice device, VkShaderEXT shader, size_t *pDataSize,
+                                    void *pData);
+
+  // VK_KHR_ray_tracing_pipeline
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdTraceRaysKHR, VkCommandBuffer commandBuffer,
+                                const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+                                const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+                                const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+                                const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+                                uint32_t width, uint32_t height, uint32_t depth);
+
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCreateRayTracingPipelinesKHR, VkDevice device,
+                                VkDeferredOperationKHR deferredOperation,
+                                VkPipelineCache pipelineCache, uint32_t createInfoCount,
+                                const VkRayTracingPipelineCreateInfoKHR *pCreateInfos,
+                                const VkAllocationCallbacks *pAllocator, VkPipeline *pPipelines);
+
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdTraceRaysIndirectKHR, VkCommandBuffer commandBuffer,
+                                const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+                                const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+                                const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+                                const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+                                VkDeviceAddress indirectDeviceAddress);
+
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRayTracingPipelineStackSizeKHR,
+                                VkCommandBuffer commandBuffer, uint32_t pipelineStackSize);
+
+  VkResult vkGetRayTracingShaderGroupHandlesKHR(VkDevice device, VkPipeline pipeline,
+                                                uint32_t firstGroup, uint32_t groupCount,
+                                                size_t dataSize, void *pData);
+
+  VkResult vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(VkDevice device, VkPipeline pipeline,
+                                                             uint32_t firstGroup, uint32_t groupCount,
+                                                             size_t dataSize, void *pData);
+
+  VkDeviceSize vkGetRayTracingShaderGroupStackSizeKHR(VkDevice device, VkPipeline pipeline,
+                                                      uint32_t group,
+                                                      VkShaderGroupShaderKHR groupShader);
 };

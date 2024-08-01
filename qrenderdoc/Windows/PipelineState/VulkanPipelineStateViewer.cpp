@@ -1362,6 +1362,22 @@ void VulkanPipelineStateViewer::addResourceRow(const ShaderResource *shaderRes,
       if(!filledSlot)
         setEmptyRow(node);
     }
+    else if(used.access.type == DescriptorType::AccelerationStructure)
+    {
+      node = new RDTreeWidgetItem({
+          slotname,
+          bindType,
+          descriptor.resource,
+          QString(),
+          QFormatStr("%1 bytes").arg(Formatter::HumanFormat(descriptor.byteSize, Formatter::OffsetSize)),
+          QString(),
+      });
+
+      node->setTag(tag);
+
+      if(!filledSlot)
+        setEmptyRow(node);
+    }
     else if(used.access.type == DescriptorType::Sampler)
     {
       if(samplerDescriptor.object == ResourceId())
@@ -1669,8 +1685,11 @@ void VulkanPipelineStateViewer::setShaderState(const VKPipe::Pipeline &pipe,
 {
   ShaderReflection *shaderDetails = stage.reflection;
 
-  QString shText =
-      QFormatStr("%1: %2").arg(ToQStr(pipe.pipelineResourceId)).arg(ToQStr(stage.resourceId));
+  QString shText;
+  if(stage.shaderObject)
+    shText = QFormatStr("%1").arg(ToQStr(stage.resourceId));
+  else
+    shText = QFormatStr("%1: %2").arg(ToQStr(pipe.pipelineResourceId)).arg(ToQStr(stage.resourceId));
 
   if(shaderDetails != NULL)
   {
@@ -1822,12 +1841,14 @@ void VulkanPipelineStateViewer::setState()
 
         if(state.vertexShader.resourceId != ResourceId())
         {
-          uint32_t attrib = a.location;
-
-          if(attrib < state.vertexShader.reflection->inputSignature.size())
+          for(SigParameter &sigParam : state.vertexShader.reflection->inputSignature)
           {
-            name = state.vertexShader.reflection->inputSignature[attrib].varName;
-            usedSlot = true;
+            if(sigParam.regIndex == a.location)
+            {
+              name = sigParam.varName;
+              usedSlot = true;
+              break;
+            }
           }
         }
 
@@ -2156,6 +2177,9 @@ void VulkanPipelineStateViewer::setState()
 
     for(const UsedDescriptor &used : descriptors)
     {
+      if(used.access.type == DescriptorType::Unknown || used.access.stage == ShaderStage::Count)
+        continue;
+
       const ShaderReflection *refl = shaderRefls[(uint32_t)used.access.stage];
 
       uint32_t dynamicOffset = 0;
@@ -2242,7 +2266,7 @@ void VulkanPipelineStateViewer::setState()
     ResourceId pipe = stage->stage == ShaderStage::Compute ? state.compute.pipelineResourceId
                                                            : state.graphics.pipelineResourceId;
 
-    b->setEnabled(stage->reflection && pipe != ResourceId());
+    b->setEnabled(stage->reflection && (pipe != ResourceId() || stage->shaderObject));
 
     m_Common.SetupShaderEditButton(b, pipe, stage->resourceId, stage->reflection);
   }
@@ -2258,7 +2282,10 @@ void VulkanPipelineStateViewer::setState()
   for(const ShaderMessage &msg : state.shaderMessages)
     numMessages[(uint32_t)msg.stage]++;
 
-  for(uint32_t i = 0; i < ARRAY_COUNT(numMessages); i++)
+  static_assert(ARRAY_COUNT(messageButtons) <= ARRAY_COUNT(numMessages),
+                "More buttons than shader stages");
+
+  for(uint32_t i = 0; i < ARRAY_COUNT(messageButtons); i++)
   {
     messageButtons[i]->setVisible(numMessages[i] > 0);
     messageButtons[i]->setText(tr("%n Message(s)", "", numMessages[i]));

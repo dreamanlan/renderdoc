@@ -56,11 +56,21 @@ struct D3D12MarkerRegion
   ID3D12CommandQueue *queue = NULL;
 };
 
-bool EnableD3D12DebugLayer(PFN_D3D12_GET_DEBUG_INTERFACE getDebugInterface = NULL);
+struct D3D12DevConfiguration
+{
+  ID3D12SDKConfiguration1 *sdkconfig = NULL;
+  ID3D12DeviceFactory *devfactory = NULL;
+  ID3D12DeviceConfiguration *devconfig = NULL;
+  ID3D12Debug *debug = NULL;
+};
+
+bool EnableD3D12DebugLayer(D3D12DevConfiguration *devConfig,
+                           PFN_D3D12_GET_DEBUG_INTERFACE getDebugInterface);
 HRESULT EnumAdapterByLuid(IDXGIFactory1 *factory, LUID luid, IDXGIAdapter **pAdapter);
 
-void D3D12_PrepareReplaySDKVersion(bool untrustedCapture, UINT SDKVersion, bytebuf d3d12core,
-                                   bytebuf d3d12sdklayers, HMODULE d3d12lib);
+D3D12DevConfiguration *D3D12_PrepareReplaySDKVersion(bool untrustedCapture, UINT SDKVersion,
+                                                     bytebuf d3d12core, bytebuf d3d12sdklayers,
+                                                     HMODULE d3d12lib);
 void D3D12_CleanupReplaySDK();
 
 inline void SetObjName(ID3D12Object *obj, const rdcstr &utf8name)
@@ -335,6 +345,87 @@ public:
   }
 };
 
+class WrappedID3D12DeviceConfiguration : public ID3D12DeviceConfiguration
+{
+private:
+  ID3D12DeviceConfiguration *m_pReal = NULL;
+  IUnknown *wrappedParent = NULL;
+public:
+  WrappedID3D12DeviceConfiguration(IUnknown *real, IUnknown *wrapped)
+  {
+    wrappedParent = wrapped;
+
+    if(real)
+    {
+      HRESULT hr = real->QueryInterface(__uuidof(ID3D12DeviceConfiguration), (void **)&m_pReal);
+      if(FAILED(hr))
+        SAFE_RELEASE(m_pReal);
+    }
+  }
+
+  ~WrappedID3D12DeviceConfiguration() { SAFE_RELEASE(m_pReal); }
+
+  bool IsValid() { return m_pReal != NULL; }
+
+  //////////////////////////////
+  // Implement IUnknown
+  ULONG STDMETHODCALLTYPE AddRef() { return wrappedParent->AddRef(); }
+  ULONG STDMETHODCALLTYPE Release() { return wrappedParent->Release(); }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject)
+  {
+    if(riid == __uuidof(IUnknown))
+    {
+      *ppvObject = (IUnknown *)this;
+      AddRef();
+      return S_OK;
+    }
+    if(riid == __uuidof(ID3D12DeviceConfiguration) && m_pReal)
+    {
+      *ppvObject = (ID3D12DeviceConfiguration *)this;
+      AddRef();
+      return S_OK;
+    }
+
+    return wrappedParent->QueryInterface(riid, ppvObject);
+  }
+
+  //////////////////////////////
+  // Implement ID3D12DeviceConfiguration
+#if defined(_MSC_VER) || !defined(_WIN32)
+  virtual D3D12_DEVICE_CONFIGURATION_DESC STDMETHODCALLTYPE GetDesc(void)
+  {
+    return m_pReal->GetDesc();
+  }
+#else
+  virtual D3D12_DEVICE_CONFIGURATION_DESC *STDMETHODCALLTYPE
+  GetDesc(D3D12_DEVICE_CONFIGURATION_DESC *RetVal)
+  {
+    return m_pReal->GetDesc(RetVal);
+  }
+#endif
+
+  virtual HRESULT STDMETHODCALLTYPE GetEnabledExperimentalFeatures(_Out_writes_(NumGuids)
+                                                                       GUID *pGuids,
+                                                                   UINT NumGuids)
+  {
+    return m_pReal->GetEnabledExperimentalFeatures(pGuids, NumGuids);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE SerializeVersionedRootSignature(
+      _In_ const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *pDesc, _COM_Outptr_ ID3DBlob **ppResult,
+      _Always_(_Outptr_opt_result_maybenull_) ID3DBlob **ppError)
+  {
+    return m_pReal->SerializeVersionedRootSignature(pDesc, ppResult, ppError);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE
+  CreateVersionedRootSignatureDeserializer(_In_reads_bytes_(Size) const void *pBlob, SIZE_T Size,
+                                           REFIID riid, _COM_Outptr_ void **ppvDeserializer)
+  {
+    return m_pReal->CreateVersionedRootSignatureDeserializer(pBlob, Size, riid, ppvDeserializer);
+  }
+};
+
 struct D3D12RootSignatureParameter : D3D12_ROOT_PARAMETER1
 {
   D3D12RootSignatureParameter()
@@ -463,6 +554,7 @@ DECLARE_REFLECTION_STRUCT(D3D12RootSignature);
 struct D3D12CommandSignature
 {
   bool graphics = true;
+  bool raytraced = false;
   UINT ByteStride = 0;
   UINT PackedByteSize = 0;
   rdcarray<D3D12_INDIRECT_ARGUMENT_DESC> arguments;
@@ -522,7 +614,8 @@ struct D3D12CommandSignature
   SERIALISE_INTERFACE(ID3D12DescriptorHeap);       \
   SERIALISE_INTERFACE(ID3D12CommandSignature);     \
   SERIALISE_INTERFACE(ID3D12CommandQueue);         \
-  SERIALISE_INTERFACE(ID3D12CommandAllocator);
+  SERIALISE_INTERFACE(ID3D12CommandAllocator);     \
+  SERIALISE_INTERFACE(ID3D12StateObject);
 
 #define SERIALISE_INTERFACE(iface) DECLARE_REFLECTION_STRUCT(iface *)
 
@@ -546,6 +639,17 @@ inline bool operator==(const D3D12_CPU_DESCRIPTOR_HANDLE &l, const D3D12_CPU_DES
 {
   return l.ptr == r.ptr;
 }
+
+struct D3D12_UNWRAPPED_STATE_OBJECT_DESC : public D3D12_STATE_OBJECT_DESC
+{
+  D3D12_UNWRAPPED_STATE_OBJECT_DESC(const D3D12_STATE_OBJECT_DESC &wrappedDesc);
+
+private:
+  rdcarray<D3D12_STATE_SUBOBJECT> subobjects;
+  rdcarray<D3D12_GLOBAL_ROOT_SIGNATURE> unwrappedRootsigObjs;
+  rdcarray<D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION> rebasedAssocs;
+  rdcarray<D3D12_EXISTING_COLLECTION_DESC> unwrappedCollObjs;
+};
 
 // expanded version of D3D12_GRAPHICS_PIPELINE_STATE_DESC / D3D12_COMPUTE_PIPELINE_STATE_DESC with
 // all subobjects. No enums suitable to make this a stream though.
@@ -944,6 +1048,7 @@ DECLARE_REFLECTION_STRUCT(D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS);
 DECLARE_REFLECTION_STRUCT(D3D12_RAYTRACING_GEOMETRY_DESC);
 DECLARE_REFLECTION_STRUCT(D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC);
 DECLARE_REFLECTION_STRUCT(D3D12_RAYTRACING_GEOMETRY_AABBS_DESC);
+DECLARE_REFLECTION_STRUCT(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO);
 DECLARE_REFLECTION_STRUCT(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC);
 DECLARE_REFLECTION_STRUCT(D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE);
 DECLARE_REFLECTION_STRUCT(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_SERIALIZATION_DESC);
@@ -963,6 +1068,9 @@ DECLARE_REFLECTION_STRUCT(D3D12_RAYTRACING_PIPELINE_CONFIG);
 DECLARE_REFLECTION_STRUCT(D3D12_HIT_GROUP_DESC);
 DECLARE_REFLECTION_STRUCT(D3D12_RAYTRACING_PIPELINE_CONFIG1);
 DECLARE_REFLECTION_STRUCT(D3D12_EXPORT_DESC);
+DECLARE_REFLECTION_STRUCT(D3D12_GPU_VIRTUAL_ADDRESS_RANGE);
+DECLARE_REFLECTION_STRUCT(D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE);
+DECLARE_REFLECTION_STRUCT(D3D12_DISPATCH_RAYS_DESC);
 
 DECLARE_DESERIALISE_TYPE(D3D12_DISCARD_REGION);
 DECLARE_DESERIALISE_TYPE(D3D12_GRAPHICS_PIPELINE_STATE_DESC);
@@ -1114,5 +1222,7 @@ enum class D3D12Chunk : uint32_t
   List_EmitRaytracingAccelerationStructurePostbuildInfo,
   List_DispatchRays,
   List_SetPipelineState1,
+  CreateAS,
+  StateObject_SetPipelineStackSize,
   Max,
 };

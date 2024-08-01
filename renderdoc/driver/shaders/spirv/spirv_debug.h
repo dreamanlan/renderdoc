@@ -264,8 +264,9 @@ struct TypeData
   bool colMajorMat = false;
 
   Id baseType;
-  uint32_t arrayDimension = 0;
+  rdcarray<uint32_t> arrayDimensions;
   rdcarray<rdcpair<rdcstr, Id>> structMembers;
+  rdcarray<uint32_t> memberOffsets;
 };
 
 struct LocalMapping
@@ -417,6 +418,8 @@ private:
                         std::function<void(ShaderVarType &, const Decorations &, const DataType &,
                                            uint64_t, const rdcstr &)>
                             callback) const;
+  void SetStructArrayNames(ShaderVariable &c, const DataType *typeWalk,
+                           const rdcarray<SpecConstant> &specInfo);
 
   void MakeSignatureNames(const rdcarray<SPIRVInterfaceAccess> &sigList, rdcarray<rdcstr> &sigNames);
 

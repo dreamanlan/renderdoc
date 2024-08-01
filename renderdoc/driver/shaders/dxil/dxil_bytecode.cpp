@@ -2225,24 +2225,51 @@ rdcstr Program::GetValueSymtabString(Value *v)
 void Program::SetValueSymtabString(Value *v, const rdcstr &s)
 {
   if(Constant *c = cast<Constant>(v))
+  {
     c->str = s;
+  }
   else if(Instruction *i = cast<Instruction>(v))
-    i->extra(alloc).name = s;
+  {
+#if DISABLED(DXC_COMPATIBLE_DISASM)
+    // For instruction names convert "." -> "_" to allow the name to be used as debugger variable name
+    // "." is treated as a field separator by the debugger
+    rdcstr &str = i->extra(alloc).name;
+    str = s;
+    for(size_t j = 0; j < str.size(); ++j)
+    {
+      if(str[j] == '.')
+        str[j] = '_';
+    }
+#endif
+  }
   else if(Block *b = cast<Block>(v))
+  {
     b->name = s;
+  }
   else if(GlobalVar *g = cast<GlobalVar>(v))
+  {
     g->name = s;
+  }
   else if(Function *f = cast<Function>(v))
+  {
     f->name = s;
+  }
   else if(Alias *a = cast<Alias>(v))
+  {
     a->name = s;
+  }
 }
 
-uint32_t Program::GetOrAssignMetaSlot(rdcarray<Metadata *> &metaSlots, uint32_t &nextMetaSlot,
-                                      Metadata *m)
+uint32_t Program::GetMetaSlot(const Metadata *m) const
+{
+  RDCASSERTNOTEQUAL(m->slot, ~0U);
+  return m->slot;
+}
+
+void Program::AssignMetaSlot(rdcarray<Metadata *> &metaSlots, uint32_t &nextMetaSlot, Metadata *m)
 {
   if(m->slot != ~0U)
-    return m->slot;
+    return;
 
   m->slot = nextMetaSlot++;
   metaSlots.push_back(m);
@@ -2253,26 +2280,28 @@ uint32_t Program::GetOrAssignMetaSlot(rdcarray<Metadata *> &metaSlots, uint32_t 
     if(!c || c->isConstant)
       continue;
 
-    GetOrAssignMetaSlot(metaSlots, nextMetaSlot, c);
+    AssignMetaSlot(metaSlots, nextMetaSlot, c);
   }
-
-  return m->slot;
 }
 
-uint32_t Program::GetOrAssignMetaSlot(rdcarray<Metadata *> &metaSlots, uint32_t &nextMetaSlot,
-                                      DebugLocation &l)
+uint32_t Program::GetMetaSlot(const DebugLocation *l) const
+{
+  RDCASSERTNOTEQUAL(l->slot, ~0U);
+  return l->slot;
+}
+
+void Program::AssignMetaSlot(rdcarray<Metadata *> &metaSlots, uint32_t &nextMetaSlot,
+                             DebugLocation &l)
 {
   if(l.slot != ~0U)
-    return l.slot;
+    return;
 
   l.slot = nextMetaSlot++;
 
   if(l.scope)
-    GetOrAssignMetaSlot(metaSlots, nextMetaSlot, l.scope);
+    AssignMetaSlot(metaSlots, nextMetaSlot, l.scope);
   if(l.inlinedAt)
-    GetOrAssignMetaSlot(metaSlots, nextMetaSlot, l.inlinedAt);
-
-  return l.slot;
+    AssignMetaSlot(metaSlots, nextMetaSlot, l.inlinedAt);
 }
 
 const Type *Program::GetPointerType(const Type *type, Type::PointerAddrSpace addrSpace)
@@ -2551,7 +2580,7 @@ void LLVMOrderAccumulator::processGlobals(Program *prog, bool doLiveChecking)
   }
 }
 
-void LLVMOrderAccumulator::processFunction(Function *f)
+void LLVMOrderAccumulator::processFunction(const Function *f)
 {
   const Function &func = *f;
 
@@ -2604,8 +2633,15 @@ void LLVMOrderAccumulator::processFunction(Function *f)
   uint32_t curBlock = 0;
 
   for(Instruction *arg : func.args)
+  {
+#if DISABLED(DXC_COMPATIBLE_DISASM)
+    if(arg->slot == ~0U)
+      arg->slot = slot++;
+#else
     if(arg->getName().isEmpty())
       arg->slot = slot++;
+#endif
+  }
 
   if(!func.blocks.empty() && func.blocks[0]->name.empty())
     func.blocks[0]->slot = slot++;
@@ -2629,8 +2665,13 @@ void LLVMOrderAccumulator::processFunction(Function *f)
     {
       accumulate(inst);
 
+#if DISABLED(DXC_COMPATIBLE_DISASM)
+      if(inst->slot == ~0U)
+        inst->slot = slot++;
+#else
       if(inst->getName().isEmpty())
         inst->slot = slot++;
+#endif
     }
 
     if(inst->op == Operation::Branch || inst->op == Operation::Unreachable ||

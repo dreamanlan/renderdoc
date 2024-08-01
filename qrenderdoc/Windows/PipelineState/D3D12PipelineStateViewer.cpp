@@ -731,9 +731,9 @@ void D3D12PipelineStateViewer::setViewDetails(RDTreeWidgetItem *node, const D3D1
                "elements).\n")
                 .arg(res.byteOffset)
                 .arg(res.byteOffset + res.byteSize)
-                .arg(res.byteSize / res.elementByteSize)
+                .arg(res.byteSize / qMax(1U, res.elementByteSize))
                 .arg(buf->length)
-                .arg(buf->length / res.elementByteSize);
+                .arg(buf->length / qMax(1U, res.elementByteSize));
 
     viewdetails = true;
   }
@@ -873,6 +873,16 @@ void D3D12PipelineStateViewer::addResourceRow(const D3D12ViewTag &view,
         else
           format = descriptor.format.Name();
       }
+    }
+
+    if(descriptor.type == DescriptorType::AccelerationStructure)
+    {
+      typeName = tr("Acceleration Structure");
+      w = descriptor.byteSize;
+      h = 0;
+      d = 0;
+      a = 0;
+      format = QString();
     }
 
     RDTreeWidgetItem *node = NULL;
@@ -1168,7 +1178,7 @@ void D3D12PipelineStateViewer::setShaderState(const D3D12Pipe::Shader &stage, RD
     int entryFile = qMax(0, dbg.entryLocation.fileIndex);
 
     shText += QFormatStr(": %1() - %2")
-                  .arg(shaderDetails->entryPoint)
+                  .arg(shaderDetails->debugInfo.entrySourceName)
                   .arg(QFileInfo(dbg.files[entryFile].filename).fileName());
   }
   shader->setText(shText);
@@ -1609,6 +1619,9 @@ void D3D12PipelineStateViewer::setState()
 
     for(const UsedDescriptor &used : descriptors)
     {
+      if(used.access.type == DescriptorType::Unknown || used.access.stage == ShaderStage::Count)
+        continue;
+
       const ShaderReflection *refl = shaderRefls[(uint32_t)used.access.stage];
 
       if(IsConstantBlockDescriptor(used.access.type))
@@ -2841,7 +2854,7 @@ void D3D12PipelineStateViewer::exportHTML(QXmlStreamWriter &xml, const D3D12Pipe
       int entryFile = qMax(0, dbg.entryLocation.fileIndex);
 
       shadername = QFormatStr("%1() - %2")
-                       .arg(shaderDetails->entryPoint)
+                       .arg(shaderDetails->debugInfo.entrySourceName)
                        .arg(QFileInfo(dbg.files[entryFile].filename).fileName());
     }
 

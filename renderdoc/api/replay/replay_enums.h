@@ -890,6 +890,10 @@ DOCUMENT(R"(The type of a descriptor.
 .. data:: ReadWriteBuffer
 
   A buffer that can be read from and written to arbitrarily.
+
+.. data:: AccelerationStructure
+
+  A ray-tracing acceleration structure, read-only in the shader.
 )");
 enum class DescriptorType : uint8_t
 {
@@ -903,6 +907,7 @@ enum class DescriptorType : uint8_t
   ReadWriteImage,
   ReadWriteTypedBuffer,
   ReadWriteBuffer,
+  AccelerationStructure,
 };
 
 DECLARE_REFLECTION_ENUM(DescriptorType);
@@ -953,7 +958,8 @@ constexpr DescriptorCategory CategoryForDescriptorType(DescriptorType type)
          : type == DescriptorType::Sampler ? DescriptorCategory::Sampler
 
          : (type == DescriptorType::ImageSampler || type == DescriptorType::Image ||
-            type == DescriptorType::TypedBuffer || type == DescriptorType::Buffer)
+            type == DescriptorType::TypedBuffer || type == DescriptorType::Buffer ||
+            type == DescriptorType::AccelerationStructure)
              ? DescriptorCategory::ReadOnlyResource
 
          : (type == DescriptorType::ReadWriteBuffer || type == DescriptorType::ReadWriteImage ||
@@ -2574,6 +2580,31 @@ DOCUMENT(R"(The stage in a pipeline where a shader runs
 .. data:: Mesh
 
   The mesh shader.
+
+.. data:: RayGen
+
+  A ray generation shader, called from a ray dispatch command to launch initial rays.
+
+.. data:: Intersection
+
+  An intersection shader, used for procedural objects in a BLAS to calculate hits.
+
+.. data:: AnyHit
+
+  An any-hit shader, called in an indeterminate order and number when a ray intersection has been
+  found with an object but may not be the final hit.
+
+.. data:: ClosestHit
+
+  A closest-hit shader, called once the closest hit on a ray has been found.
+
+.. data:: Miss
+
+  A miss shader, called when a ray has no valid closest hit at all.
+
+.. data:: Callable
+
+  A callable shader, called by shader code via index during ray processing.
 )");
 enum class ShaderStage : uint8_t
 {
@@ -2597,6 +2628,13 @@ enum class ShaderStage : uint8_t
   Amplification = Task,
 
   Mesh,
+
+  RayGen,
+  Intersection,
+  AnyHit,
+  ClosestHit,
+  Miss,
+  Callable,
 
   Count,
 };
@@ -4452,10 +4490,6 @@ DOCUMENT(R"(Specifies a windowing system to use for creating an output window.
   The windowing data refers to a MacOS / OS X NSView & CALayer that is Metal/GL compatible.
   See :func:`CreateMacOSWindowingData`.
 
-.. data:: GGP
-
-  The windowing data refers to an GGP surface. See :func:`CreateGgpWindowingData`.
-
 .. data:: Wayland
 
   The windowing data refers to an Wayland window. See :func:`CreateWaylandWindowingData`.
@@ -4469,7 +4503,6 @@ enum class WindowingSystem : uint32_t
   XCB,
   Android,
   MacOS,
-  GGP,
   Wayland,
 };
 
@@ -4738,6 +4771,30 @@ DOCUMENT(R"(A set of flags for ``ShaderStage`` stages
 
   The flag for :data:`ShaderStage.Mesh`.
 
+.. data:: RayGen
+
+  The flag for :data:`ShaderStage.RayGen`.
+
+.. data:: Intersection
+
+  The flag for :data:`ShaderStage.Intersection`.
+
+.. data:: AnyHit
+
+  The flag for :data:`ShaderStage.AnyHit`.
+
+.. data:: ClosestHit
+
+  The flag for :data:`ShaderStage.ClosestHit`.
+
+.. data:: Miss
+
+  The flag for :data:`ShaderStage.Miss`.
+
+.. data:: Callable
+
+  The flag for :data:`ShaderStage.Callable`.
+
 .. data:: All
 
   A shorthand version with flags set for all stages together.
@@ -4757,7 +4814,14 @@ enum class ShaderStageMask : uint16_t
   Task = 1 << uint32_t(ShaderStage::Task),
   Amplification = Task,
   Mesh = 1 << uint32_t(ShaderStage::Mesh),
-  All = Vertex | Hull | Domain | Geometry | Pixel | Compute | Task | Mesh,
+  RayGen = 1 << uint32_t(ShaderStage::RayGen),
+  Intersection = 1 << uint32_t(ShaderStage::Intersection),
+  AnyHit = 1 << uint32_t(ShaderStage::AnyHit),
+  ClosestHit = 1 << uint32_t(ShaderStage::ClosestHit),
+  Miss = 1 << uint32_t(ShaderStage::Miss),
+  Callable = 1 << uint32_t(ShaderStage::Callable),
+  All = Vertex | Hull | Domain | Geometry | Pixel | Compute | Task | Mesh | RayGen | Intersection |
+        AnyHit | ClosestHit | Miss | Callable,
 };
 
 BITMASK_OPERATORS(ShaderStageMask);
@@ -4957,7 +5021,7 @@ actions.
 
 .. data:: BuildAccStruct
 
-  This action builds the acceleration structure.
+  This action builds or copies to and implicitly fills an acceleration structure.
 
 .. data:: Indexed
 

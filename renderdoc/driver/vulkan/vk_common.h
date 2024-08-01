@@ -577,7 +577,9 @@ constexpr DescriptorSlotType convert(VkDescriptorType type)
              ? DescriptorSlotType::StorageBufferDynamic
          : type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT     ? DescriptorSlotType::InputAttachment
          : type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? DescriptorSlotType::InlineBlock
-                                                           : DescriptorSlotType::Unwritten;
+         : type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+             ? DescriptorSlotType::AccelerationStructure
+             : DescriptorSlotType::Unwritten;
 }
 
 enum class DescriptorSlotImageLayout : EnumBaseType
@@ -1079,6 +1081,12 @@ enum class VulkanChunk : uint32_t
   vkCmdCopyAccelerationStructureToMemoryKHR,
   vkCmdCopyMemoryToAccelerationStructureKHR,
   vkCreateAccelerationStructureKHR,
+  vkCmdBindShadersEXT,
+  vkCreateShadersEXT,
+  vkCmdSetRayTracingPipelineStackSizeKHR,
+  vkCmdTraceRaysIndirectKHR,
+  vkCmdTraceRaysKHR,
+  vkCreateRayTracingPipelinesKHR,
   Max,
 };
 
@@ -1118,7 +1126,8 @@ DECLARE_REFLECTION_ENUM(VulkanChunk);
   SERIALISE_HANDLE(VkSurfaceKHR)               \
   SERIALISE_HANDLE(VkDescriptorUpdateTemplate) \
   SERIALISE_HANDLE(VkSamplerYcbcrConversion)   \
-  SERIALISE_HANDLE(VkAccelerationStructureKHR)
+  SERIALISE_HANDLE(VkAccelerationStructureKHR) \
+  SERIALISE_HANDLE(VkShaderEXT)
 
 #define SERIALISE_HANDLE(type) DECLARE_REFLECTION_STRUCT(type)
 
@@ -1268,8 +1277,8 @@ DECLARE_REFLECTION_STRUCT(VkImageStencilUsageCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkImageSwapchainCreateInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkImageViewASTCDecodeModeEXT);
 DECLARE_REFLECTION_STRUCT(VkImageViewCreateInfo);
-DECLARE_REFLECTION_STRUCT(VkImageViewUsageCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkImageViewMinLodCreateInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkImageViewUsageCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkImportFenceFdInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkImportMemoryFdInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkImportSemaphoreFdInfoKHR);
@@ -1388,14 +1397,16 @@ DECLARE_REFLECTION_STRUCT(VkPhysicalDevicePresentWaitFeaturesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevicePrimitivesGeneratedQueryFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevicePrivateDataFeatures);
-DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProvokingVertexFeaturesEXT);
-DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProvokingVertexPropertiesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProperties2);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProtectedMemoryFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProtectedMemoryProperties);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProvokingVertexFeaturesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceProvokingVertexPropertiesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDevicePushDescriptorPropertiesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRayQueryFeaturesKHR);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRayTracingPipelineFeaturesKHR);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRayTracingPipelinePropertiesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRGBA10X6FormatsFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRobustness2FeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceRobustness2PropertiesEXT);
@@ -1416,6 +1427,9 @@ DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderImageFootprintFeaturesNV);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderIntegerDotProductFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderIntegerDotProductProperties);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderObjectFeaturesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderObjectPropertiesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderRelaxedExtendedInstructionFeaturesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderTerminateInvocationFeatures);
@@ -1495,6 +1509,9 @@ DECLARE_REFLECTION_STRUCT(VkQueryPoolCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkQueryPoolPerformanceCreateInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkQueueFamilyGlobalPriorityPropertiesKHR);
 DECLARE_REFLECTION_STRUCT(VkQueueFamilyProperties2);
+DECLARE_REFLECTION_STRUCT(VkRayTracingPipelineCreateInfoKHR);
+DECLARE_REFLECTION_STRUCT(VkRayTracingPipelineInterfaceCreateInfoKHR);
+DECLARE_REFLECTION_STRUCT(VkRayTracingShaderGroupCreateInfoKHR);
 DECLARE_REFLECTION_STRUCT(VkRefreshCycleDurationGOOGLE);
 DECLARE_REFLECTION_STRUCT(VkReleaseSwapchainImagesInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkRenderingAttachmentInfo);
@@ -1524,6 +1541,7 @@ DECLARE_REFLECTION_STRUCT(VkSemaphoreSignalInfo);
 DECLARE_REFLECTION_STRUCT(VkSemaphoreSubmitInfo);
 DECLARE_REFLECTION_STRUCT(VkSemaphoreTypeCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkSemaphoreWaitInfo);
+DECLARE_REFLECTION_STRUCT(VkShaderCreateInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkShaderModuleCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkShaderModuleValidationCacheCreateInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkSharedPresentSurfaceCapabilitiesKHR);
@@ -1702,8 +1720,8 @@ DECLARE_DESERIALISE_TYPE(VkImageStencilUsageCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkImageSwapchainCreateInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkImageViewASTCDecodeModeEXT);
 DECLARE_DESERIALISE_TYPE(VkImageViewCreateInfo);
-DECLARE_DESERIALISE_TYPE(VkImageViewUsageCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkImageViewMinLodCreateInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkImageViewUsageCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkImportFenceFdInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkImportMemoryFdInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkImportSemaphoreFdInfoKHR);
@@ -1819,14 +1837,16 @@ DECLARE_DESERIALISE_TYPE(VkPhysicalDevicePresentWaitFeaturesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevicePrimitivesGeneratedQueryFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevicePrivateDataFeatures);
-DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProvokingVertexFeaturesEXT);
-DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProvokingVertexPropertiesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProperties2);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProtectedMemoryFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProtectedMemoryProperties);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProvokingVertexFeaturesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceProvokingVertexPropertiesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDevicePushDescriptorPropertiesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRayQueryFeaturesKHR);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRayTracingPipelineFeaturesKHR);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRayTracingPipelinePropertiesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRGBA10X6FormatsFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRobustness2FeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceRobustness2PropertiesEXT);
@@ -1847,6 +1867,9 @@ DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderImageFootprintFeaturesNV);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderIntegerDotProductFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderIntegerDotProductProperties);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderObjectFeaturesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderObjectPropertiesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderRelaxedExtendedInstructionFeaturesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderTerminateInvocationFeatures);
@@ -1925,6 +1948,9 @@ DECLARE_DESERIALISE_TYPE(VkQueryPoolCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkQueryPoolPerformanceCreateInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkQueueFamilyGlobalPriorityPropertiesKHR);
 DECLARE_DESERIALISE_TYPE(VkQueueFamilyProperties2);
+DECLARE_DESERIALISE_TYPE(VkRayTracingPipelineCreateInfoKHR);
+DECLARE_DESERIALISE_TYPE(VkRayTracingPipelineInterfaceCreateInfoKHR);
+DECLARE_DESERIALISE_TYPE(VkRayTracingShaderGroupCreateInfoKHR);
 DECLARE_DESERIALISE_TYPE(VkReleaseSwapchainImagesInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkRenderingAttachmentInfo);
 DECLARE_DESERIALISE_TYPE(VkRenderingFragmentDensityMapAttachmentInfoEXT);
@@ -1952,6 +1978,7 @@ DECLARE_DESERIALISE_TYPE(VkSemaphoreSignalInfo);
 DECLARE_DESERIALISE_TYPE(VkSemaphoreSubmitInfo);
 DECLARE_DESERIALISE_TYPE(VkSemaphoreTypeCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkSemaphoreWaitInfo);
+DECLARE_DESERIALISE_TYPE(VkShaderCreateInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkShaderModuleCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkShaderModuleValidationCacheCreateInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkSharedPresentSurfaceCapabilitiesKHR);
@@ -2068,6 +2095,7 @@ DECLARE_REFLECTION_STRUCT(VkSparseMemoryBind);
 DECLARE_REFLECTION_STRUCT(VkSpecializationInfo);
 DECLARE_REFLECTION_STRUCT(VkSpecializationMapEntry);
 DECLARE_REFLECTION_STRUCT(VkStencilOpState);
+DECLARE_REFLECTION_STRUCT(VkStridedDeviceAddressRegionKHR);
 DECLARE_REFLECTION_STRUCT(VkSubpassDependency);
 DECLARE_REFLECTION_STRUCT(VkSubpassDescription);
 DECLARE_REFLECTION_STRUCT(VkSurfaceCapabilitiesKHR);
@@ -2148,13 +2176,6 @@ DECLARE_DESERIALISE_TYPE(VkImportAndroidHardwareBufferInfoANDROID);
 DECLARE_DESERIALISE_TYPE(VkMemoryGetAndroidHardwareBufferInfoANDROID);
 DECLARE_DESERIALISE_TYPE(VkExternalFormatANDROID);
 DECLARE_DESERIALISE_TYPE(VkAndroidHardwareBufferFormatProperties2ANDROID);
-#endif
-
-// GGP only structs
-#ifdef VK_USE_PLATFORM_GGP
-DECLARE_REFLECTION_STRUCT(VkPresentFrameTokenGGP);
-
-DECLARE_DESERIALISE_TYPE(VkPresentFrameTokenGGP);
 #endif
 
 // we add these fake enums so we have a type for type-dispatch in the serialiser. Due to C ABI rules
@@ -2287,6 +2308,7 @@ DECLARE_REFLECTION_ENUM(VkPresentModeKHR);
 DECLARE_REFLECTION_ENUM(VkPresentScalingFlagBitsEXT);
 DECLARE_REFLECTION_ENUM(VkPrimitiveTopology);
 DECLARE_REFLECTION_ENUM(VkProvokingVertexModeEXT);
+DECLARE_REFLECTION_ENUM(VkRayTracingShaderGroupTypeKHR);
 DECLARE_REFLECTION_ENUM(VkRenderingFlagBits);
 DECLARE_REFLECTION_ENUM(VkQueryControlFlagBits);
 DECLARE_REFLECTION_ENUM(VkQueryPipelineStatisticFlagBits);
@@ -2307,6 +2329,8 @@ DECLARE_REFLECTION_ENUM(VkSamplerYcbcrRange);
 DECLARE_REFLECTION_ENUM(VkSemaphoreImportFlagBits);
 DECLARE_REFLECTION_ENUM(VkSemaphoreType);
 DECLARE_REFLECTION_ENUM(VkSemaphoreWaitFlagBits);
+DECLARE_REFLECTION_ENUM(VkShaderCodeTypeEXT);
+DECLARE_REFLECTION_ENUM(VkShaderCreateFlagBitsEXT);
 DECLARE_REFLECTION_ENUM(VkShaderFloatControlsIndependence);
 DECLARE_REFLECTION_ENUM(VkShaderStageFlagBits);
 DECLARE_REFLECTION_ENUM(VkSharingMode);

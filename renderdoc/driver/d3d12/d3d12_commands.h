@@ -205,7 +205,7 @@ struct BakedCmdListInfo
   struct PatchRaytracing
   {
     bool m_patched = false;
-    D3D12GpuBuffer m_patchedInstanceBuffer;
+    D3D12GpuBuffer *m_patchedInstanceBuffer;
   };
 
   rdcflatmap<uint32_t, PatchRaytracing> m_patchRaytracingInfo;
@@ -362,6 +362,8 @@ struct D3D12CommandData
   uint64_t m_TimeBase = 0;
   double m_TimeFrequency = 1.0f;
   SDFile *m_StructuredFile;
+
+  rdcarray<PatchedRayDispatch::Resources> m_RayDispatches;
 
   std::map<ResourceId, rdcarray<EventUsage>> m_ResourceUses;
 

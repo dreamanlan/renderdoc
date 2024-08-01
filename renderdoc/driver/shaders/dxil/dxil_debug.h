@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,23 +22,57 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "os/os_specific.h"
+#pragma once
 
-#include <time.h>
-#include <unistd.h>
+#include "common/common.h"
+#include "driver/shaders/dxbc/dxbc_container.h"
+#include "dxil_bytecode.h"
 
-double Timing::GetTickFrequency()
+namespace DXILDebug
 {
-  return 1000000.0;
-}
-
-uint64_t Timing::GetTick()
+typedef rdcstr Id;
+class Debugger;
+struct GlobalState;
+struct BindingSlot
 {
-  timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return uint64_t(ts.tv_sec) * 1000000000ULL + uint32_t(ts.tv_nsec & 0xffffffff);
-}
+  BindingSlot() : shaderRegister(UINT32_MAX), registerSpace(UINT32_MAX) {}
+  BindingSlot(uint32_t shaderReg, uint32_t regSpace)
+      : shaderRegister(shaderReg), registerSpace(regSpace)
+  {
+  }
+  BindingSlot(const DXIL::ResourceReference &resRef)
+      : shaderRegister(resRef.resourceBase.regBase), registerSpace(resRef.resourceBase.space)
+  {
+  }
 
-void Threading::SetCurrentThreadName(const rdcstr &name)
+  bool operator<(const BindingSlot &o) const
+  {
+    if(registerSpace != o.registerSpace)
+      return registerSpace < o.registerSpace;
+    return shaderRegister < o.shaderRegister;
+  }
+
+  uint32_t shaderRegister;
+  uint32_t registerSpace;
+};
+
+class DebugAPIWrapper
 {
-}
+};
+
+struct ThreadState
+{
+};
+
+struct GlobalState
+{
+  GlobalState() = default;
+};
+
+class Debugger : public DXBCContainerDebugger
+{
+public:
+  Debugger() : DXBCContainerDebugger(true){};
+};
+
+};    // namespace DXILDebug

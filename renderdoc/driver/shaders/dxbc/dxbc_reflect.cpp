@@ -25,6 +25,7 @@
 #include "dxbc_reflect.h"
 #include "common/formatting.h"
 #include "core/core.h"
+#include "driver/shaders/dxil/dxil_bytecode.h"
 #include "dxbc_bytecode.h"
 #include "dxbc_container.h"
 
@@ -155,7 +156,8 @@ static void MakeResourceList(bool srv, DXBC::DXBCContainer *dxbc,
                       r.type == DXBC::ShaderInputBind::TYPE_UAV_RWTYPED) &&
                      r.dimension != DXBC::ShaderInputBind::DIM_UNKNOWN &&
                      r.dimension != DXBC::ShaderInputBind::DIM_BUFFER &&
-                     r.dimension != DXBC::ShaderInputBind::DIM_BUFFEREX);
+                     r.dimension != DXBC::ShaderInputBind::DIM_BUFFEREX &&
+                     r.dimension != DXBC::ShaderInputBind::DIM_RTAS);
     res.isReadOnly = srv;
 
     switch(r.dimension)
@@ -163,7 +165,8 @@ static void MakeResourceList(bool srv, DXBC::DXBCContainer *dxbc,
       default:
       case DXBC::ShaderInputBind::DIM_UNKNOWN: res.textureType = TextureType::Unknown; break;
       case DXBC::ShaderInputBind::DIM_BUFFER:
-      case DXBC::ShaderInputBind::DIM_BUFFEREX: res.textureType = TextureType::Buffer; break;
+      case DXBC::ShaderInputBind::DIM_BUFFEREX:
+      case DXBC::ShaderInputBind::DIM_RTAS: res.textureType = TextureType::Buffer; break;
       case DXBC::ShaderInputBind::DIM_TEXTURE1D: res.textureType = TextureType::Texture1D; break;
       case DXBC::ShaderInputBind::DIM_TEXTURE1DARRAY:
         res.textureType = TextureType::Texture1DArray;
@@ -187,8 +190,15 @@ static void MakeResourceList(bool srv, DXBC::DXBCContainer *dxbc,
         break;
     }
 
-    if(r.type == DXBC::ShaderInputBind::TYPE_BYTEADDRESS ||
-       r.type == DXBC::ShaderInputBind::TYPE_UAV_RWBYTEADDRESS)
+    if(r.type == DXBC::ShaderInputBind::TYPE_RTAS)
+    {
+      res.variableType.rows = res.variableType.columns = 1;
+      res.variableType.elements = 1;
+      res.variableType.baseType = VarType::Unknown;
+      res.variableType.name = "RaytracingAccelerationStructure";
+    }
+    else if(r.type == DXBC::ShaderInputBind::TYPE_BYTEADDRESS ||
+            r.type == DXBC::ShaderInputBind::TYPE_UAV_RWBYTEADDRESS)
     {
       res.variableType.rows = res.variableType.columns = 1;
       res.variableType.elements = 1;
@@ -258,7 +268,11 @@ static void MakeResourceList(bool srv, DXBC::DXBCContainer *dxbc,
     res.fixedBindSetOrSpace = r.space;
     res.bindArraySize = r.bindCount == 0 ? ~0U : r.bindCount;
 
-    if(res.isReadOnly)
+    if(r.type == DXBC::ShaderInputBind::TYPE_RTAS)
+    {
+      res.descriptorType = DescriptorType::AccelerationStructure;
+    }
+    else if(res.isReadOnly)
     {
       res.descriptorType = DescriptorType::Image;
       if(!res.isTexture)
@@ -280,7 +294,8 @@ static void MakeResourceList(bool srv, DXBC::DXBCContainer *dxbc,
   }
 }
 
-void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl)
+void MakeShaderReflection(DXBC::DXBCContainer *dxbc, const ShaderEntryPoint &entry,
+                          ShaderReflection *refl)
 {
   if(dxbc == NULL || !RenderDoc::Inst().IsReplayApp())
     return;
@@ -295,6 +310,7 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl)
     case DXBC::ShaderType::Compute: refl->stage = ShaderStage::Compute; break;
     case DXBC::ShaderType::Amplification: refl->stage = ShaderStage::Amplification; break;
     case DXBC::ShaderType::Mesh: refl->stage = ShaderStage::Mesh; break;
+    case DXBC::ShaderType::Library: refl->stage = entry.stage; break;
     default:
       RDCERR("Unexpected DXBC shader type %u", dxbc->m_Type);
       refl->stage = ShaderStage::Vertex;
@@ -305,8 +321,6 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl)
 
   if(dxbc->GetDebugInfo())
   {
-    refl->debugInfo.entrySourceName = refl->entryPoint = dxbc->GetDebugInfo()->GetEntryFunction();
-
     refl->debugInfo.encoding = ShaderEncoding::HLSL;
 
     refl->debugInfo.sourceDebugInformation = true;
@@ -317,9 +331,16 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl)
 
     dxbc->GetDebugInfo()->GetLineInfo(~0U, ~0U, refl->debugInfo.entryLocation);
 
-    rdcstr entry = dxbc->GetDebugInfo()->GetEntryFunction();
-    if(entry.empty())
-      entry = "main";
+    rdcstr entryFunc = entry.name;
+    if(entryFunc.empty())
+      entryFunc = dxbc->GetDebugInfo()->GetEntryFunction();
+    if(entryFunc.empty())
+      entryFunc = "main";
+
+    refl->debugInfo.entrySourceName = refl->entryPoint = entryFunc;
+
+    // demangle DXIL source names for display
+    refl->debugInfo.entrySourceName = DXBC::BasicDemangle(refl->entryPoint);
 
     // assume the debug info put the file with the entry point at the start. SDBG seems to do this
     // by default, and SPDB has an extra sorting step that probably maybe possibly does this.
@@ -336,6 +357,7 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl)
       case DXBC::ShaderType::Hull: profile = "hs"; break;
       case DXBC::ShaderType::Domain: profile = "ds"; break;
       case DXBC::ShaderType::Compute: profile = "cs"; break;
+      case DXBC::ShaderType::Library: profile = "lib"; break;
       default: profile = "xx"; break;
     }
     profile += StringFormat::Fmt("_%u_%u", dxbc->m_Version.Major, dxbc->m_Version.Minor);
@@ -346,18 +368,15 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl)
   if(dxbc->GetDXBCByteCode())
   {
     refl->debugInfo.debugStatus = dxbc->GetDXBCByteCode()->GetDebugStatus();
-
-    refl->debugInfo.debuggable = refl->debugInfo.debugStatus.empty();
   }
   else
   {
-    refl->debugInfo.debuggable = false;
-
     if(dxbc->GetDXILByteCode())
-      refl->debugInfo.debugStatus = "Debugging DXIL is not supported";
+      refl->debugInfo.debugStatus = dxbc->GetDXILByteCode()->GetDebugStatus();
     else
       refl->debugInfo.debugStatus = "Shader contains no recognised bytecode";
   }
+  refl->debugInfo.debuggable = refl->debugInfo.debugStatus.empty();
 
   refl->encoding = ShaderEncoding::DXBC;
   refl->debugInfo.compiler = KnownShaderTool::fxc;
@@ -455,5 +474,25 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl)
   {
     refl->taskPayload.variables.push_back(
         MakeConstantBufferVariable(false, dxbcRefl->TaskPayload.members[v]));
+  }
+
+  DXBC::CBufferVariableType RayPayload = dxbc->GetRayPayload(entry);
+  DXBC::CBufferVariableType RayAttributes = dxbc->GetRayAttributes(entry);
+
+  refl->rayPayload.bufferBacked = false;
+  refl->rayPayload.name = RayPayload.name;
+  refl->rayPayload.variables.reserve(RayPayload.members.size());
+  for(size_t v = 0; v < RayPayload.members.size(); v++)
+  {
+    refl->rayPayload.variables.push_back(MakeConstantBufferVariable(false, RayPayload.members[v]));
+  }
+
+  refl->rayAttributes.bufferBacked = false;
+  refl->rayAttributes.name = RayAttributes.name;
+  refl->rayAttributes.variables.reserve(RayAttributes.members.size());
+  for(size_t v = 0; v < RayAttributes.members.size(); v++)
+  {
+    refl->rayAttributes.variables.push_back(
+        MakeConstantBufferVariable(false, RayAttributes.members[v]));
   }
 }

@@ -209,7 +209,7 @@ public:
 
           const BindingStorage &bindStorage =
               m_pDriver->GetCurrentDescSetBindingStorage(srcData.descSet);
-          const DescriptorSetSlot *first = bindStorage.binds[0];
+          const DescriptorSetSlot *first = bindStorage.binds.empty() ? NULL : bindStorage.binds[0];
           for(size_t b = 0; b < bindStorage.binds.size(); b++)
           {
             const DescSetLayout::Binding &layoutBind =
@@ -1508,7 +1508,8 @@ private:
   struct ImageData
   {
     uint32_t width = 0, height = 0, depth = 0;
-    uint32_t texelSize = 0, rowPitch = 0, slicePitch = 0, samplePitch = 0;
+    uint32_t texelSize = 0;
+    uint64_t rowPitch = 0, slicePitch = 0, samplePitch = 0;
     ResourceFormat fmt;
     bytebuf bytes;
 
@@ -1725,15 +1726,15 @@ private:
           ResourceFormat fmt = MakeResourceFormat(imageProps.format);
 
           data.fmt = MakeResourceFormat(imageProps.format);
-          data.texelSize = GetByteSize(1, 1, 1, imageProps.format, 0);
-          data.rowPitch = GetByteSize(data.width, 1, 1, imageProps.format, 0);
+          data.texelSize = (uint32_t)GetByteSize(1, 1, 1, imageProps.format, 0);
+          data.rowPitch = (uint32_t)GetByteSize(data.width, 1, 1, imageProps.format, 0);
           data.slicePitch = GetByteSize(data.width, data.height, 1, imageProps.format, 0);
           data.samplePitch = GetByteSize(data.width, data.height, data.depth, imageProps.format, 0);
 
           const uint32_t numSlices = imageProps.type == VK_IMAGE_TYPE_3D ? 1 : data.depth;
           const uint32_t numSamples = (uint32_t)imageProps.samples;
 
-          data.bytes.reserve(data.samplePitch * numSamples);
+          data.bytes.reserve(size_t(data.samplePitch * numSamples));
 
           // defaults are fine - no interpretation. Maybe we could use the view's typecast?
           const GetTextureDataParams params = GetTextureDataParams();
@@ -3917,12 +3918,6 @@ static void CreatePSInputFetcher(rdcarray<uint32_t> &fragspv, uint32_t &structSt
 ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, uint32_t instid,
                                             uint32_t idx, uint32_t view)
 {
-  if(!GetAPIProperties().shaderDebugging)
-  {
-    RDCUNIMPLEMENTED("Vertex debugging not yet implemented for Vulkan");
-    return new ShaderDebugTrace;
-  }
-
   const VulkanRenderState &state = m_pDriver->GetRenderState();
   VulkanCreationInfo &c = m_pDriver->m_CreationInfo;
 
@@ -4011,7 +4006,7 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
 
     bytebuf data;
 
-    size_t size = GetByteSize(1, 1, 1, attr.format, 0);
+    size_t size = (size_t)GetByteSize(1, 1, 1, attr.format, 0);
 
     bool found = false;
 
@@ -4162,12 +4157,6 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
 ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y,
                                            const DebugPixelInputs &inputs)
 {
-  if(!GetAPIProperties().shaderDebugging)
-  {
-    RDCUNIMPLEMENTED("Pixel debugging not yet implemented for Vulkan");
-    return new ShaderDebugTrace;
-  }
-
   if(!m_pDriver->GetDeviceEnabledFeatures().fragmentStoresAndAtomics)
   {
     RDCWARN("Pixel debugging is not supported without fragment stores");
@@ -4383,8 +4372,11 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
 
   // use the load RP if an RP is specified
   if(graphicsInfo.renderPass != VK_NULL_HANDLE)
+  {
     graphicsInfo.renderPass =
         c.m_RenderPass[GetResID(graphicsInfo.renderPass)].loadRPs[graphicsInfo.subpass];
+    graphicsInfo.subpass = 0;
+  }
 
   // struct size is PSHit header plus 5x structStride = base, ddxcoarse, ddycoarse, ddxfine, ddyfine
   uint32_t structSize = sizeof(PSHit) + structStride * 5;
@@ -4926,12 +4918,6 @@ ShaderDebugTrace *VulkanReplay::DebugThread(uint32_t eventId,
                                             const rdcfixedarray<uint32_t, 3> &groupid,
                                             const rdcfixedarray<uint32_t, 3> &threadid)
 {
-  if(!GetAPIProperties().shaderDebugging)
-  {
-    RDCUNIMPLEMENTED("Compute debugging not yet implemented for Vulkan");
-    return new ShaderDebugTrace;
-  }
-
   const VulkanRenderState &state = m_pDriver->GetRenderState();
   VulkanCreationInfo &c = m_pDriver->m_CreationInfo;
 

@@ -437,7 +437,7 @@ HRESULT WrappedID3D12Device::CreateResource(
 
   if(FAILED(ret))
   {
-    CheckHRESULT(ret);
+    CHECK_HR(this, ret);
     return ret;
   }
 
@@ -544,6 +544,7 @@ HRESULT WrappedID3D12Device::CreateResource(
        InitialLayout.ToStates() == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
     {
       wrapped->MarkAsAccelerationStructureResource();
+      m_UsedRT = true;
     }
     else
     {

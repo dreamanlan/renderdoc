@@ -206,6 +206,7 @@
     <ClInclude Include="common\timing.h" />
     <ClInclude Include="common\wrapped_pool.h" />
     <ClInclude Include="core\bit_flag_iterator.h" />
+    <ClInclude Include="core\gpu_address_range_tracker.h" />
     <ClInclude Include="core\settings.h" />
     <ClInclude Include="core\core.h" />
     <ClInclude Include="core\crash_handler.h" />
@@ -243,6 +244,7 @@
     </ClInclude>
     <ClInclude Include="os\win32\dia2_stubs.h" />
     <ClInclude Include="os\win32\win32_specific.h" />
+    <ClInclude Include="replay\common\var_dispatch_helpers.h" />
     <ClInclude Include="replay\dummy_driver.h" />
     <ClInclude Include="replay\replay_driver.h" />
     <ClInclude Include="replay\replay_controller.h" />
@@ -531,8 +533,11 @@
     <ClCompile Include="android\jdwp_util.cpp" />
     <ClCompile Include="common\common.cpp" />
     <ClCompile Include="common\dds_readwrite.cpp" />
+    <ClCompile Include="common\jobsystem.cpp" />
+    <ClCompile Include="common\jobsystem_tests.cpp" />
     <ClCompile Include="common\threading_tests.cpp" />
     <ClCompile Include="core\bit_flag_iterator_tests.cpp" />
+    <ClCompile Include="core\gpu_address_range_tracker.cpp" />
     <ClCompile Include="core\settings.cpp" />
     <ClCompile Include="core\core.cpp">
       <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>

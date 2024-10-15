@@ -45,12 +45,29 @@ namespace DXILDebug
 {
 class Debugger;
 struct ThreadState;
+const uint32_t INVALID_ID = ~0U;
+typedef uint32_t Id;
 };
 
 namespace DXIL
 {
 static const rdcstr DXIL_FAKE_OUTPUT_STRUCT_NAME("_OUT");
 static const rdcstr DXIL_FAKE_INPUT_STRUCT_NAME("_IN");
+
+enum class FunctionFamily : uint8_t
+{
+  Unknown,
+  LLVM,
+  DXOp,
+  LLVMDbg,
+};
+
+enum class LLVMDbgOp : uint8_t
+{
+  Unknown = 0,
+  Declare,
+  Value,
+};
 
 struct BumpAllocator
 {
@@ -1077,10 +1094,12 @@ struct GlobalVar : public ForwardReferencableValue<GlobalVar>
   static constexpr ValueKind Kind = ValueKind::GlobalVar;
   GlobalVar() : ForwardReferencableValue(Kind) {}
   rdcstr name;
-  uint64_t align = 0;
+  const Constant *initialiser = NULL;
+  uint32_t align = 0;
   int32_t section = -1;
   GlobalFlags flags = GlobalFlags::NoFlags;
-  const Constant *initialiser = NULL;
+  // unique global ID used by the debugger and disassembly similar to Instruction member variable slot
+  uint32_t ssaId = ~0U;
 };
 
 struct DIBase
@@ -1266,7 +1285,7 @@ struct Instruction : public ForwardReferencableValue<Instruction>
   // For DXC Compatibility mode: slot contains a number assigned to instructions that don't have
   // names and return a value, used for disassembly
 
-  // Otherwise a unique global ID used by the debugger and disassemvbly
+  // Otherwise a unique global ID used by the debugger and disassembly
   uint32_t slot = ~0U;
   InstructionFlags &opFlags() { return (InstructionFlags &)flags; }
   InstructionFlags opFlags() const { return (InstructionFlags)flags; }
@@ -1365,6 +1384,9 @@ struct Function : public Value
 
   rdcarray<UselistEntry> uselist;
   AttachedMetadata attachedMeta;
+
+  FunctionFamily family = FunctionFamily::Unknown;
+  LLVMDbgOp llvmDbgOp = LLVMDbgOp::Unknown;
 };
 
 class LLVMOrderAccumulator
@@ -1519,6 +1541,14 @@ class Program : public DXBC::IDebugInfo
 {
   friend DXILDebug::Debugger;
   friend DXILDebug::ThreadState;
+
+  struct LocalSourceVariable
+  {
+    uint32_t startInst;
+    uint32_t endInst;
+    rdcarray<SourceVariableMapping> sourceVars;
+  };
+
 public:
   Program(const byte *bytes, size_t length);
   Program(const Program &o) = delete;
@@ -1529,7 +1559,8 @@ public:
 
   const bytebuf &GetBytes() const { return m_Bytes; }
   void FetchComputeProperties(DXBC::Reflection *reflection);
-  DXBC::Reflection *GetReflection();
+  void FetchEntryPoint();
+  DXBC::Reflection *BuildReflection();
   rdcstr GetDebugStatus();
   rdcarray<ShaderEntryPoint> GetEntryPoints();
   void FillEntryPointInterfaces();
@@ -1572,8 +1603,11 @@ protected:
   void ParseConstant(ValueList &values, const LLVMBC::BlockOrRecord &constant);
   bool ParseDebugMetaRecord(MetadataList &metadata, const LLVMBC::BlockOrRecord &metaRecord,
                             Metadata &meta);
-  rdcstr GetDebugVarName(const DIBase *d);
-  rdcstr GetFunctionScopeName(const DIBase *d);
+  rdcstr GetDebugVarName(const DIBase *d) const;
+  rdcstr GetFunctionScopeName(const DIBase *d) const;
+  rdcstr GetDebugScopeFilePath(const DIBase *d) const;
+  uint64_t GetDebugScopeLine(const DIBase *d) const;
+  const Metadata *GetDebugScopeParent(const DIBase *d) const;
 
   rdcstr GetValueSymtabString(Value *v);
   void SetValueSymtabString(Value *v, const rdcstr &s);
@@ -1661,6 +1695,7 @@ protected:
   std::map<rdcstr, size_t> m_ResourceHandles;
   std::map<rdcstr, rdcstr> m_SsaAliases;
   std::map<rdcstr, uint32_t> m_ResourceAnnotateCounts;
+  rdcarray<LocalSourceVariable> m_Locals;
 
   rdcarray<ResourceReference> m_ResourceReferences;
   rdcstr m_Disassembly;
@@ -1692,6 +1727,7 @@ bool getival(const Value *v, T &out)
 }
 
 bool IsSSA(const Value *dxilValue);
+DXILDebug::Id GetSSAId(const DXIL::Value *value);
 bool IsDXCNop(const Instruction &inst);
 bool IsLLVMDebugCall(const Instruction &inst);
 
@@ -1706,3 +1742,5 @@ DECLARE_STRINGISE_TYPE(DXIL::Operation);
 DECLARE_STRINGISE_TYPE(DXIL::DXOp);
 DECLARE_STRINGISE_TYPE(DXIL::Type::TypeKind);
 DECLARE_STRINGISE_TYPE(DXIL::Type::ScalarKind);
+DECLARE_STRINGISE_TYPE(DXIL::LLVMDbgOp);
+DECLARE_STRINGISE_TYPE(DXIL::DIBase::Type);

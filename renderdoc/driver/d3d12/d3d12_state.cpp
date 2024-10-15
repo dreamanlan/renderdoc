@@ -71,7 +71,7 @@ void D3D12RenderState::ResolvePendingIndirectState(WrappedID3D12Device *device)
 
   D3D12_RANGE range = {0, D3D12CommandData::m_IndirectSize};
   byte *mapPtr = NULL;
-  device->CheckHRESULT(indirectState.argsBuf->Map(0, &range, (void **)&mapPtr));
+  CHECK_HR(device, indirectState.argsBuf->Map(0, &range, (void **)&mapPtr));
 
   if(device->HasFatalError())
     return;
@@ -214,8 +214,12 @@ void D3D12RenderState::ApplyState(WrappedID3D12Device *dev, ID3D12GraphicsComman
 {
   D3D12_COMMAND_LIST_TYPE type = cmd->GetType();
 
+  ID3D12PipelineState *pipeState = NULL;
   if(pipe != ResourceId())
-    cmd->SetPipelineState(GetResourceManager()->GetCurrentAs<ID3D12PipelineState>(pipe));
+  {
+    pipeState = GetResourceManager()->GetCurrentAs<ID3D12PipelineState>(pipe);
+    cmd->SetPipelineState(pipeState);
+  }
 
   if(stateobj != ResourceId())
     cmd->SetPipelineState1(GetResourceManager()->GetCurrentAs<ID3D12StateObject>(stateobj));
@@ -270,14 +274,17 @@ void D3D12RenderState::ApplyState(WrappedID3D12Device *dev, ID3D12GraphicsComman
       }
     }
 
-    if(GetWrapped(cmd)->GetReal9())
+    if(GetWrapped(cmd)->GetReal9() && pipeState)
     {
-      if(dev->GetOpts15().DynamicIndexBufferStripCutSupported)
+      WrappedID3D12PipelineState *wrappedPipe = (WrappedID3D12PipelineState *)pipeState;
+      if(dev->GetOpts15().DynamicIndexBufferStripCutSupported && wrappedPipe->IsGraphics() &&
+         (wrappedPipe->graphics->Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT))
       {
         cmd->IASetIndexBufferStripCutValue(cutValue);
       }
 
-      if(dev->GetOpts16().DynamicDepthBiasSupported)
+      if(dev->GetOpts16().DynamicDepthBiasSupported && wrappedPipe->IsGraphics() &&
+         (wrappedPipe->graphics->Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS))
       {
         cmd->RSSetDepthBias(depthBias, depthBiasClamp, slopeScaledDepthBias);
       }

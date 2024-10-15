@@ -111,6 +111,7 @@ public:
   const VulkanCreationInfo::Image &GetImageInfo(ResourceId img) const;
   const VulkanCreationInfo::ImageView &GetImageViewInfo(ResourceId imgView) const;
   const VulkanCreationInfo::Pipeline &GetPipelineInfo(ResourceId pipe) const;
+  const VulkanCreationInfo::ShaderObject &GetShaderObjectInfo(ResourceId shader) const;
   const VulkanCreationInfo::ShaderModule &GetShaderInfo(ResourceId shader) const;
   const VulkanCreationInfo::Framebuffer &GetFramebufferInfo(ResourceId fb) const;
   const VulkanCreationInfo::RenderPass &GetRenderPassInfo(ResourceId rp) const;
@@ -120,7 +121,6 @@ public:
   const WrappedVulkan::DescriptorSetInfo &GetDescSetInfo(ResourceId ds) const;
 
 private:
-  void CheckVkResult(VkResult vkr) { return m_pDriver->CheckVkResult(vkr); }
   // GetBufferData
   GPUBuffer m_ReadbackWindow;
   byte *m_ReadbackPtr = NULL;

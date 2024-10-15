@@ -43,9 +43,14 @@
 #include "d3d12_resources.h"
 #include "d3d12_shader_cache.h"
 
+RDOC_EXTERN_CONFIG(bool, Replay_Debug_PrintChunkTimings);
+
+RDOC_EXTERN_CONFIG(bool, Replay_Debug_SingleThreadedCompilation);
+
 RDOC_DEBUG_CONFIG(bool, D3D12_Debug_SingleSubmitFlushing, false,
                   "Every command buffer is submitted and fully flushed to the GPU, to narrow down "
                   "the source of problems.");
+RDOC_DEBUG_CONFIG(bool, D3D12_Debug_RTOverlay, false, "Add some RT tracking to the overlay.");
 
 WRAPPED_POOL_INST(WrappedID3D12Device);
 
@@ -110,7 +115,8 @@ HRESULT STDMETHODCALLTYPE DummyID3D12DebugDevice::QueryInterface(REFIID riid, vo
      riid == __uuidof(ID3D12Device5) || riid == __uuidof(ID3D12Device6) ||
      riid == __uuidof(ID3D12Device7) || riid == __uuidof(ID3D12Device8) ||
      riid == __uuidof(ID3D12Device9) || riid == __uuidof(ID3D12Device10) ||
-     riid == __uuidof(ID3D12Device11) || riid == __uuidof(ID3D12Device12))
+     riid == __uuidof(ID3D12Device11) || riid == __uuidof(ID3D12Device12) ||
+     riid == __uuidof(ID3D12Device13) || riid == __uuidof(ID3D12Device14))
     return m_pDevice->QueryInterface(riid, ppvObject);
 
   if(riid == __uuidof(IUnknown))
@@ -146,7 +152,8 @@ HRESULT STDMETHODCALLTYPE WrappedID3D12DebugDevice::QueryInterface(REFIID riid, 
      riid == __uuidof(ID3D12Device5) || riid == __uuidof(ID3D12Device6) ||
      riid == __uuidof(ID3D12Device7) || riid == __uuidof(ID3D12Device8) ||
      riid == __uuidof(ID3D12Device9) || riid == __uuidof(ID3D12Device10) ||
-     riid == __uuidof(ID3D12Device11) || riid == __uuidof(ID3D12Device12))
+     riid == __uuidof(ID3D12Device11) || riid == __uuidof(ID3D12Device12) ||
+     riid == __uuidof(ID3D12Device13) || riid == __uuidof(ID3D12Device14))
     return m_pDevice->QueryInterface(riid, ppvObject);
 
   if(riid == __uuidof(IUnknown))
@@ -556,6 +563,8 @@ WrappedID3D12Device::WrappedID3D12Device(ID3D12Device *realDevice, D3D12InitPara
   m_pDevice10 = NULL;
   m_pDevice11 = NULL;
   m_pDevice12 = NULL;
+  m_pDevice13 = NULL;
+  m_pDevice14 = NULL;
   m_pDownlevel = NULL;
   if(m_pDevice)
   {
@@ -571,6 +580,8 @@ WrappedID3D12Device::WrappedID3D12Device(ID3D12Device *realDevice, D3D12InitPara
     m_pDevice->QueryInterface(__uuidof(ID3D12Device10), (void **)&m_pDevice10);
     m_pDevice->QueryInterface(__uuidof(ID3D12Device11), (void **)&m_pDevice11);
     m_pDevice->QueryInterface(__uuidof(ID3D12Device12), (void **)&m_pDevice12);
+    m_pDevice->QueryInterface(__uuidof(ID3D12Device13), (void **)&m_pDevice13);
+    m_pDevice->QueryInterface(__uuidof(ID3D12Device14), (void **)&m_pDevice14);
     m_pDevice->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData), (void **)&m_DRED.m_pReal);
     m_pDevice->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData1), (void **)&m_DRED.m_pReal1);
     m_pDevice->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
@@ -588,6 +599,16 @@ WrappedID3D12Device::WrappedID3D12Device(ID3D12Device *realDevice, D3D12InitPara
           m_pDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(i));
 
     HRESULT hr = S_OK;
+
+    {
+      D3D12_FEATURE_DATA_ROOT_SIGNATURE rootSigVer;
+      hr = m_pDevice->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &rootSigVer,
+                                          sizeof(rootSigVer));
+      if(hr != S_OK)
+        rootSigVer.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
+
+      m_RootSigVersion = rootSigVer.HighestVersion;
+    }
 
     hr = m_pDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &m_D3D12Opts,
                                         sizeof(m_D3D12Opts));
@@ -825,6 +846,9 @@ WrappedID3D12Device::WrappedID3D12Device(ID3D12Device *realDevice, D3D12InitPara
           // message about mismatched SRV dimensions, which it seems to get wrong with the
           // dummy NULL descriptors on the texture sampling code
           D3D12_MESSAGE_ID_COMMAND_LIST_STATIC_DESCRIPTOR_RESOURCE_DIMENSION_MISMATCH,
+
+          // This error has a bug, it doesn't properly count events
+          D3D12_MESSAGE_ID_PIX_EVENT_UNDERFLOW,
       };
 
       D3D12_INFO_QUEUE_FILTER filter = {};
@@ -847,6 +871,12 @@ WrappedID3D12Device::WrappedID3D12Device(ID3D12Device *realDevice, D3D12InitPara
 
 WrappedID3D12Device::~WrappedID3D12Device()
 {
+  if(!m_Replay->IsRemoteProxy())
+  {
+    Threading::JobSystem::SyncAllJobs();
+    GetResourceManager()->ResolveDeferredWrappers();
+  }
+
   {
     SCOPED_LOCK(m_DeviceWrappersLock);
     m_DeviceWrappers.erase(m_pDevice);
@@ -910,6 +940,8 @@ WrappedID3D12Device::~WrappedID3D12Device()
   SAFE_RELEASE(m_CompatDevice.m_pReal);
   SAFE_RELEASE(m_SharingContract.m_pReal);
   SAFE_RELEASE(m_pDownlevel);
+  SAFE_RELEASE(m_pDevice14);
+  SAFE_RELEASE(m_pDevice13);
   SAFE_RELEASE(m_pDevice12);
   SAFE_RELEASE(m_pDevice11);
   SAFE_RELEASE(m_pDevice10);
@@ -1230,11 +1262,48 @@ HRESULT WrappedID3D12Device::QueryInterface(REFIID riid, void **ppvObject)
       return E_NOINTERFACE;
     }
   }
+  else if(riid == __uuidof(ID3D12Device13))
+  {
+    if(m_pDevice13)
+    {
+      AddRef();
+      *ppvObject = (ID3D12Device13 *)this;
+      return S_OK;
+    }
+    else
+    {
+      return E_NOINTERFACE;
+    }
+  }
+  else if(riid == __uuidof(ID3D12Device14))
+  {
+    if(m_pDevice14)
+    {
+      AddRef();
+      *ppvObject = (ID3D12Device14 *)this;
+      return S_OK;
+    }
+    else
+    {
+      return E_NOINTERFACE;
+    }
+  }
   else if(riid == __uuidof(ID3D12DeviceConfiguration))
   {
     if(m_DevConfig.IsValid())
     {
       *ppvObject = (ID3D12DeviceConfiguration *)&m_DevConfig;
+      AddRef();
+      return S_OK;
+    }
+
+    return E_NOINTERFACE;
+  }
+  else if(riid == __uuidof(ID3D12DeviceConfiguration1))
+  {
+    if(m_DevConfig.IsValid1())
+    {
+      *ppvObject = (ID3D12DeviceConfiguration1 *)&m_DevConfig;
       AddRef();
       return S_OK;
     }
@@ -1491,7 +1560,7 @@ HRESULT WrappedID3D12Device::CreateInitialStateBuffer(const D3D12_RESOURCE_DESC 
 
     if(FAILED(ret))
     {
-      CheckHRESULT(ret);
+      CHECK_HR(this, ret);
       RDCERR("Couldn't create new initial state heap #%zu: %s", m_InitialStateHeaps.size(),
              ToStr(ret).c_str());
       SAFE_RELEASE(heap);
@@ -1961,7 +2030,7 @@ bool WrappedID3D12Device::Serialise_MapDataWrite(SerialiserType &ser, ID3D12Reso
     else
     {
       HRESULT hr = Resource->Map(Subresource, &nopRange, (void **)&MappedData);
-      CheckHRESULT(hr);
+      CHECK_HR(this, hr);
       if(FAILED(hr))
       {
         RDCERR("Failed to map resource on replay HRESULT: %s", ToStr(hr).c_str());
@@ -1990,7 +2059,7 @@ bool WrappedID3D12Device::Serialise_MapDataWrite(SerialiserType &ser, ID3D12Reso
     {
       byte *writePtr = NULL;
       HRESULT hr = Resource->Map(Subresource, &nopRange, (void **)&writePtr);
-      CheckHRESULT(hr);
+      CHECK_HR(this, hr);
       if(FAILED(hr))
       {
         RDCERR("Failed to map resource on replay HRESULT: %s", ToStr(hr).c_str());
@@ -2061,7 +2130,7 @@ bool WrappedID3D12Device::Serialise_MapDataWrite(SerialiserType &ser, ID3D12Reso
         D3D12_RANGE maprange = {0, 0};
         void *dst = NULL;
         HRESULT hr = uploadBuf->Map(Subresource, &maprange, &dst);
-        CheckHRESULT(hr);
+        CHECK_HR(this, hr);
 
         if(SUCCEEDED(hr))
         {
@@ -2222,7 +2291,7 @@ bool WrappedID3D12Device::Serialise_WriteToSubresource(SerialiserType &ser, ID3D
         D3D12_RANGE range = {0, 0};
         void *dst = NULL;
         HRESULT hr = uploadBuf->Map(Subresource, &range, &dst);
-        CheckHRESULT(hr);
+        CHECK_HR(this, hr);
 
         if(SUCCEEDED(hr))
         {
@@ -2260,7 +2329,7 @@ bool WrappedID3D12Device::Serialise_WriteToSubresource(SerialiserType &ser, ID3D
     else
     {
       HRESULT hr = Resource->Map(Subresource, NULL, NULL);
-      CheckHRESULT(hr);
+      CHECK_HR(this, hr);
 
       if(SUCCEEDED(hr))
       {
@@ -2363,6 +2432,35 @@ HRESULT WrappedID3D12Device::Present(ID3D12GraphicsCommandList *pOverlayCommandL
 
         rdcstr overlayText =
             RenderDoc::Inst().GetOverlayText(RDCDriver::D3D12, devWnd, m_FrameCounter, 0);
+
+#if ENABLED(RDOC_DEVEL)
+        if(D3D12_Debug_RTOverlay() && m_UsedRT)
+        {
+          double now = GetResourceManager()->GetRTManager()->GetCurrentASTimestamp();
+          ASStats blasStats = {}, tlasStats = {};
+
+          ASBuildData::GatherASAgeStatistics(GetResourceManager(), now, blasStats, tlasStats);
+
+          overlayText += "       TLAS               BLAS\n";
+
+          for(size_t i = 0; i < ARRAY_COUNT(tlasStats.bucket); i++)
+          {
+            if(tlasStats.bucket[i].msThreshold == ~0U)
+              overlayText += "  older    ";
+            else
+              overlayText += StringFormat::Fmt("<=% 4ums   ", tlasStats.bucket[i].msThreshold);
+
+            overlayText += StringFormat::Fmt(
+                "% 4u (% 3.2f MB)   % 4u (%.2f MB)\n", tlasStats.bucket[i].count,
+                float(tlasStats.bucket[i].bytes) / 1048576.0f, blasStats.bucket[i].count,
+                float(blasStats.bucket[i].bytes) / 1048576.0f);
+          }
+
+          overlayText += StringFormat::Fmt(
+              "%.2f MB overhead\n",
+              float(blasStats.overheadBytes + tlasStats.overheadBytes) / 1048576.0f);
+        }
+#endif
 
         m_TextRenderer->RenderText(list, 0.0f, 0.0f, overlayText);
 
@@ -2497,8 +2595,7 @@ bool WrappedID3D12Device::Serialise_BeginCaptureFrame(SerialiserType &ser)
     m_InitialResourceStates = m_ResourceStates;
 
     GetDebugManager()->PrepareExecuteIndirectPatching(m_OrigGPUAddresses);
-    GetResourceManager()->GetRaytracingResourceAndUtilHandler()->PrepareRayDispatchBuffer(
-        &m_OrigGPUAddresses);
+    GetResourceManager()->GetRTManager()->PrepareRayDispatchBuffer(&m_OrigGPUAddresses);
   }
 
   std::map<ResourceId, SubresourceStateVector> initialStates;
@@ -2594,7 +2691,7 @@ void WrappedID3D12Device::StartFrameCapture(DeviceOwnedWindow devWnd)
     GPUSyncAllQueues();
 
     // wait until we've synced all queues to check for these
-    GetResourceManager()->GetRaytracingResourceAndUtilHandler()->CheckPendingASBuilds();
+    GetResourceManager()->GetRTManager()->CheckPendingASBuilds();
 
     GetResourceManager()->PrepareInitialContents();
 
@@ -3517,7 +3614,7 @@ rdcarray<DebugMessage> WrappedID3D12Device::GetDebugMessages()
   return ret;
 }
 
-void WrappedID3D12Device::CheckHRESULT(HRESULT hr)
+void WrappedID3D12Device::CheckHRESULT(const char *file, int line, HRESULT hr)
 {
   if(SUCCEEDED(hr) || HasFatalError())
     return;
@@ -3525,25 +3622,40 @@ void WrappedID3D12Device::CheckHRESULT(HRESULT hr)
   if(hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
      hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR)
   {
-    SET_ERROR_RESULT(m_FatalError, ResultCode::DeviceLost, "Logging device lost fatal error for %s",
-                     ToStr(hr).c_str());
+    SET_ERROR_RESULT(m_FatalError, ResultCode::DeviceLost,
+                     "Logging device lost fatal error at %s:%d: %s", file, line, ToStr(hr).c_str());
   }
   else if(hr == E_OUTOFMEMORY)
   {
     if(m_OOMHandler)
     {
-      RDCLOG("Ignoring out of memory error that will be handled");
+      RDCLOG("Ignoring out of memory error at %s:%d that will be handled");
     }
     else
     {
-      RDCLOG("Logging out of memory fatal error for %s", ToStr(hr).c_str());
+      RDCLOG("Logging out of memory error at %s:%d: %s", file, line, ToStr(hr).c_str());
       m_FatalError = ResultCode::OutOfMemory;
     }
   }
   else
   {
-    RDCLOG("Ignoring return code %s", ToStr(hr).c_str());
+    RDCLOG("Ignoring return code at %s:%d: %s", file, line, ToStr(hr).c_str());
   }
+}
+
+void WrappedID3D12Device::CheckDeferredResult(const RDResult &res)
+{
+  if(res == ResultCode::Succeeded)
+    return;
+
+  SCOPED_LOCK(m_DeferredResultLock);
+  m_DeferredResult = res;
+}
+
+void WrappedID3D12Device::AddDeferredTime(double ms)
+{
+  SCOPED_LOCK(m_DeferredResultLock);
+  m_DeferredTime += ms;
 }
 
 template <typename SerialiserType>
@@ -3611,7 +3723,10 @@ bool WrappedID3D12Device::Serialise_SetName(SerialiserType &ser, ID3D12DeviceChi
     if(Name && Name[0])
     {
       descr.SetCustomName(Name);
-      pResource->SetName(StringFormat::UTF82Wide(Name).c_str());
+
+      // defer setting names on real resources so we can do this independent of any jobs without
+      // needing to push more jobs
+      m_CustomNames.push_back({pResource, Name});
     }
     AddResourceCurChunk(descr);
   }
@@ -3828,12 +3943,24 @@ bool WrappedID3D12Device::Serialise_SetPipelineStackSize(SerialiserType &ser,
 
   if(IsReplayingAndReading() && pStateObject)
   {
-    ID3D12StateObjectProperties *properties = NULL;
-    pStateObject->QueryInterface(__uuidof(ID3D12StateObjectProperties), (void **)&properties);
+    auto setSize = [pStateObject, StackSize]() {
+      ID3D12StateObjectProperties *properties = NULL;
+      pStateObject->QueryInterface(__uuidof(ID3D12StateObjectProperties), (void **)&properties);
 
-    properties->SetPipelineStackSize(StackSize);
+      properties->SetPipelineStackSize(StackSize);
 
-    SAFE_RELEASE(properties);
+      SAFE_RELEASE(properties);
+    };
+
+    if(Replay_Debug_SingleThreadedCompilation())
+    {
+      setSize();
+    }
+    else
+    {
+      Threading::JobSystem::AddJob([setSize]() { setSize(); },
+                                   {GetWrapped(pStateObject)->deferredJob});
+    }
   }
 
   return true;
@@ -4079,7 +4206,7 @@ void WrappedID3D12Device::CreateInternalResources()
     }
   }
 
-  GetResourceManager()->GetRaytracingResourceAndUtilHandler()->CreateInternalResources();
+  GetResourceManager()->GetRTManager()->CreateInternalResources();
 
   // we don't want replay-only shaders added in WrappedID3D12Shader to pollute the list of resources
   WrappedID3D12Shader::InternalResources(true);
@@ -4172,16 +4299,13 @@ void WrappedID3D12Device::CreateInternalResources()
 
   m_GPUSyncCounter = 0;
 
-  if(IsReplayMode(m_State))
-    GetShaderCache()->SetDevConfiguration(m_Replay->GetDevConfiguration());
-
   if(m_TextRenderer == NULL)
     m_TextRenderer = new D3D12TextRenderer(this);
 
   m_Replay->CreateResources();
 
   WrappedID3D12Shader::InternalResources(false);
-  GetResourceManager()->GetRaytracingResourceAndUtilHandler()->InitInternalResources();
+  GetResourceManager()->GetRTManager()->InitInternalResources();
 }
 
 void WrappedID3D12Device::DestroyInternalResources()
@@ -4237,14 +4361,14 @@ void WrappedID3D12Device::GPUSync(ID3D12CommandQueue *queue, ID3D12Fence *fence)
     fence = m_GPUSyncFence;
 
   HRESULT hr = queue->Signal(fence, m_GPUSyncCounter);
-  CheckHRESULT(hr);
+  CHECK_HR(this, hr);
   RDCASSERTEQUAL(hr, S_OK);
 
   fence->SetEventOnCompletion(m_GPUSyncCounter, m_GPUSyncHandle);
   WaitForSingleObject(m_GPUSyncHandle, 10000);
 
   hr = m_pDevice->GetDeviceRemovedReason();
-  CheckHRESULT(hr);
+  CHECK_HR(this, hr);
   RDCASSERTEQUAL(hr, S_OK);
 }
 
@@ -4283,7 +4407,7 @@ ID3D12GraphicsCommandListX *WrappedID3D12Device::GetNewList()
     ret = (ID3D12GraphicsCommandListX *)list;
 
     RDCASSERTEQUAL(hr, S_OK);
-    CheckHRESULT(hr);
+    CHECK_HR(this, hr);
 
     if(ret == NULL)
       return NULL;
@@ -4453,6 +4577,7 @@ bool WrappedID3D12Device::ProcessChunk(ReadSerialiser &ser, D3D12Chunk context)
       return Serialise_CreatePipelineState(ser, NULL, IID(), NULL);
     // these functions are serialised as-if they are a real heap.
     case D3D12Chunk::Device_CreateHeapFromAddress:
+    case D3D12Chunk::Device_CreateHeapFromAddress1:
     case D3D12Chunk::Device_CreateHeapFromFileMapping:
       return Serialise_CreateHeap(ser, NULL, IID(), NULL);
     case D3D12Chunk::Device_OpenSharedHandle:
@@ -4499,6 +4624,8 @@ bool WrappedID3D12Device::ProcessChunk(ReadSerialiser &ser, D3D12Chunk context)
     case D3D12Chunk::CreateAS: return Serialise_CreateAS(ser, NULL, 0, {}, NULL);
     case D3D12Chunk::StateObject_SetPipelineStackSize:
       return Serialise_SetPipelineStackSize(ser, NULL, 0);
+    case D3D12Chunk::Device_CreateRootSignatureFromSubobjectInLibrary:
+      return Serialise_CreateRootSignatureFromSubobjectInLibrary(ser, 0, NULL, 0, NULL, IID(), NULL);
 
     // in order to get a warning if we miss a case, we explicitly handle the list/queue chunks here.
     // If we actually encounter one it's an error (we should hit CaptureBegin first and switch to
@@ -4597,6 +4724,8 @@ bool WrappedID3D12Device::ProcessChunk(ReadSerialiser &ser, D3D12Chunk context)
     case D3D12Chunk::List_EmitRaytracingAccelerationStructurePostbuildInfo:
     case D3D12Chunk::List_DispatchRays:
     case D3D12Chunk::List_SetPipelineState1:
+    case D3D12Chunk::List_SetProgram:
+    case D3D12Chunk::List_DispatchGraph:
       RDCERR("Unexpected chunk while processing initialisation: %s", ToStr(context).c_str());
       return false;
 
@@ -4860,6 +4989,20 @@ RDResult WrappedID3D12Device::ReadLogInitialisation(RDCFile *rdc, bool storeStru
 
         ApplyInitialContents();
 
+        {
+          SCOPED_TIMER("Syncing deferred jobs");
+          Threading::JobSystem::SyncAllJobs();
+          RDCLOG("Total deferred CPU time: %.2fms", m_DeferredTime);
+        }
+
+        GetResourceManager()->ResolveDeferredWrappers();
+
+        if(m_DeferredResult != ResultCode::Succeeded)
+          return m_DeferredResult;
+
+        for(rdcpair<ID3D12DeviceChild *, rdcstr> &name : m_CustomNames)
+          name.first->SetName(StringFormat::UTF82Wide(name.second).c_str());
+
         // restore saved messages - which implicitly discards any generated while applying initial
         // contents
         savedDebugMessages.swap(m_DebugMessages);
@@ -4918,19 +5061,28 @@ RDResult WrappedID3D12Device::ReadLogInitialisation(RDCFile *rdc, bool storeStru
     }
   }
 
+  const bool develMode =
 #if ENABLED(RDOC_DEVEL)
-  for(auto it = chunkInfos.begin(); it != chunkInfos.end(); ++it)
-  {
-    double dcount = double(it->second.count);
-
-    RDCDEBUG(
-        "% 5d chunks - Time: %9.3fms total/%9.3fms avg - Size: %8.3fMB total/%7.3fMB avg - %s (%u)",
-        it->second.count, it->second.total, it->second.total / dcount,
-        double(it->second.totalsize) / (1024.0 * 1024.0),
-        double(it->second.totalsize) / (dcount * 1024.0 * 1024.0),
-        GetChunkName((uint32_t)it->first).c_str(), uint32_t(it->first));
-  }
+      true;
+#else
+      false;
 #endif
+
+  if(Replay_Debug_PrintChunkTimings() || develMode)
+  {
+    for(auto it = chunkInfos.begin(); it != chunkInfos.end(); ++it)
+    {
+      double dcount = double(it->second.count);
+
+      RDCLOG(
+          "| % 5d chunks - Time: %9.3fms total/%9.3fms avg - Size: %8.3fMB total/%7.3fMB avg - %s "
+          "(%u)",
+          it->second.count, it->second.total, it->second.total / dcount,
+          double(it->second.totalsize) / (1024.0 * 1024.0),
+          double(it->second.totalsize) / (dcount * 1024.0 * 1024.0),
+          GetChunkName((uint32_t)it->first).c_str(), uint32_t(it->first));
+    }
+  }
 
   GetReplay()->WriteFrameRecord().frameInfo.uncompressedFileSize =
       rdc->GetSectionProperties(sectionIdx).uncompressedSize;
@@ -4971,17 +5123,17 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     // command lists due to the 'previous queue fence' not being ready yet, even if no fences are
     // signalled or waited. So instead we just signal a dummy fence each new 'frame'
     for(size_t i = 0; i < m_Queues.size(); i++)
-      CheckHRESULT(m_Queues[i]->Signal(m_QueueFences[i], m_GPUSyncCounter));
+      CHECK_HR(this, m_Queues[i]->Signal(m_QueueFences[i], m_GPUSyncCounter));
 
     FlushLists(true);
     m_CurDataUpload = 0;
 
     // take this opportunity to reset command allocators to ensure we don't steadily leak over time.
     if(m_DataUploadAlloc)
-      CheckHRESULT(m_DataUploadAlloc->Reset());
+      CHECK_HR(this, m_DataUploadAlloc->Reset());
 
     for(ID3D12CommandAllocator *alloc : m_CommandAllocators)
-      CheckHRESULT(alloc->Reset());
+      CHECK_HR(this, alloc->Reset());
 
     if(HasFatalError())
       return;
@@ -5030,7 +5182,7 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
       beginList->SetMarker(0, text.c_str(), size);
     }
 
-    CheckHRESULT(beginList->Close());
+    CHECK_HR(this, beginList->Close());
     ExecuteLists();
 
     if(HasFatalError())
@@ -5091,7 +5243,7 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
 
       ID3D12GraphicsCommandList *list = cmd.m_OutsideCmdList;
 
-      CheckHRESULT(list->Close());
+      CHECK_HR(this, list->Close());
 
       ExecuteLists();
 
@@ -5131,7 +5283,7 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     list->ResourceBarrier(1, &uavBarrier);
 
-    CheckHRESULT(list->Close());
+    CHECK_HR(this, list->Close());
 
     ExecuteLists();
   }

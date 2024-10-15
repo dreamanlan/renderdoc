@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "common/formatting.h"
+#include "strings/string_utils.h"
 #include "dxil_bytecode.h"
 #include "dxil_common.h"
 
@@ -988,29 +989,11 @@ VarType VarTypeForComponentType(ComponentType compType)
     case ComponentType::F32: varType = VarType::Float; break;
     case ComponentType::F64: varType = VarType::Double; break;
     case ComponentType::SNormF16:
-      varType = VarType::Half;
-      RDCERR("Unexpected type in cbuffer annotations");
-      break;
-    case ComponentType::UNormF16:
-      varType = VarType::Half;
-      RDCERR("Unexpected type in cbuffer annotations");
-      break;
+    case ComponentType::UNormF16: varType = VarType::Half; break;
     case ComponentType::SNormF32:
-      varType = VarType::Float;
-      RDCERR("Unexpected type in cbuffer annotations");
-      break;
-    case ComponentType::UNormF32:
-      varType = VarType::Float;
-      RDCERR("Unexpected type in cbuffer annotations");
-      break;
+    case ComponentType::UNormF32: varType = VarType::Float; break;
     case ComponentType::SNormF64:
-      varType = VarType::Double;
-      RDCERR("Unexpected type in cbuffer annotations");
-      break;
-    case ComponentType::UNormF64:
-      varType = VarType::Double;
-      RDCERR("Unexpected type in cbuffer annotations");
-      break;
+    case ComponentType::UNormF64: varType = VarType::Double; break;
   }
   return varType;
 }
@@ -1478,12 +1461,32 @@ rdcarray<ShaderEntryPoint> Program::GetEntryPoints()
   return ret;
 }
 
-DXBC::Reflection *Program::GetReflection()
+void Program::FetchEntryPoint()
+{
+  if(m_EntryPoint.empty())
+  {
+    DXMeta dx(m_NamedMeta);
+    if(dx.entryPoints && dx.entryPoints->children.size() > 0 &&
+       dx.entryPoints->children[0]->children.size() > 2)
+    {
+      m_EntryPoint = dx.entryPoints->children[0]->children[1]->str;
+    }
+    else
+    {
+      RDCERR("Didn't find dx.entryPoints");
+      m_EntryPoint = "main";
+    }
+  }
+}
+
+DXBC::Reflection *Program::BuildReflection()
 {
   const bool dxcStyleFormatting = m_DXCStyle;
   using namespace DXBC;
 
   Reflection *refl = new Reflection;
+  Files.clear();
+  m_CompileFlags.flags.clear();
 
   DXMeta dx(m_NamedMeta);
 
@@ -1546,13 +1549,25 @@ DXBC::Reflection *Program::GetReflection()
     {
       if(f->children.size() != 2)
         continue;
-      Files.push_back({f->children[0]->str, f->children[1]->str});
+      bool found = false;
+      rdcstr shaderFilePath = standardise_directory_separator(f->children[0]->str);
+      for(const ShaderSourceFile &shaderSource : Files)
+      {
+        if(shaderSource.filename == shaderFilePath)
+        {
+          found = true;
+          break;
+        }
+      }
+
+      if(!found)
+        Files.push_back({shaderFilePath, f->children[1]->str});
     }
 
     // push the main filename to the front
     if(dx.source.mainFileName && !dx.source.mainFileName->children.empty())
     {
-      rdcstr mainFile = dx.source.mainFileName->children[0]->str;
+      rdcstr mainFile = standardise_directory_separator(dx.source.mainFileName->children[0]->str);
 
       if(!mainFile.empty())
       {
@@ -1566,6 +1581,8 @@ DXBC::Reflection *Program::GetReflection()
         }
       }
     }
+    if(!Files.empty())
+      m_CompileFlags.flags.push_back({"preferSourceDebug", "1"});
   }
 
   if(dx.source.args && dx.source.args->children.size() == 1)
@@ -1731,16 +1748,57 @@ rdcstr Program::GetDebugStatus()
 
 void Program::GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo &lineInfo) const
 {
+  bool getEntryPoint = (instruction == ~0U);
+  if(getEntryPoint)
+    RDCASSERT(!m_EntryPoint.empty());
+
   lineInfo = LineColumnInfo();
 
   for(size_t i = 0; i < m_Functions.size(); i++)
   {
     const Function &f = *m_Functions[i];
 
-    if(instruction < f.instructions.size())
+    bool getLineInfo = (getEntryPoint) ? false : (instruction < f.instructions.size());
+    if(getEntryPoint)
     {
-      lineInfo.disassemblyLine = f.instructions[instruction]->disassemblyLine;
-      break;
+      if(f.name == m_EntryPoint)
+      {
+        getLineInfo = true;
+        instruction = 0;
+      }
+    }
+    if(getLineInfo)
+    {
+      const Instruction *const inst = f.instructions[instruction];
+      uint32_t dbgLoc = inst->debugLoc;
+      if(dbgLoc != ~0U)
+      {
+        const DebugLocation &debugLoc = m_DebugLocations[dbgLoc];
+        int32_t fileIndex = -1;
+        Metadata *scope = debugLoc.scope;
+        const DIBase *const dwarfInfo = scope->dwarf;
+        rdcstr shaderFilePath = standardise_directory_separator(GetDebugScopeFilePath(dwarfInfo));
+        RDCASSERT(!shaderFilePath.empty());
+        for(int32_t iFile = 0; iFile < Files.count(); iFile++)
+        {
+          rdcstr filePath = Files[iFile].filename;
+          if(filePath == shaderFilePath)
+          {
+            fileIndex = iFile;
+            break;
+          }
+        }
+
+        lineInfo.fileIndex = fileIndex;
+        lineInfo.lineStart = (uint32_t)debugLoc.line;
+        lineInfo.lineEnd = (uint32_t)debugLoc.line;
+        // Without column end data ignore the column start data in DebugLocation
+        lineInfo.colStart = 0;
+        lineInfo.colEnd = 0;
+      }
+
+      lineInfo.disassemblyLine = inst->disassemblyLine;
+      return;
     }
     instruction -= f.instructions.size();
   }
@@ -1761,6 +1819,16 @@ void Program::GetLocals(const DXBC::DXBCContainer *dxbc, size_t instruction, uin
                         rdcarray<SourceVariableMapping> &locals) const
 {
   locals.clear();
+
+  for(const LocalSourceVariable &localVar : m_Locals)
+  {
+    if(localVar.startInst > instruction)
+      continue;
+    if(instruction > localVar.endInst)
+      continue;
+
+    locals.append(localVar.sourceVars);
+  }
 }
 
 const ResourceReference *Program::GetResourceReference(const rdcstr &handleStr) const

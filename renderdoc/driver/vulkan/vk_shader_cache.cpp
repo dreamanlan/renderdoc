@@ -44,6 +44,7 @@ enum class BuiltinShaderFlags
   None = 0x0,
   BaseTypeParameterised = 0x1,
   TextureTypeParameterised = 0x2,
+  Multiview = 0x4,
 };
 
 BITMASK_OPERATORS(BuiltinShaderFlags);
@@ -86,9 +87,15 @@ static const BuiltinShaderConfig builtinShaders[] = {
                         rdcspv::ShaderStage::Compute),
     BuiltinShaderConfig(BuiltinShader::QuadResolveFS, EmbeddedResource(glsl_quadresolve_frag),
                         rdcspv::ShaderStage::Fragment, FeatureCheck::FragmentStores),
+    BuiltinShaderConfig(BuiltinShader::QuadResolveMultiviewFS,
+                        EmbeddedResource(glsl_quadresolve_frag), rdcspv::ShaderStage::Fragment,
+                        FeatureCheck::FragmentStores, BuiltinShaderFlags::Multiview),
     BuiltinShaderConfig(BuiltinShader::QuadWriteFS, EmbeddedResource(glsl_quadwrite_frag),
+                        rdcspv::ShaderStage::Fragment),
+    BuiltinShaderConfig(BuiltinShader::QuadWriteMultiviewFS, EmbeddedResource(glsl_quadwrite_frag),
                         rdcspv::ShaderStage::Fragment,
-                        FeatureCheck::FragmentStores | FeatureCheck::NonMetalBackend),
+                        FeatureCheck::FragmentStores | FeatureCheck::NonMetalBackend,
+                        BuiltinShaderFlags::Multiview),
     BuiltinShaderConfig(BuiltinShader::TrisizeGS, EmbeddedResource(glsl_trisize_geom),
                         rdcspv::ShaderStage::Geometry),
     BuiltinShaderConfig(BuiltinShader::TrisizeFS, EmbeddedResource(glsl_trisize_frag),
@@ -282,6 +289,9 @@ VulkanShaderCache::VulkanShaderCache(WrappedVulkan *driver)
         defines += rdcstr("#define SHADER_RESTYPE ") + ToStr(textureType) + "\n";
         defines += rdcstr("#define SHADER_BASETYPE ") + ToStr(baseType) + "\n";
 
+        if(config.flags & BuiltinShaderFlags::Multiview)
+          defines += rdcstr("#define USE_MULTIVIEW 1\n");
+
         SPIRVBlob &blob = m_BuiltinShaderBlobs[i][baseType][textureType];
         rdcstr source = GetDynamicEmbeddedResource(config.resource);
 
@@ -329,7 +339,7 @@ VulkanShaderCache::VulkanShaderCache(WrappedVulkan *driver)
 
           VkResult vkr = driver->vkCreateShaderModule(
               m_Device, &modinfo, NULL, &m_BuiltinShaderModules[i][baseType][textureType]);
-          driver->CheckVkResult(vkr);
+          CHECK_VKR(driver, vkr);
 
           driver->GetResourceManager()->SetInternalResource(
               GetResID(m_BuiltinShaderModules[i][baseType][textureType]));
@@ -394,7 +404,7 @@ VulkanShaderCache::VulkanShaderCache(WrappedVulkan *driver)
 
     VkResult vkr = ObjDisp(m_Device)->CreatePipelineCache(Unwrap(m_Device), &createInfo, NULL,
                                                           &m_PipelineCache);
-    driver->CheckVkResult(vkr);
+    CHECK_VKR(driver, vkr);
 
     if(vkr == VK_SUCCESS)
     {
@@ -960,7 +970,7 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
 
       VkResult vkr = m_pDriver->vkCreatePipelineLayout(m_pDriver->GetDev(), &pipeLayoutCreateInfo,
                                                        NULL, &m_CombinedPipeLayouts[pipeline]);
-      m_pDriver->CheckVkResult(vkr);
+      CHECK_VKR(m_pDriver, vkr);
 
       ret.layout = m_CombinedPipeLayouts[pipeline];
     }

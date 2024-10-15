@@ -191,7 +191,7 @@ static void StripUnwantedExtensions(rdcarray<rdcstr> &Extensions)
     if(ext == "VK_GOOGLE_display_timing" || ext == "VK_KHR_display_swapchain" ||
        ext == "VK_EXT_display_control" || ext == "VK_KHR_present_id" ||
        ext == "VK_KHR_present_wait" || ext == "VK_EXT_surface_maintenance1" ||
-       ext == "VK_EXT_swapchain_maintenance1")
+       ext == "VK_EXT_swapchain_maintenance1" || ext == "VK_EXT_hdr_metadata")
       return true;
 
     // remove fullscreen exclusive extension
@@ -218,6 +218,9 @@ RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion
   m_InitParams = params;
   m_SectionVersion = sectionVersion;
   m_ReplayOptions = opts;
+
+  if(!m_Replay->IsRemoteProxy())
+    Threading::JobSystem::Init();
 
   m_ResourceManager->SetOptimisationLevel(m_ReplayOptions.optimisation);
 
@@ -524,7 +527,7 @@ RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion
   uint32_t count = 0;
 
   VkResult vkr = ObjDisp(m_Instance)->EnumeratePhysicalDevices(Unwrap(m_Instance), &count, NULL);
-  CheckVkResult(vkr);
+  CHECK_VKR(this, vkr);
 
   if(count == 0)
   {
@@ -538,7 +541,7 @@ RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion
 
   vkr = ObjDisp(m_Instance)
             ->EnumeratePhysicalDevices(Unwrap(m_Instance), &count, &m_ReplayPhysicalDevices[0]);
-  CheckVkResult(vkr);
+  CHECK_VKR(this, vkr);
 
   for(uint32_t i = 0; i < count; i++)
     GetResourceManager()->WrapResource(m_Instance, m_ReplayPhysicalDevices[i]);
@@ -943,6 +946,12 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
 
 void WrappedVulkan::Shutdown()
 {
+  if(!m_Replay->IsRemoteProxy())
+  {
+    Threading::JobSystem::Shutdown();
+    GetResourceManager()->ResolveDeferredWrappers();
+  }
+
   // flush out any pending commands/semaphores
   SubmitCmds();
   SubmitSemaphores();
@@ -952,7 +961,7 @@ void WrappedVulkan::Shutdown()
   if(m_Device)
   {
     VkResult vkr = ObjDisp(m_Device)->DeviceWaitIdle(Unwrap(m_Device));
-    CheckVkResult(vkr);
+    CHECK_VKR(this, vkr);
   }
 
   // since we didn't create proper registered resources for our command buffers,
@@ -1472,7 +1481,7 @@ VkResult WrappedVulkan::vkEnumeratePhysicalDevices(VkInstance instance,
 
   SERIALISE_TIME_CALL(
       vkr = ObjDisp(instance)->EnumeratePhysicalDevices(Unwrap(instance), &count, devices));
-  CheckVkResult(vkr);
+  CHECK_VKR(this, vkr);
 
   m_PhysicalDevices.resize(count);
 
@@ -3494,13 +3503,13 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     VkResult vkr =
         ObjDisp(physicalDevice)
             ->EnumerateDeviceExtensionProperties(Unwrap(physicalDevice), NULL, &numExts, NULL);
-    CheckVkResult(vkr);
+    CHECK_VKR(this, vkr);
 
     VkExtensionProperties *exts = new VkExtensionProperties[numExts];
 
     vkr = ObjDisp(physicalDevice)
               ->EnumerateDeviceExtensionProperties(Unwrap(physicalDevice), NULL, &numExts, exts);
-    CheckVkResult(vkr);
+    CHECK_VKR(this, vkr);
 
     for(uint32_t i = 0; i < numExts; i++)
       RDCLOG("Dev Ext %u: %s (%u)", i, exts[i].extensionName, exts[i].specVersion);
@@ -4026,7 +4035,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                                           qFamilyIdx};
       vkr = ObjDisp(device)->CreateCommandPool(Unwrap(device), &poolInfo, NULL,
                                                &m_InternalCmds.cmdpool);
-      CheckVkResult(vkr);
+      CHECK_VKR(this, vkr);
 
       GetResourceManager()->WrapResource(Unwrap(device), m_InternalCmds.cmdpool);
     }
@@ -4049,7 +4058,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       };
       vkr = ObjDisp(device)->CreateCommandPool(Unwrap(device), &poolInfo, NULL,
                                                &m_ExternalQueues[qidx].pool);
-      CheckVkResult(vkr);
+      CHECK_VKR(this, vkr);
 
       GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].pool);
 
@@ -4069,7 +4078,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       {
         vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
                                                       &m_ExternalQueues[qidx].ring[x].acquire);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         if(m_SetDeviceLoaderData)
           m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].ring[x].acquire);
@@ -4080,7 +4089,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
         vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
                                                       &m_ExternalQueues[qidx].ring[x].release);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         if(m_SetDeviceLoaderData)
           m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].ring[x].release);
@@ -4091,19 +4100,19 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
         vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
                                                &m_ExternalQueues[qidx].ring[x].fromext);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fromext);
 
         vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
                                                &m_ExternalQueues[qidx].ring[x].toext);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].toext);
 
         vkr = ObjDisp(device)->CreateFence(Unwrap(device), &fenceInfo, NULL,
                                            &m_ExternalQueues[qidx].ring[x].fence);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fence);
       }
@@ -4404,6 +4413,14 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     m_AccelerationStructures = true;
   }
 
+  VkPhysicalDeviceRayTracingPipelineFeaturesKHR *rtpFeatures =
+      (VkPhysicalDeviceRayTracingPipelineFeaturesKHR *)FindNextStruct(
+          &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR);
+  if(rtpFeatures && rtpFeatures->rayTracingPipeline)
+  {
+    rtpFeatures->rayTracingPipelineShaderGroupHandleCaptureReplay = VK_TRUE;
+  }
+
   VkResult ret;
   SERIALISE_TIME_CALL(ret = createFunc(Unwrap(physicalDevice), &createInfo, NULL, pDevice));
 
@@ -4506,7 +4523,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
                                           qFamilyIdx};
       vkr = ObjDisp(device)->CreateCommandPool(Unwrap(device), &poolInfo, NULL,
                                                &m_InternalCmds.cmdpool);
-      CheckVkResult(vkr);
+      CHECK_VKR(this, vkr);
 
       GetResourceManager()->WrapResource(Unwrap(device), m_InternalCmds.cmdpool);
     }
@@ -4528,7 +4545,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
       };
       vkr = ObjDisp(device)->CreateCommandPool(Unwrap(device), &poolInfo, NULL,
                                                &m_ExternalQueues[qidx].pool);
-      CheckVkResult(vkr);
+      CHECK_VKR(this, vkr);
 
       GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].pool);
 
@@ -4548,7 +4565,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
       {
         vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
                                                       &m_ExternalQueues[qidx].ring[x].acquire);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         if(m_SetDeviceLoaderData)
           m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].ring[x].acquire);
@@ -4559,7 +4576,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 
         vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
                                                       &m_ExternalQueues[qidx].ring[x].release);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         if(m_SetDeviceLoaderData)
           m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].ring[x].release);
@@ -4570,19 +4587,19 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 
         vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
                                                &m_ExternalQueues[qidx].ring[x].fromext);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fromext);
 
         vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
                                                &m_ExternalQueues[qidx].ring[x].toext);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].toext);
 
         vkr = ObjDisp(device)->CreateFence(Unwrap(device), &fenceInfo, NULL,
                                            &m_ExternalQueues[qidx].ring[x].fence);
-        CheckVkResult(vkr);
+        CHECK_VKR(this, vkr);
 
         GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fence);
       }
@@ -4651,9 +4668,22 @@ void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
   SubmitSemaphores();
   FlushQ();
 
+  {
+    SCOPED_LOCK(m_PendingCmdBufferCallbacksLock);
+
+    for(VkPendingSubmissionCompleteCallbacks *pending : m_PendingCmdBufferCallbacks)
+    {
+      const VkResult vkr = ObjDisp(m_Device)->GetEventStatus(Unwrap(m_Device), pending->event);
+      if(vkr == VK_EVENT_SET)
+        pending->Release();
+    }
+
+    m_PendingCmdBufferCallbacks.clear();
+  }
+
   // idle the device as well so that external queues are idle.
   VkResult vkr = ObjDisp(m_Device)->DeviceWaitIdle(Unwrap(m_Device));
-  CheckVkResult(vkr);
+  CHECK_VKR(this, vkr);
 
   // MULTIDEVICE this function will need to check if the device is the one we
   // used for debugmanager/cmd pool etc, and only remove child queues and

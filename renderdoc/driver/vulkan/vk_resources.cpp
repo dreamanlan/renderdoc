@@ -24,6 +24,7 @@
 
 #include "vk_resources.h"
 #include "maths/vec.h"
+#include "vk_acceleration_structure.h"
 #include "vk_info.h"
 
 WRAPPED_POOL_INST(WrappedVkInstance)
@@ -3390,6 +3391,19 @@ VkImageAspectFlags FormatImageAspects(VkFormat fmt)
     return VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
+void VkPendingSubmissionCompleteCallbacks::Release()
+{
+  int32_t ref = Atomic::Dec32(&refCount);
+  RDCASSERT(ref >= 0);
+  if(ref <= 0)
+  {
+    if(event != VK_NULL_HANDLE)
+      ObjDisp(device)->DestroyEvent(Unwrap(device), event, NULL);
+
+    delete this;
+  }
+}
+
 RenderPassInfo::RenderPassInfo(const VkRenderPassCreateInfo &ci)
 {
   // *2 in case we need separate barriers for depth and stencil, +1 for the terminating null
@@ -3842,12 +3856,12 @@ InitReqType ImgRefs::SubresourceRangeMaxInitReq(VkImageSubresourceRange range, I
   return initReq;
 }
 
-rdcarray<rdcpair<VkImageSubresourceRange, InitReqType> > ImgRefs::SubresourceRangeInitReqs(
+rdcarray<rdcpair<VkImageSubresourceRange, InitReqType>> ImgRefs::SubresourceRangeInitReqs(
     VkImageSubresourceRange range, InitPolicy policy, bool initialized) const
 {
   VkImageSubresourceRange out(range);
-  rdcarray<rdcpair<VkImageSubresourceRange, InitReqType> > res;
-  rdcarray<rdcpair<int, VkImageAspectFlags> > splitAspects;
+  rdcarray<rdcpair<VkImageSubresourceRange, InitReqType>> res;
+  rdcarray<rdcpair<int, VkImageAspectFlags>> splitAspects;
   if(areAspectsSplit)
   {
     int aspectIndex = 0;
@@ -3934,6 +3948,19 @@ void ImgRefs::Split(bool splitAspects, bool splitLevels, bool splitLayers)
   areLayersSplit = newSplitLayerCount > 1;
 }
 
+QueryPoolInfo::QueryPoolInfo(WrappedVulkan *driver, VkDevice device,
+                             const VkQueryPoolCreateInfo *pCreateInfo)
+{
+  m_Buffer.Create(driver, device, pCreateInfo->queryCount * 8, 1, GPUBuffer::eGPUBufferReadback);
+  m_MappedMem = (byte *)m_Buffer.Map(0, m_Buffer.totalsize);
+}
+
+QueryPoolInfo::~QueryPoolInfo()
+{
+  m_Buffer.Unmap();
+  m_Buffer.Destroy();
+}
+
 VkResourceRecord::~VkResourceRecord()
 {
   // bufferviews and imageviews have non-owning pointers to the sparseinfo struct
@@ -3981,6 +4008,12 @@ VkResourceRecord::~VkResourceRecord()
 
   if(resType == eResCommandPool)
     SAFE_DELETE(cmdPoolInfo);
+
+  if(resType == eResQueryPool)
+    SAFE_DELETE(queryPoolInfo);
+
+  if(resType == eResAccelerationStructureKHR && accelerationStructureInfo)
+    accelerationStructureInfo->Release();
 }
 
 void VkResourceRecord::MarkImageFrameReferenced(VkResourceRecord *img, const ImageRange &range,
@@ -4821,7 +4854,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
   {
     const uint32_t width = 24, height = 24;
 
-    rdcarray<rdcpair<VkFormat, rdcarray<uint32_t> > > tests = {
+    rdcarray<rdcpair<VkFormat, rdcarray<uint32_t>>> tests = {
         {VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM, {576, 144, 144}},
         {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, {576, 288}},
         {VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM, {576, 288, 288}},
@@ -4848,7 +4881,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
         {VK_FORMAT_G16_B16R16_2PLANE_444_UNORM, {1152, 2304}},
     };
 
-    for(rdcpair<VkFormat, rdcarray<uint32_t> > e : tests)
+    for(rdcpair<VkFormat, rdcarray<uint32_t>> e : tests)
     {
       INFO("Format is " << ToStr(e.first));
       for(uint32_t p = 0; p < e.second.size(); p++)

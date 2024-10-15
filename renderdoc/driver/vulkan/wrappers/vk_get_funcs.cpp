@@ -860,8 +860,9 @@ void WrappedVulkan::vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice
 
   if(accStruct && accStruct->accelerationStructureHostCommands)
   {
-    RDCWARN("Disabling support for acceleration structure host commands");
+    RDCWARN("Disabling support for acceleration structure host commands and indirect builds");
     accStruct->accelerationStructureHostCommands = VK_FALSE;
+    accStruct->accelerationStructureIndirectBuild = VK_FALSE;
   }
 }
 
@@ -1220,7 +1221,7 @@ void WrappedVulkan::vkGetAccelerationStructureBuildSizesKHR(
   unwrapped.srcAccelerationStructure = Unwrap(unwrapped.srcAccelerationStructure);
   unwrapped.dstAccelerationStructure = Unwrap(unwrapped.dstAccelerationStructure);
 
-  ObjDisp(device)->GetAccelerationStructureBuildSizesKHR(Unwrap(device), buildType, pBuildInfo,
+  ObjDisp(device)->GetAccelerationStructureBuildSizesKHR(Unwrap(device), buildType, &unwrapped,
                                                          pMaxPrimitiveCounts, pSizeInfo);
 }
 

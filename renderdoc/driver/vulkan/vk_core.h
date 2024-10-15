@@ -25,6 +25,7 @@
 #pragma once
 
 #include "common/timing.h"
+#include "core/gpu_address_range_tracker.h"
 #include "serialise/serialiser.h"
 #include "vk_acceleration_structure.h"
 #include "vk_common.h"
@@ -844,6 +845,12 @@ private:
   // determines whether we should track the open/close state of a renderpass.
   bool ShouldUpdateRenderpassActive(ResourceId cmdId, bool dynamicRendering = false);
 
+  // shifts the beginEvent of any command buffer nodes executed after targetEvent by eidShift.
+  // additionally updates the action and event counts for the corresponding BakedCmdBufferInfo.
+  // this function is used to account for events added by DrawIndirectCount calls
+  void ShiftSuccessiveCommandNodes(uint32_t targetEvent, uint32_t eidShift,
+                                   CommandBufferNode *current = NULL);
+
   // if we're replaying just a single action or a particular command
   // buffer subsection of command events, we don't go through the
   // whole original command buffers to set up the partial replay,
@@ -978,6 +985,15 @@ private:
 
   bytebuf m_MaskedMapData;
 
+  Threading::CriticalSection m_PendingCmdBufferCallbacksLock;
+  rdcarray<VkPendingSubmissionCompleteCallbacks *> m_PendingCmdBufferCallbacks;
+  void InsertPendingCommandBufferCallbacksEvent(VkCommandBuffer commandBuffer);
+  void AddPendingCommandBufferCallbacks(VkCommandBuffer commandBuffer);
+  void CheckPendingCommandBufferCallbacks();
+
+  GPUAddressRangeTracker m_AddressTracker;
+  GPUAddressRange CreateAddressRange(VkDevice device, VkBuffer buffer);
+
   // on replay we may need to allocate several bits of temporary memory, so the single-region
   // doesn't work as well. We're not quite as performance-sensitive so we allocate 4MB per thread
   // and use it in a ring-buffer fashion. This allows multiple allocations to live at once as long
@@ -1074,6 +1090,9 @@ private:
 
   std::set<ResourceId> m_SparseBindResources;
 
+  Threading::CriticalSection m_DeferredResultLock;
+  RDResult m_DeferredResult = ResultCode::Succeeded;
+  double m_DeferredTime = 0.0;
   RDResult m_FailedReplayResult = ResultCode::APIReplayFailed;
 
   VulkanActionTreeNode m_ParentAction;
@@ -1131,8 +1150,8 @@ private:
                                       const VulkanRenderState &renderState);
 
   // no copy semantics
-  WrappedVulkan(const WrappedVulkan &);
-  WrappedVulkan &operator=(const WrappedVulkan &);
+  WrappedVulkan(const WrappedVulkan &) = delete;
+  WrappedVulkan &operator=(const WrappedVulkan &) = delete;
 
   VkBool32 DebugCallback(MessageSeverity severity, MessageCategory category, int messageCode,
                          const char *pMessageId, const char *pMessage);
@@ -1201,11 +1220,12 @@ public:
   bool Serialise_InitialState(SerialiserType &ser, ResourceId id, VkResourceRecord *record,
                               const VkInitialContents *initial);
   void Create_InitialState(ResourceId id, WrappedVkRes *live, bool hasData);
-  void Apply_InitialState(WrappedVkRes *live, const VkInitialContents &initial);
+  void Apply_InitialState(WrappedVkRes *live, VkInitialContents &initial);
 
   void RemapQueueFamilyIndices(uint32_t &srcQueueFamily, uint32_t &dstQueueFamily);
   uint32_t GetQueueFamilyIndex() const { return m_QueueFamilyIdx; }
   bool ReleaseResource(WrappedVkRes *res);
+  const rdcarray<uint32_t> &GetQueueFamilyIndices() const { return m_QueueFamilyIndices; }
 
   void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, rdcstr d);
 
@@ -1253,6 +1273,10 @@ public:
   void FreeMemoryAllocation(MemoryAllocation alloc);
 
   void ChooseMemoryIndices();
+
+  void TrackBufferAddress(VkDevice device, VkBuffer buffer);
+  void UntrackBufferAddress(VkDevice device, VkBuffer buffer);
+  void GetResIDFromAddr(GPUAddressRange::Address addr, ResourceId &id, uint64_t &offs);
 
   EventFlags GetEventFlags(uint32_t eid) { return m_EventFlags[eid]; }
   rdcarray<EventUsage> GetUsage(ResourceId id) { return m_ResourceUses[id]; }
@@ -1307,13 +1331,16 @@ public:
   }
   RDResult FatalErrorCheck() { return m_FatalError; }
   bool HasFatalError() { return m_FatalError != ResultCode::Succeeded; }
-  inline void CheckVkResult(VkResult vkr)
+  inline void CheckVkResult(const char *file, int line, VkResult vkr)
   {
     if(vkr == VK_SUCCESS)
       return;
-    CheckErrorVkResult(vkr);
+    CheckErrorVkResult(file, line, vkr);
   }
-  void CheckErrorVkResult(VkResult vkr);
+  void CheckErrorVkResult(const char *file, int line, VkResult vkr);
+
+  void CheckDeferredResult(const RDResult &res);
+  void AddDeferredTime(double ms);
 
   bool SeparateDepthStencil() const { return m_SeparateDepthStencil; }
   bool NULLDescriptorsAllowed() const { return m_NULLDescriptorsAllowed; }

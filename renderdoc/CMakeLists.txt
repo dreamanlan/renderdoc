@@ -131,6 +131,7 @@ set(sources
     common/globalconfig.h
     common/result.h
     common/shader_cache.h
+    common/jobsystem.cpp
     common/threading.h
     common/timing.h
     common/wrapped_pool.h
@@ -139,6 +140,8 @@ set(sources
     core/image_viewer.cpp
     core/core.h
     core/crash_handler.h
+    core/gpu_address_range_tracker.cpp
+    core/gpu_address_range_tracker.h
     core/target_control.cpp
     core/remote_server.cpp
     core/remote_server.h
@@ -194,6 +197,7 @@ set(sources
     replay/replay_output.cpp
     replay/replay_controller.cpp
     replay/replay_controller.h
+    replay/common/var_dispatch_helpers.h
     serialise/serialiser.cpp
     serialise/serialiser.h
     serialise/lz4io.cpp

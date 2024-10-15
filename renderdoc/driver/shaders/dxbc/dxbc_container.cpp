@@ -124,6 +124,12 @@ struct FileHeader
   // uint32 chunkOffsets[numChunks]; follows
 };
 
+struct PartHeader
+{
+  uint32_t fourcc;
+  uint32_t partLength;
+};
+
 struct ILDNHeader
 {
   uint16_t Flags;
@@ -820,36 +826,42 @@ void DXBCContainer::ReplaceChunk(bytebuf &ByteCode, uint32_t fourcc, const byte 
   HashContainer(ByteCode.data(), ByteCode.size());
 }
 
-const byte *DXBCContainer::FindChunk(const bytebuf &ByteCode, uint32_t fourcc, size_t &size)
+const byte *DXBCContainer::FindChunk(const byte *ByteCode, size_t ByteCodeLength, uint32_t fourcc,
+                                     size_t &size)
 {
-  const FileHeader *header = (const FileHeader *)ByteCode.data();
+  const FileHeader *header = (const FileHeader *)ByteCode;
 
   size = 0;
 
   if(header->fourcc != FOURCC_DXBC)
     return NULL;
 
-  if(header->fileLength != (uint32_t)ByteCode.size())
+  if(header->fileLength != (uint32_t)ByteCodeLength)
     return NULL;
 
   const uint32_t *chunkOffsets =
-      (const uint32_t *)(ByteCode.data() + sizeof(FileHeader));    // right after the header
+      (const uint32_t *)(ByteCode + sizeof(FileHeader));    // right after the header
 
   for(uint32_t chunkIdx = 0; chunkIdx < header->numChunks; chunkIdx++)
   {
     uint32_t offs = chunkOffsets[chunkIdx];
 
-    const uint32_t *chunkFourcc = (uint32_t *)(ByteCode.data() + offs);
+    const uint32_t *chunkFourcc = (uint32_t *)(ByteCode + offs);
     const uint32_t *chunkSize = (uint32_t *)(chunkFourcc + 1);
 
     if(*chunkFourcc == fourcc)
     {
       size = *chunkSize;
-      return ByteCode.data() + offs + 8;
+      return ByteCode + offs + 8;
     }
   }
 
   return NULL;
+}
+
+const byte *DXBCContainer::FindChunk(const bytebuf &ByteCode, uint32_t fourcc, size_t &size)
+{
+  return FindChunk(ByteCode.data(), ByteCode.size(), fourcc, size);
 }
 
 void DXBCContainer::GetHash(uint32_t hash[4], const void *ByteCode, size_t BytecodeLength)
@@ -890,6 +902,43 @@ void DXBCContainer::GetHash(uint32_t hash[4], const void *ByteCode, size_t Bytec
       memcpy(hash, hashHeader->hashValue, sizeof(hashHeader->hashValue));
     }
   }
+}
+
+bytebuf DXBCContainer::MakeContainerForChunk(uint32_t fourcc, const byte *chunk, uint64_t chunkSize)
+{
+  FileHeader dxbcHeader;
+  PartHeader partHeader;
+
+  dxbcHeader.fourcc = FOURCC_DXBC;
+  dxbcHeader.containerVersion = 1;
+  dxbcHeader.fileLength =
+      uint32_t(sizeof(FileHeader) + sizeof(uint32_t) + sizeof(PartHeader) + chunkSize);
+  dxbcHeader.numChunks = 1;
+
+  partHeader.fourcc = fourcc;
+  partHeader.partLength = (uint32_t)chunkSize;
+
+  uint32_t chunkOffset = sizeof(FileHeader) + sizeof(uint32_t);
+
+  bytebuf ret;
+  ret.resize(dxbcHeader.fileLength);
+
+  byte *write = ret.data();
+
+  memcpy(write, &dxbcHeader, sizeof(dxbcHeader));
+  write += sizeof(dxbcHeader);
+
+  memcpy(write, &chunkOffset, sizeof(chunkOffset));
+  write += sizeof(chunkOffset);
+
+  memcpy(write, &partHeader, sizeof(partHeader));
+  write += sizeof(partHeader);
+
+  memcpy(write, chunk, (size_t)chunkSize);
+
+  HashContainer(ret.data(), ret.size());
+
+  return ret;
 }
 
 bool DXBCContainer::IsHashedContainer(const void *ByteCode, size_t BytecodeLength)
@@ -1701,12 +1750,13 @@ DXBCContainer::DXBCContainer(const bytebuf &ByteCode, const rdcstr &debugInfoPat
     }
     else if(*fourcc == FOURCC_RDAT)
     {
-      // runtime data
+      m_RDATOffset = chunkContents - data;
+      m_RDATSize = *chunkSize;
     }
     else if(*fourcc == FOURCC_PSV0)
     {
-      // this chunk contains some information we could use for reflection but it doesn't contain
-      // enough, and doesn't have anything else interesting so we skip it
+      m_PSVOffset = chunkContents - data;
+      m_PSVSize = *chunkSize;
     }
     else if(*fourcc == FOURCC_ISGN || *fourcc == FOURCC_OSGN || *fourcc == FOURCC_ISG1 ||
             *fourcc == FOURCC_OSG1 || *fourcc == FOURCC_OSG5 || *fourcc == FOURCC_PCSG ||
@@ -1850,7 +1900,7 @@ DXBCContainer::DXBCContainer(const bytebuf &ByteCode, const rdcstr &debugInfoPat
     if(m_DXBCByteCode)
       m_Reflection = m_DXBCByteCode->GuessReflection();
     else if(dxilReflectProgram)
-      m_Reflection = dxilReflectProgram->GetReflection();
+      m_Reflection = dxilReflectProgram->BuildReflection();
     else
       m_Reflection = new Reflection;
   }
@@ -1948,23 +1998,23 @@ DXBCContainer::DXBCContainer(const bytebuf &ByteCode, const rdcstr &debugInfoPat
 
         SigCompType compType = (SigCompType)el->componentType;
         desc.varType = VarType::Float;
-        if(compType == COMPONENT_TYPE_UINT32)
+        if(compType == DXBC::SigCompType::COMPONENT_TYPE_UINT32)
           desc.varType = VarType::UInt;
-        else if(compType == COMPONENT_TYPE_SINT32)
+        else if(compType == DXBC::SigCompType::COMPONENT_TYPE_SINT32)
           desc.varType = VarType::SInt;
-        else if(compType == COMPONENT_TYPE_FLOAT32)
+        else if(compType == DXBC::SigCompType::COMPONENT_TYPE_FLOAT32)
           desc.varType = VarType::Float;
-        else if(compType == COMPONENT_TYPE_UINT16)
+        else if(compType == DXBC::SigCompType::COMPONENT_TYPE_UINT16)
           desc.varType = VarType::UShort;
-        else if(compType == COMPONENT_TYPE_SINT16)
+        else if(compType == DXBC::SigCompType::COMPONENT_TYPE_SINT16)
           desc.varType = VarType::SShort;
-        else if(compType == COMPONENT_TYPE_FLOAT16)
+        else if(compType == DXBC::SigCompType::COMPONENT_TYPE_FLOAT16)
           desc.varType = VarType::Half;
-        else if(compType == COMPONENT_TYPE_UINT64)
+        else if(compType == DXBC::SigCompType::COMPONENT_TYPE_UINT64)
           desc.varType = VarType::ULong;
-        else if(compType == COMPONENT_TYPE_SINT64)
+        else if(compType == DXBC::SigCompType::COMPONENT_TYPE_SINT64)
           desc.varType = VarType::SLong;
-        else if(compType == COMPONENT_TYPE_FLOAT64)
+        else if(compType == DXBC::SigCompType::COMPONENT_TYPE_FLOAT64)
           desc.varType = VarType::Double;
 
         desc.regChannelMask = (uint8_t)(el->mask & 0xff);
@@ -2481,7 +2531,7 @@ float4 main(float3 input : INPUT) : SV_Target0
       }
     }
 
-    bool dwordLength[15] = {};
+    bool dwordLength[16] = {};
 
     for(rdcstr snippet : snippets)
     {

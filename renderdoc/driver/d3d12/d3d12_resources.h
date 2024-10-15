@@ -29,6 +29,14 @@
 #include "d3d12_device.h"
 #include "d3d12_manager.h"
 
+namespace Threading
+{
+namespace JobSystem
+{
+struct Job;
+};
+};
+
 rdcpair<uint32_t, uint32_t> FindMatchingRootParameter(const D3D12RootSignature &sig,
                                                       D3D12_SHADER_VISIBILITY visibility,
                                                       D3D12_DESCRIPTOR_RANGE_TYPE rangeType,
@@ -708,6 +716,8 @@ class WrappedID3D12PipelineState : public WrappedDeviceChild12<ID3D12PipelineSta
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12PipelineState);
 
+  Threading::JobSystem::Job *deferredJob = NULL;
+
   D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC *graphics = NULL;
   D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC *compute = NULL;
 
@@ -985,6 +995,8 @@ public:
     }
   }
 
+  void SetNewReal(ID3D12PipelineState *real) { m_pReal = real; }
+
   void ProcessDescriptorAccess();
 
   //////////////////////////////
@@ -1024,9 +1036,10 @@ typedef WrappedID3D12PipelineState::ShaderEntry WrappedID3D12Shader;
 struct D3D12ShaderExportDatabase : public RefCounter12<IUnknown>
 {
 public:
-  D3D12ShaderExportDatabase(ResourceId id, D3D12RaytracingResourceAndUtilHandler *rayManager,
-                            ID3D12StateObjectProperties *obj);
+  D3D12ShaderExportDatabase(ResourceId id, D3D12RTManager *rayManager);
   ~D3D12ShaderExportDatabase();
+
+  void SetObjectProperties(ID3D12StateObjectProperties *obj) { m_StateObjectProps = obj; }
 
   ResourceId GetResourceId() { return objectOriginalId; }
 
@@ -1072,7 +1085,7 @@ private:
   rdcarray<D3D12ShaderExportDatabase *> parents;
 
   ID3D12StateObjectProperties *m_StateObjectProps = NULL;
-  D3D12RaytracingResourceAndUtilHandler *m_RayManager = NULL;
+  D3D12RTManager *m_RayManager = NULL;
 
   struct ExportLookup
   {
@@ -1146,28 +1159,41 @@ private:
 };
 
 class WrappedID3D12StateObject : public WrappedDeviceChild12<ID3D12StateObject>,
-                                 public ID3D12StateObjectProperties
+                                 public ID3D12StateObjectProperties1
 {
   ID3D12StateObjectProperties *properties;
+  ID3D12StateObjectProperties1 *properties1;
 
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12StateObject);
 
   D3D12ShaderExportDatabase *exports = NULL;
 
+  Threading::JobSystem::Job *deferredJob = NULL;
+
   enum
   {
     TypeEnum = Resource_StateObject,
   };
 
-  WrappedID3D12StateObject(ID3D12StateObject *real, WrappedID3D12Device *device)
+  WrappedID3D12StateObject(ID3D12StateObject *real, bool deferredHandle, WrappedID3D12Device *device)
       : WrappedDeviceChild12(real, device)
   {
-    real->QueryInterface(__uuidof(ID3D12StateObjectProperties), (void **)&properties);
+    if(!deferredHandle)
+      SetNewReal(real);
   }
+
+  void SetNewReal(ID3D12StateObject *real)
+  {
+    m_pReal = real;
+    real->QueryInterface(__uuidof(ID3D12StateObjectProperties), (void **)&properties);
+    real->QueryInterface(__uuidof(ID3D12StateObjectProperties1), (void **)&properties1);
+  }
+
   virtual ~WrappedID3D12StateObject()
   {
     SAFE_RELEASE(properties);
+    SAFE_RELEASE(properties1);
     SAFE_RELEASE(exports);
     Shutdown();
   }
@@ -1181,6 +1207,24 @@ public:
       *ppvObject = (ID3D12StateObjectProperties *)this;
       AddRef();
       return S_OK;
+    }
+    else if(riid == __uuidof(ID3D12StateObjectProperties1))
+    {
+      if(properties1)
+      {
+        *ppvObject = (ID3D12StateObjectProperties1 *)this;
+        AddRef();
+        return S_OK;
+      }
+      else
+      {
+        return E_NOINTERFACE;
+      }
+    }
+    if(riid == __uuidof(ID3D12WorkGraphProperties) || riid == __uuidof(ID3D12WorkGraphProperties1))
+    {
+      // work graphs are not currently supported
+      return E_NOINTERFACE;
     }
     return WrappedDeviceChild12::QueryInterface(riid, ppvObject);
   }
@@ -1209,6 +1253,21 @@ public:
   {
     m_pDevice->SetPipelineStackSize(this, PipelineStackSizeInBytes);
     properties->SetPipelineStackSize(PipelineStackSizeInBytes);
+  }
+
+  //////////////////////////////
+  // implement ID3D12StateObjectProperties1
+
+#if defined(_MSC_VER) || !defined(_WIN32)
+  virtual D3D12_PROGRAM_IDENTIFIER STDMETHODCALLTYPE GetProgramIdentifier(LPCWSTR pProgramName)
+#else
+  virtual D3D12_PROGRAM_IDENTIFIER *STDMETHODCALLTYPE
+  GetProgramIdentifier(D3D12_PROGRAM_IDENTIFIER *RetVal, LPCWSTR pProgramName)
+#endif
+  {
+    if(properties1)
+      return properties1->GetProgramIdentifier(pProgramName);
+    return {};
   }
 };
 
@@ -1591,6 +1650,8 @@ public:
   }
 };
 
+struct ASBuildData;
+
 // class to represent acceleration structure i.e. BLAS/TLAS
 class D3D12AccelerationStructure : public WrappedDeviceChild12<ID3D12DeviceChild>
 {
@@ -1608,6 +1669,8 @@ public:
   {
     return m_asbWrappedResource->GetGPUVirtualAddress() + m_asbWrappedResourceBufferOffset;
   }
+
+  ASBuildData *buildData = NULL;
 
 private:
   WrappedID3D12Resource *m_asbWrappedResource;

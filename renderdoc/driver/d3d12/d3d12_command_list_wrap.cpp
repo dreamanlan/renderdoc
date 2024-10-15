@@ -128,7 +128,7 @@ HRESULT WrappedID3D12GraphicsCommandList::Close()
     m_ListRecord->Bake();
   }
 
-  m_pDevice->CheckHRESULT(ret);
+  CHECK_HR(m_pDevice, ret);
 
   return ret;
 }
@@ -397,6 +397,7 @@ HRESULT WrappedID3D12GraphicsCommandList::ResetInternal(ID3D12CommandAllocator *
     }
     m_RayDispatches.clear();
 
+    m_CaptureComputeState = D3D12RenderState();
     m_CaptureComputeState.m_ResourceManager = GetResourceManager();
 
     // free any baked commands.
@@ -439,7 +440,7 @@ HRESULT WrappedID3D12GraphicsCommandList::ResetInternal(ID3D12CommandAllocator *
   else
   {
     ret = m_pList->Reset(Unwrap(pAllocator), Unwrap(pInitialState));
-    m_pDevice->CheckHRESULT(ret);
+    CHECK_HR(m_pDevice, ret);
   }
 
   return ret;
@@ -669,6 +670,9 @@ void WrappedID3D12GraphicsCommandList::ClearState(ID3D12PipelineState *pPipeline
 
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
     m_ListRecord->MarkResourceFrameReferenced(GetResID(pPipelineState), eFrameRef_Read);
+
+    m_CaptureComputeState = D3D12RenderState();
+    m_CaptureComputeState.m_ResourceManager = GetResourceManager();
   }
 }
 
@@ -1377,6 +1381,9 @@ void WrappedID3D12GraphicsCommandList::SetPipelineState(ID3D12PipelineState *pPi
 
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
     m_ListRecord->MarkResourceFrameReferenced(GetResID(pPipelineState), eFrameRef_Read);
+
+    m_CaptureComputeState.pipe = GetResID(pPipelineState);
+    m_CaptureComputeState.stateobj = ResourceId();
   }
 }
 
@@ -3649,7 +3656,7 @@ void WrappedID3D12GraphicsCommandList::FinaliseExecuteIndirectEvents(BakedCmdLis
 
   D3D12_RANGE range = {0, D3D12CommandData::m_IndirectSize};
   byte *mapPtr = NULL;
-  m_pDevice->CheckHRESULT(exec.argBuf->Map(0, &range, (void **)&mapPtr));
+  CHECK_HR(m_pDevice, exec.argBuf->Map(0, &range, (void **)&mapPtr));
 
   if(m_pDevice->HasFatalError())
     return;
@@ -4214,10 +4221,9 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
           if(comSig->sig.raytraced)
           {
             PatchedRayDispatch patchedDispatch = {};
-            patchedDispatch =
-                GetResourceManager()->GetRaytracingResourceAndUtilHandler()->PatchIndirectRayDispatch(
-                    Unwrap(pCommandList), state.heaps, comSig, MaxCommandCount, patched.first,
-                    patched.second, pCountBuffer, CountBufferOffset);
+            patchedDispatch = GetResourceManager()->GetRTManager()->PatchIndirectRayDispatch(
+                Unwrap(pCommandList), state.heaps, comSig, MaxCommandCount, patched.first,
+                patched.second, pCountBuffer, CountBufferOffset);
 
             argBuffer = patchedDispatch.resources.argumentBuffer->Resource();
             argOffset = patchedDispatch.resources.argumentBuffer->Offset();
@@ -4315,10 +4321,9 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
       if(comSig->sig.raytraced)
       {
         PatchedRayDispatch patchedDispatch = {};
-        patchedDispatch =
-            GetResourceManager()->GetRaytracingResourceAndUtilHandler()->PatchIndirectRayDispatch(
-                Unwrap(list), state.heaps, comSig, MaxCommandCount, patched.first, patched.second,
-                pCountBuffer, CountBufferOffset);
+        patchedDispatch = GetResourceManager()->GetRTManager()->PatchIndirectRayDispatch(
+            Unwrap(list), state.heaps, comSig, MaxCommandCount, patched.first, patched.second,
+            pCountBuffer, CountBufferOffset);
 
         argBuffer = patchedDispatch.resources.argumentBuffer->Resource();
         argOffset = patchedDispatch.resources.argumentBuffer->Offset();
@@ -4426,10 +4431,9 @@ void WrappedID3D12GraphicsCommandList::ExecuteIndirect(ID3D12CommandSignature *p
   PatchedRayDispatch patchedDispatch = {};
   if(((WrappedID3D12CommandSignature *)pCommandSignature)->sig.raytraced)
   {
-    patchedDispatch =
-        GetResourceManager()->GetRaytracingResourceAndUtilHandler()->PatchIndirectRayDispatch(
-            m_pList, m_CaptureComputeState.heaps, pCommandSignature, MaxCommandCount,
-            pArgumentBuffer, ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
+    patchedDispatch = GetResourceManager()->GetRTManager()->PatchIndirectRayDispatch(
+        m_pList, m_CaptureComputeState.heaps, pCommandSignature, MaxCommandCount, pArgumentBuffer,
+        ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
 
     argBuffer = patchedDispatch.resources.argumentBuffer->Resource();
     argOffset = patchedDispatch.resources.argumentBuffer->Offset();

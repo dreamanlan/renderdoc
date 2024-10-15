@@ -26,6 +26,7 @@
 
 #include "common/wrapped_pool.h"
 #include "core/core.h"
+#include "core/gpu_address_range_tracker.h"
 #include "core/intervals.h"
 #include "core/resource_manager.h"
 #include "core/sparse_page_table.h"
@@ -510,36 +511,6 @@ struct CmdListRecordingInfo
 class WrappedID3D12Resource;
 using D3D12BufferOffset = UINT64;
 
-struct GPUAddressRange
-{
-  D3D12_GPU_VIRTUAL_ADDRESS start, realEnd, oobEnd;
-  ResourceId id;
-
-  bool operator<(const D3D12_GPU_VIRTUAL_ADDRESS &o) const
-  {
-    if(o < start)
-      return true;
-
-    return false;
-  }
-};
-
-struct GPUAddressRangeTracker
-{
-  GPUAddressRangeTracker() {}
-  // no copying
-  GPUAddressRangeTracker(const GPUAddressRangeTracker &);
-  GPUAddressRangeTracker &operator=(const GPUAddressRangeTracker &);
-
-  rdcarray<GPUAddressRange> addresses;
-  Threading::RWLock addressLock;
-
-  void AddTo(const GPUAddressRange &range);
-  void RemoveFrom(const GPUAddressRange &range);
-  void GetResIDFromAddr(D3D12_GPU_VIRTUAL_ADDRESS addr, ResourceId &id, UINT64 &offs);
-  void GetResIDFromAddrAllowOutOfBounds(D3D12_GPU_VIRTUAL_ADDRESS addr, ResourceId &id, UINT64 &offs);
-};
-
 struct MapState
 {
   ID3D12Resource *res;
@@ -730,6 +701,8 @@ private:
   rdcarray<Bind> binds;
 };
 
+struct ASBuildData;
+
 struct D3D12InitialContents
 {
   enum Tag
@@ -793,7 +766,9 @@ struct D3D12InitialContents
         srcData(NULL),
         dataSize(0),
         sparseTable(NULL),
-        sparseBinds(NULL)
+        sparseBinds(NULL),
+        buildData(NULL),
+        cachedBuiltAS(NULL)
   {
   }
 
@@ -804,6 +779,8 @@ struct D3D12InitialContents
     SAFE_DELETE(sparseTable);
     SAFE_RELEASE(resource);
     FreeAlignedBuffer(srcData);
+    SAFE_RELEASE(buildData);
+    SAFE_RELEASE(cachedBuiltAS);
   }
 
   Tag tag;
@@ -820,6 +797,10 @@ struct D3D12InitialContents
   Sparse::PageTable *sparseTable;
   // only valid on replay, the table above converted into a set of binds
   SparseBinds *sparseBinds;
+
+  ASBuildData *buildData;
+  // only on replay, we cache the result of the build so we can copy it instead to save time
+  D3D12GpuBuffer *cachedBuiltAS;
 };
 
 class WrappedID3D12GraphicsCommandList;
@@ -1054,11 +1035,128 @@ struct PatchedRayDispatch
 
 struct D3D12ShaderExportDatabase;
 
-class D3D12RaytracingResourceAndUtilHandler
+struct ASStats
+{
+  struct
+  {
+    uint32_t msThreshold;
+    uint32_t count;
+    uint64_t bytes;
+  } bucket[4];
+
+  uint64_t overheadBytes;
+};
+
+// this is a refcounted GPU buffer with the build data, together with the metadata
+struct ASBuildData
+{
+  static const uint64_t NULLVA = ~0ULL;
+  // RVA equivalent of D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE
+  struct RVAWithStride
+  {
+    uint64_t RVA;
+    UINT64 StrideInBytes;
+  };
+
+  // RVA equivalent of D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC
+  struct RVATrianglesDesc
+  {
+    uint64_t Transform3x4;
+    DXGI_FORMAT IndexFormat;
+    DXGI_FORMAT VertexFormat;
+    UINT IndexCount;
+    UINT VertexCount;
+    uint64_t IndexBuffer;
+    RVAWithStride VertexBuffer;
+  };
+
+  // RVA equivalent of D3D12_RAYTRACING_GEOMETRY_AABBS_DESC
+  struct RVAAABBDesc
+  {
+    UINT AABBCount;
+    RVAWithStride AABBs;
+  };
+
+  // analogous struct to D3D12_RAYTRACING_GEOMETRY_DESC but contains plain uint64 offsets in place
+  // of GPU VAs - effectively RVAs in the internal buffer
+  struct RTGeometryDesc
+  {
+    RTGeometryDesc() = default;
+    RTGeometryDesc(const D3D12_RAYTRACING_GEOMETRY_DESC &desc)
+    {
+      RDCCOMPILE_ASSERT(sizeof(*this) == sizeof(D3D12_RAYTRACING_GEOMETRY_DESC),
+                        "Types should be entirely identical");
+      memcpy(this, &desc, sizeof(desc));
+    }
+
+    D3D12_RAYTRACING_GEOMETRY_TYPE Type;
+    D3D12_RAYTRACING_GEOMETRY_FLAGS Flags;
+
+    union
+    {
+      RVATrianglesDesc Triangles;
+      RVAAABBDesc AABBs;
+    };
+  };
+
+  // this struct is immutable, it's a snapshot of data and it's only referenced or deleted, never modified
+  ASBuildData(const ASBuildData &o) = delete;
+  ASBuildData(ASBuildData &&o) = delete;
+  ASBuildData &operator=(const ASBuildData &o) = delete;
+
+  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE Type;
+  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS Flags;
+
+  // for TLAS, the number of instance descriptors. For BLAS the number of geometries is given by
+  // the size of the array below
+  UINT NumBLAS;
+
+  // geometry GPU addresses have been de-based to contain only offsets
+  rdcarray<RTGeometryDesc> geoms;
+
+  void AddRef();
+  void Release();
+
+  D3D12GpuBuffer *buffer = NULL;
+
+  static void GatherASAgeStatistics(D3D12ResourceManager *rm, double now, ASStats &blasAges,
+                                    ASStats &tlasAges);
+
+private:
+  ASBuildData()
+  {
+#if ENABLED(RDOC_DEVEL)
+    SCOPED_WRITELOCK(dataslock);
+    datas.push_back(this);
+#endif
+  }
+
+  // timestamp this build data was recorded on
+  double timestamp = 0;
+
+  // how many bytes of overhead are currently present, due to copying with strided vertex/AABB data
+  uint64_t bytesOverhead = 0;
+
+  unsigned int m_RefCount = 1;
+
+  friend class D3D12RTManager;
+  friend class D3D12ResourceManager;
+
+#if ENABLED(RDOC_DEVEL)
+  static Threading::RWLock dataslock;
+  static rdcarray<ASBuildData *> datas;
+#endif
+};
+
+DECLARE_REFLECTION_STRUCT(ASBuildData::RVAWithStride);
+DECLARE_REFLECTION_STRUCT(ASBuildData::RVATrianglesDesc);
+DECLARE_REFLECTION_STRUCT(ASBuildData::RVAAABBDesc);
+DECLARE_REFLECTION_STRUCT(ASBuildData::RTGeometryDesc);
+
+class D3D12RTManager
 {
 public:
-  D3D12RaytracingResourceAndUtilHandler(WrappedID3D12Device *device,
-                                        D3D12GpuBufferAllocator &gpuBufferAllocator);
+  D3D12RTManager(WrappedID3D12Device *device, D3D12GpuBufferAllocator &gpuBufferAllocator);
 
   void CreateInternalResources();
 
@@ -1069,8 +1167,9 @@ public:
   D3D12AccStructPatchInfo GetAccStructPatchInfo() const { return m_accStructPatchInfo; }
   void SyncGpuForRtWork();
 
-  ~D3D12RaytracingResourceAndUtilHandler()
+  ~D3D12RTManager()
   {
+    SAFE_RELEASE(ASSerialiseBuffer);
     SAFE_RELEASE(m_cmdList);
     SAFE_RELEASE(m_cmdAlloc);
     SAFE_RELEASE(m_cmdQueue);
@@ -1093,6 +1192,9 @@ public:
 
   void PrepareRayDispatchBuffer(const GPUAddressRangeTracker *origAddresses);
 
+  ASBuildData *CopyBuildInputs(ID3D12GraphicsCommandList4 *unwrappedCmd,
+                               const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS &inputs);
+
   PatchedRayDispatch PatchRayDispatch(ID3D12GraphicsCommandList4 *unwrappedCmd,
                                       rdcarray<ResourceId> heaps,
                                       const D3D12_DISPATCH_RAYS_DESC &desc);
@@ -1107,7 +1209,7 @@ public:
                           const rdcarray<std::function<bool()>> &callbacks);
   void CheckPendingASBuilds();
 
-  void ResizeSerialisationBuffer(UINT64 size);
+  void ResizeSerialisationBuffer(UINT64 ScratchDataSizeInBytes);
 
   // buffer in UAV state for emitting AS queries to, CPU accessible/mappable
   D3D12GpuBuffer *ASQueryBuffer = NULL;
@@ -1115,12 +1217,19 @@ public:
   // temp buffer for AS serialise copies
   D3D12GpuBuffer *ASSerialiseBuffer = NULL;
 
+  double GetCurrentASTimestamp() { return m_Timestamp.GetMilliseconds(); }
+
 private:
   void InitRayDispatchPatchingResources();
   void InitReplayBlasPatchingResources();
 
+  void CopyFromVA(ID3D12GraphicsCommandList4 *unwrappedCmd, ID3D12Resource *dstRes,
+                  uint64_t dstOffset, D3D12_GPU_VIRTUAL_ADDRESS sourceVA, uint64_t byteSize);
+
   WrappedID3D12Device *m_wrappedDevice;
   D3D12GpuBufferAllocator &m_GPUBufferAllocator;
+
+  PerformanceTimer m_Timestamp;
 
   ID3D12GraphicsCommandListX *m_cmdList;
   ID3D12CommandAllocator *m_cmdAlloc;
@@ -1181,11 +1290,10 @@ public:
   D3D12ResourceManager(CaptureState &state, WrappedID3D12Device *dev)
       : ResourceManager(state), m_Device(dev), m_GPUBufferAllocator(dev)
   {
-    m_raytracingResourceManager =
-        new D3D12RaytracingResourceAndUtilHandler(m_Device, m_GPUBufferAllocator);
+    m_RTManager = new D3D12RTManager(m_Device, m_GPUBufferAllocator);
   }
 
-  ~D3D12ResourceManager() { SAFE_DELETE(m_raytracingResourceManager); }
+  ~D3D12ResourceManager() { SAFE_DELETE(m_RTManager); }
 
   template <class T>
   T *GetLiveAs(ResourceId id, bool optional = false)
@@ -1199,12 +1307,21 @@ public:
     return (T *)GetCurrentResource(id);
   }
 
+  template <typename D3D12Type>
+  D3D12Type *CreateDeferredHandle()
+  {
+    D3D12Type *ret = (D3D12Type *)(m_DummyHandle);
+
+    Atomic::Dec64((int64_t *)&m_DummyHandle);
+
+    return ret;
+  }
+
+  void ResolveDeferredWrappers();
+
   void ApplyBarriers(BarrierSet &barriers, std::map<ResourceId, SubresourceStateVector> &states);
 
-  D3D12RaytracingResourceAndUtilHandler *GetRaytracingResourceAndUtilHandler() const
-  {
-    return m_raytracingResourceManager;
-  }
+  D3D12RTManager *GetRTManager() const { return m_RTManager; }
 
   D3D12GpuBufferAllocator &GetGPUBufferAllocator() { return m_GPUBufferAllocator; }
 
@@ -1232,9 +1349,14 @@ private:
     return Serialise_InitialState<WriteSerialiser>(ser, id, record, initial);
   }
   void Create_InitialState(ResourceId id, ID3D12DeviceChild *live, bool hasData);
-  void Apply_InitialState(ID3D12DeviceChild *live, const D3D12InitialContents &data);
+  void Apply_InitialState(ID3D12DeviceChild *live, D3D12InitialContents &data);
+  rdcarray<ResourceId> InitialContentResources();
 
   WrappedID3D12Device *m_Device;
-  D3D12RaytracingResourceAndUtilHandler *m_raytracingResourceManager;
+  D3D12RTManager *m_RTManager;
   D3D12GpuBufferAllocator m_GPUBufferAllocator;
+
+  // dummy handle to use - starting from near highest valid pointer to minimise risk of overlap with real handles
+  static const uint64_t FirstDummyHandle = UINTPTR_MAX - 1024;
+  uint64_t m_DummyHandle = FirstDummyHandle;
 };

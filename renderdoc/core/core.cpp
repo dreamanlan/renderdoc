@@ -51,6 +51,11 @@ extern "C" const rdcstr VulkanLayerJSONBasename = STRINGIZE(RDOC_BASE_NAME);
 RDOC_DEBUG_CONFIG(bool, Capture_Debug_SnapshotDiagnosticLog, false,
                   "Snapshot the diagnostic log at capture time and embed in the capture.");
 
+RDOC_CONFIG(bool, Replay_Debug_PrintChunkTimings, false, "Print stats of chunk processing times");
+
+RDOC_CONFIG(bool, Replay_Debug_SingleThreadedCompilation, false,
+            "Compile all shaders and PSOs single-threaded.");
+
 // this is declared centrally so it can be shared with any backend - the name is a misnomer but kept
 // for backwards compatibility reasons.
 RDOC_CONFIG(rdcarray<rdcstr>, DXBC_Debug_SearchDirPaths, {},
@@ -671,6 +676,10 @@ void RenderDoc::InitialiseReplay(GlobalEnvironment env, const rdcarray<rdcstr> &
                   "atioglxx.dll",
                   "ControlLib.dll",
                   "ControlLib32.dll",
+                  "igd10iumd32.dll",
+                  "igd10iumd64.dll",
+                  "igd12umd32.dll",
+                  "igd12umd64.dll",
                   "igc32.dll",
                   "igc64.dll",
                   "igvk32.dll",

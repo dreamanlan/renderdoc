@@ -1386,9 +1386,12 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
         Decorations::Flags flags = Decorations::Flags(
             decorations[global.id].flags & (Decorations::HasLocation | Decorations::HasBinding));
 
+        bindset = 0;
+
         if(flags == Decorations::HasLocation)
         {
           bind = decorations[global.id].location;
+          bindset = 1;
         }
         else if(flags == Decorations::NoFlags)
         {
@@ -1422,7 +1425,7 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
         res.variableType.baseType = VarType::UInt;
         res.variableType.name = varType->name;
 
-        res.fixedBindSetOrSpace = 0;
+        res.fixedBindSetOrSpace = bindset;
         res.fixedBindNumber = GetBinding(decorations[global.id].binding);
         res.bindArraySize = arraySize;
 
@@ -2014,12 +2017,23 @@ void Reflector::MakeConstantBlockVariables(rdcspv::StorageClass storage, const D
       // expect at least the scalar size to be available otherwise this struct seems to overlap
       RDCASSERT(sizes.scalarSize <= availSize, sizes.scalarSize, availSize);
 
-      if(sizes.extendedSize <= availSize)
-        cblock[i].type.arrayByteStride = sizes.extendedSize;
-      else if(sizes.baseSize <= availSize)
-        cblock[i].type.arrayByteStride = sizes.baseSize;
+      // If there is no next member, use the base size as do not know how much trailing padding the shader expected.
+      if(i + 1 == cblock.size())
+      {
+        if(sizes.baseSize <= availSize)
+          cblock[i].type.arrayByteStride = sizes.baseSize;
+        else
+          cblock[i].type.arrayByteStride = sizes.scalarSize;
+      }
       else
-        cblock[i].type.arrayByteStride = sizes.scalarSize;
+      {
+        if(sizes.extendedSize <= availSize)
+          cblock[i].type.arrayByteStride = sizes.extendedSize;
+        else if(sizes.baseSize <= availSize)
+          cblock[i].type.arrayByteStride = sizes.baseSize;
+        else
+          cblock[i].type.arrayByteStride = sizes.scalarSize;
+      }
     }
   }
 }

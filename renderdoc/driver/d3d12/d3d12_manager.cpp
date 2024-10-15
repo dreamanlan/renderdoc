@@ -31,12 +31,20 @@
 #include "d3d12_command_queue.h"
 #include "d3d12_device.h"
 #include "d3d12_resources.h"
+#include "d3d12_rootsig.h"
 #include "d3d12_shader_cache.h"
 
 #include "data/hlsl/hlsl_cbuffers.h"
 
 RDOC_CONFIG(uint32_t, D3D12_Debug_RTIndirectEstimateOverride, 0,
             "Override how many bytes are reserved for shader tables in each indirect ray dispatch");
+RDOC_CONFIG(uint32_t, D3D12_Debug_RTMaxVertexIncrement, 1000,
+            "Amount to add to the API-provided max vertex when building a BLAS with an index "
+            "buffer, to account for incorrectly set values by application.");
+RDOC_CONFIG(
+    uint32_t, D3D12_Debug_RTMaxVertexPercentIncrease, 10,
+    "Percentage increase for the API-provided max vertex when building a BLAS with an index "
+    "buffer, to account for incorrectly set values by application.");
 
 void D3D12Descriptor::Init(const D3D12_SAMPLER_DESC2 *pDesc)
 {
@@ -690,8 +698,8 @@ D3D12Descriptor *DescriptorFromPortableHandle(D3D12ResourceManager *manager, Por
 #define BARRIER_ASSERT(...)
 #endif
 
-D3D12RaytracingResourceAndUtilHandler::D3D12RaytracingResourceAndUtilHandler(
-    WrappedID3D12Device *device, D3D12GpuBufferAllocator &gpuBufferAllocator)
+D3D12RTManager::D3D12RTManager(WrappedID3D12Device *device,
+                               D3D12GpuBufferAllocator &gpuBufferAllocator)
     : m_wrappedDevice(device),
       m_cmdList(NULL),
       m_cmdAlloc(NULL),
@@ -703,7 +711,7 @@ D3D12RaytracingResourceAndUtilHandler::D3D12RaytracingResourceAndUtilHandler(
 {
 }
 
-void D3D12RaytracingResourceAndUtilHandler::CreateInternalResources()
+void D3D12RTManager::CreateInternalResources()
 {
   if(m_wrappedDevice)
   {
@@ -755,7 +763,7 @@ void D3D12RaytracingResourceAndUtilHandler::CreateInternalResources()
   }
 }
 
-void D3D12RaytracingResourceAndUtilHandler::SyncGpuForRtWork()
+void D3D12RTManager::SyncGpuForRtWork()
 {
   m_gpuSyncCounter++;
 
@@ -770,7 +778,7 @@ void D3D12RaytracingResourceAndUtilHandler::SyncGpuForRtWork()
   WaitForSingleObject(m_gpuSyncHandle, 10000);
 }
 
-void D3D12RaytracingResourceAndUtilHandler::InitInternalResources()
+void D3D12RTManager::InitInternalResources()
 {
   if(IsReplayMode(m_wrappedDevice->GetState()))
   {
@@ -779,7 +787,7 @@ void D3D12RaytracingResourceAndUtilHandler::InitInternalResources()
   InitRayDispatchPatchingResources();
 }
 
-void D3D12RaytracingResourceAndUtilHandler::ResizeSerialisationBuffer(UINT64 size)
+void D3D12RTManager::ResizeSerialisationBuffer(UINT64 size)
 {
   if(!ASSerialiseBuffer || size > ASSerialiseBuffer->Size())
   {
@@ -790,8 +798,8 @@ void D3D12RaytracingResourceAndUtilHandler::ResizeSerialisationBuffer(UINT64 siz
   }
 }
 
-void D3D12RaytracingResourceAndUtilHandler::AddPendingASBuilds(
-    ID3D12Fence *fence, UINT64 waitValue, const rdcarray<std::function<bool()>> &callbacks)
+void D3D12RTManager::AddPendingASBuilds(ID3D12Fence *fence, UINT64 waitValue,
+                                        const rdcarray<std::function<bool()>> &callbacks)
 {
   SCOPED_LOCK(m_PendingASBuildsLock);
   for(const std::function<bool()> &cb : callbacks)
@@ -801,7 +809,7 @@ void D3D12RaytracingResourceAndUtilHandler::AddPendingASBuilds(
   }
 }
 
-void D3D12RaytracingResourceAndUtilHandler::CheckPendingASBuilds()
+void D3D12RTManager::CheckPendingASBuilds()
 {
   std::map<ID3D12Fence *, UINT64> fenceValues;
   SCOPED_LOCK(m_PendingASBuildsLock);
@@ -827,9 +835,9 @@ void D3D12RaytracingResourceAndUtilHandler::CheckPendingASBuilds()
   m_PendingASBuilds.removeIf([](const PendingASBuild &build) { return build.fence == NULL; });
 }
 
-PatchedRayDispatch D3D12RaytracingResourceAndUtilHandler::PatchRayDispatch(
-    ID3D12GraphicsCommandList4 *unwrappedCmd, rdcarray<ResourceId> heaps,
-    const D3D12_DISPATCH_RAYS_DESC &desc)
+PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *unwrappedCmd,
+                                                    rdcarray<ResourceId> heaps,
+                                                    const D3D12_DISPATCH_RAYS_DESC &desc)
 {
   PatchedRayDispatch ret = {};
 
@@ -1004,7 +1012,7 @@ PatchedRayDispatch D3D12RaytracingResourceAndUtilHandler::PatchRayDispatch(
   return ret;
 }
 
-PatchedRayDispatch D3D12RaytracingResourceAndUtilHandler::PatchIndirectRayDispatch(
+PatchedRayDispatch D3D12RTManager::PatchIndirectRayDispatch(
     ID3D12GraphicsCommandList *unwrappedCmd, rdcarray<ResourceId> heaps,
     ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgumentBuffer,
     UINT64 ArgumentBufferOffset, ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset)
@@ -1161,8 +1169,7 @@ PatchedRayDispatch D3D12RaytracingResourceAndUtilHandler::PatchIndirectRayDispat
   return ret;
 }
 
-void D3D12RaytracingResourceAndUtilHandler::PrepareRayDispatchBuffer(
-    const GPUAddressRangeTracker *origAddresses)
+void D3D12RTManager::PrepareRayDispatchBuffer(const GPUAddressRangeTracker *origAddresses)
 {
   SCOPED_LOCK(m_LookupBufferLock);
   if(m_LookupBufferDirty || origAddresses)
@@ -1265,7 +1272,274 @@ void D3D12RaytracingResourceAndUtilHandler::PrepareRayDispatchBuffer(
   }
 }
 
-void D3D12RaytracingResourceAndUtilHandler::InitRayDispatchPatchingResources()
+ASBuildData *D3D12RTManager::CopyBuildInputs(
+    ID3D12GraphicsCommandList4 *unwrappedCmd,
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS &inputs)
+{
+  ASBuildData *ret = new ASBuildData;
+  ret->Type = inputs.Type;
+  ret->Flags = inputs.Flags;
+  ret->timestamp = m_Timestamp.GetMilliseconds();
+
+  if(inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)
+  {
+    ret->NumBLAS = inputs.NumDescs;
+
+    if(ret->NumBLAS > 0)
+    {
+      uint64_t byteSize = sizeof(D3D12_RAYTRACING_INSTANCE_DESC) * inputs.NumDescs;
+      m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::ReadBackHeap,
+                                 D3D12GpuBufferHeapMemoryFlag::Default, byteSize, 256, &ret->buffer);
+
+      if(inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY)
+      {
+        // easy case, one copy of instances
+
+        ResourceId sourceBufferId;
+        D3D12BufferOffset sourceOffset;
+
+        WrappedID3D12Resource::GetResIDFromAddr(inputs.InstanceDescs, sourceBufferId, sourceOffset);
+        ID3D12Resource *sourceBuffer = Unwrap(
+            m_wrappedDevice->GetResourceManager()->GetCurrentAs<ID3D12Resource>(sourceBufferId));
+
+        unwrappedCmd->CopyBufferRegion(ret->buffer->Resource(), ret->buffer->Offset(), sourceBuffer,
+                                       sourceOffset, byteSize);
+      }
+      else
+      {
+        // hard case :( instance pointers, need to do indirected copy with compute
+        // this is extra hard because all the indirect pointers are inaccessible from shaders so we
+        // need to shunt through an ExecuteIndirect to use them as root SRVs. That also means that
+        // we need to first do a pre-pass to prepare the indirect argument buffer from
+        // {BLASDescAddr, BLASDescAddr, BlasDescAddr...} to
+        // {BLASDescAddr, dispatch(1,1,1), BLASDescAddr, dispatch(1,1,1), ...}
+        RDCERR("Unimplemented indirect array-of-pointers input to TLAS");
+
+        ret->NumBLAS = 0;
+      }
+    }
+  }
+  else
+  {
+    ret->NumBLAS = 0;
+
+    if(inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY)
+    {
+      ret->geoms.assign((ASBuildData::RTGeometryDesc *)inputs.pGeometryDescs, inputs.NumDescs);
+    }
+    else
+    {
+      ret->geoms.reserve(inputs.NumDescs);
+      for(UINT i = 0; i < inputs.NumDescs; i++)
+        ret->geoms.push_back(*inputs.ppGeometryDescs[i]);
+    }
+
+    // calculate how much data is needed. Add 256 bytes padding
+    uint64_t byteSize = 0;
+    uint64_t bytesOverhead = 0;
+    for(const ASBuildData::RTGeometryDesc &desc : ret->geoms)
+    {
+      if(desc.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS)
+      {
+        if(desc.AABBs.AABBCount > 0)
+        {
+          byteSize += (desc.AABBs.AABBCount - 1) * desc.AABBs.AABBs.StrideInBytes;
+          byteSize += sizeof(D3D12_RAYTRACING_AABB);
+          byteSize = AlignUp16(byteSize);
+
+          if(desc.AABBs.AABBs.StrideInBytes > sizeof(D3D12_RAYTRACING_AABB))
+            bytesOverhead += (desc.AABBs.AABBCount - 1) *
+                             (desc.AABBs.AABBs.StrideInBytes - sizeof(D3D12_RAYTRACING_AABB));
+        }
+      }
+      else
+      {
+        if(desc.Triangles.Transform3x4)
+          byteSize += sizeof(float) * 3 * 4;
+
+        if(desc.Triangles.IndexBuffer)
+        {
+          UINT isize = 2;
+          if(desc.Triangles.IndexFormat == DXGI_FORMAT_R32_UINT)
+            isize = 4;
+          byteSize += isize * desc.Triangles.IndexCount;
+          byteSize = AlignUp16(byteSize);
+
+          ResourceId vbId = WrappedID3D12Resource::GetResIDFromAddr(desc.Triangles.VertexBuffer.RVA);
+          ID3D12Resource *sourceBuffer =
+              m_wrappedDevice->GetResourceManager()->GetCurrentAs<ID3D12Resource>(vbId);
+
+          uint64_t vbSize = sourceBuffer->GetDesc().Width;
+
+          uint32_t untrustedVertexCount = desc.Triangles.VertexCount;
+          uint32_t estimatedVertexCount =
+              untrustedVertexCount +
+              (untrustedVertexCount / 100) * D3D12_Debug_RTMaxVertexPercentIncrease() +
+              D3D12_Debug_RTMaxVertexIncrement();
+
+          RDCASSERT(vbSize >= desc.Triangles.VertexBuffer.StrideInBytes * untrustedVertexCount);
+
+          vbSize = RDCMIN(vbSize, desc.Triangles.VertexBuffer.StrideInBytes * estimatedVertexCount);
+
+          byteSize += vbSize;
+          byteSize = AlignUp16(byteSize);
+
+          uint64_t tightStride = GetByteSize(1, 1, 1, desc.Triangles.VertexFormat, 0);
+
+          if(desc.Triangles.VertexBuffer.StrideInBytes > tightStride)
+          {
+            bytesOverhead += vbSize - (tightStride * untrustedVertexCount);
+          }
+          else if(vbSize > desc.Triangles.VertexBuffer.StrideInBytes * untrustedVertexCount)
+          {
+            bytesOverhead +=
+                vbSize - (desc.Triangles.VertexBuffer.StrideInBytes * untrustedVertexCount);
+          }
+        }
+        else
+        {
+          if(desc.Triangles.VertexCount > 0)
+          {
+            byteSize += (desc.Triangles.VertexCount - 1) * desc.Triangles.VertexBuffer.StrideInBytes;
+
+            uint64_t tightStride = GetByteSize(1, 1, 1, desc.Triangles.VertexFormat, 0);
+
+            if(desc.Triangles.VertexBuffer.StrideInBytes > tightStride)
+              bytesOverhead += (desc.Triangles.VertexCount - 1) *
+                               (desc.Triangles.VertexBuffer.StrideInBytes - tightStride);
+
+            byteSize += tightStride;
+            byteSize = AlignUp16(byteSize);
+          }
+        }
+      }
+    }
+
+    ret->bytesOverhead = bytesOverhead;
+
+    m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::ReadBackHeap,
+                               D3D12GpuBufferHeapMemoryFlag::Default, byteSize, 256, &ret->buffer);
+
+    if(!ret->buffer)
+    {
+      RDCERR("Failed to allocate shadow storage for AS");
+      ret = {};
+      return ret;
+    }
+
+    ID3D12Resource *dstRes = ret->buffer->Resource();
+    uint64_t dstOffset = ret->buffer->Offset();
+    uint64_t baseOffset = dstOffset;
+
+    for(ASBuildData::RTGeometryDesc &desc : ret->geoms)
+    {
+      if(desc.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS)
+      {
+        if(desc.AABBs.AABBCount > 0)
+        {
+          byteSize = (desc.AABBs.AABBCount - 1) * desc.AABBs.AABBs.StrideInBytes;
+          byteSize += sizeof(D3D12_RAYTRACING_AABB);
+
+          CopyFromVA(unwrappedCmd, dstRes, dstOffset, desc.AABBs.AABBs.RVA, byteSize);
+
+          desc.AABBs.AABBs.RVA = dstOffset - baseOffset;
+
+          dstOffset = AlignUp16(dstOffset + byteSize);
+        }
+        else
+        {
+          // set a NULL marker so that we don't confuse an offset of 0 with an intended NULL
+          desc.AABBs.AABBs.RVA = ASBuildData::NULLVA;
+        }
+      }
+      else
+      {
+        if(desc.Triangles.Transform3x4)
+        {
+          byteSize = sizeof(float) * 3 * 4;
+
+          CopyFromVA(unwrappedCmd, dstRes, dstOffset, desc.Triangles.Transform3x4, byteSize);
+
+          desc.Triangles.Transform3x4 = dstOffset - baseOffset;
+
+          dstOffset = AlignUp16(dstOffset + byteSize);
+        }
+        else
+        {
+          desc.Triangles.Transform3x4 = ASBuildData::NULLVA;
+        }
+
+        if(desc.Triangles.IndexBuffer)
+        {
+          UINT isize = 2;
+          if(desc.Triangles.IndexFormat == DXGI_FORMAT_R32_UINT)
+            isize = 4;
+          byteSize = isize * desc.Triangles.IndexCount;
+
+          CopyFromVA(unwrappedCmd, dstRes, dstOffset, desc.Triangles.IndexBuffer, byteSize);
+
+          desc.Triangles.IndexBuffer = dstOffset - baseOffset;
+
+          dstOffset = AlignUp16(dstOffset + byteSize);
+
+          ResourceId vbId;
+          uint64_t srcOffs = 0;
+          WrappedID3D12Resource::GetResIDFromAddr(desc.Triangles.VertexBuffer.RVA, vbId, srcOffs);
+          ID3D12Resource *sourceBuffer =
+              m_wrappedDevice->GetResourceManager()->GetCurrentAs<ID3D12Resource>(vbId);
+
+          uint64_t vbSize = sourceBuffer->GetDesc().Width;
+
+          vbSize =
+              RDCMIN(vbSize, desc.Triangles.VertexBuffer.StrideInBytes * desc.Triangles.VertexCount);
+
+          unwrappedCmd->CopyBufferRegion(dstRes, dstOffset, Unwrap(sourceBuffer), srcOffs, vbSize);
+
+          desc.Triangles.VertexBuffer.RVA = dstOffset - baseOffset;
+
+          dstOffset = AlignUp16(dstOffset + byteSize);
+        }
+        else
+        {
+          desc.Triangles.IndexBuffer = ASBuildData::NULLVA;
+          if(desc.Triangles.VertexCount > 0)
+          {
+            byteSize = (desc.Triangles.VertexCount - 1) * desc.Triangles.VertexBuffer.StrideInBytes;
+
+            byteSize += GetByteSize(1, 1, 1, desc.Triangles.VertexFormat, 0);
+
+            CopyFromVA(unwrappedCmd, dstRes, dstOffset, desc.Triangles.VertexBuffer.RVA, byteSize);
+
+            desc.Triangles.VertexBuffer.RVA = dstOffset - baseOffset;
+
+            dstOffset = AlignUp16(dstOffset + byteSize);
+          }
+        }
+      }
+    }
+  }
+
+  // ensure the copy finishes before anything changes in the input buffer
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  unwrappedCmd->ResourceBarrier(1, &barrier);
+
+  return ret;
+}
+
+void D3D12RTManager::CopyFromVA(ID3D12GraphicsCommandList4 *unwrappedCmd, ID3D12Resource *dstRes,
+                                uint64_t dstOffset, D3D12_GPU_VIRTUAL_ADDRESS sourceVA,
+                                uint64_t byteSize)
+{
+  ResourceId srcId;
+  uint64_t srcOffs = 0;
+  WrappedID3D12Resource::GetResIDFromAddr(sourceVA, srcId, srcOffs);
+  ID3D12Resource *srcBuf = m_wrappedDevice->GetResourceManager()->GetCurrentAs<ID3D12Resource>(srcId);
+
+  unwrappedCmd->CopyBufferRegion(dstRes, dstOffset, Unwrap(srcBuf), srcOffs, byteSize);
+}
+
+void D3D12RTManager::InitRayDispatchPatchingResources()
 {
   D3D12ShaderCache *shaderCache = m_wrappedDevice->GetShaderCache();
 
@@ -1369,12 +1643,13 @@ void D3D12RaytracingResourceAndUtilHandler::InitRayDispatchPatchingResources()
 
   RDCASSERT(rootParameters.size() == uint32_t(D3D12PatchRayDispatchParam::Count));
 
-  ID3DBlob *rootSig = shaderCache->MakeRootSig(rootParameters, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+  bytebuf rootSig = EncodeRootSig(m_wrappedDevice->RootSigVersion(), rootParameters,
+                                  D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
-  if(rootSig)
+  if(!rootSig.empty())
   {
     HRESULT result = m_wrappedDevice->GetReal()->CreateRootSignature(
-        0, rootSig->GetBufferPointer(), rootSig->GetBufferSize(), __uuidof(ID3D12RootSignature),
+        0, rootSig.data(), rootSig.size(), __uuidof(ID3D12RootSignature),
         (void **)&m_RayPatchingData.descPatchRootSig);
 
     if(!SUCCEEDED(result))
@@ -1405,8 +1680,6 @@ void D3D12RaytracingResourceAndUtilHandler::InitRayDispatchPatchingResources()
     {
       RDCERR("Failed to get shader for dispatch patching");
     }
-
-    SAFE_RELEASE(rootSig);
   }
 
   // need 5x 2-DWORD root buffers, the rest we can have for constants.
@@ -1481,12 +1754,13 @@ void D3D12RaytracingResourceAndUtilHandler::InitRayDispatchPatchingResources()
 
   RDCASSERT(rootParameters.size() == uint32_t(D3D12IndirectPrepParam::Count));
 
-  rootSig = shaderCache->MakeRootSig(rootParameters, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+  rootSig = EncodeRootSig(m_wrappedDevice->RootSigVersion(), rootParameters,
+                          D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
-  if(rootSig)
+  if(!rootSig.empty())
   {
     HRESULT result = m_wrappedDevice->GetReal()->CreateRootSignature(
-        0, rootSig->GetBufferPointer(), rootSig->GetBufferSize(), __uuidof(ID3D12RootSignature),
+        0, rootSig.data(), rootSig.size(), __uuidof(ID3D12RootSignature),
         (void **)&m_RayPatchingData.indirectPrepRootSig);
 
     if(!SUCCEEDED(result))
@@ -1517,8 +1791,6 @@ void D3D12RaytracingResourceAndUtilHandler::InitRayDispatchPatchingResources()
     {
       RDCERR("Failed to get shader for indirect execute patching");
     }
-
-    SAFE_RELEASE(rootSig);
   }
 
   {
@@ -1561,7 +1833,7 @@ void D3D12RaytracingResourceAndUtilHandler::InitRayDispatchPatchingResources()
   }
 }
 
-void D3D12RaytracingResourceAndUtilHandler::InitReplayBlasPatchingResources()
+void D3D12RTManager::InitReplayBlasPatchingResources()
 {
   // Root Signature
   rdcarray<D3D12_ROOT_PARAMETER1> rootParameters;
@@ -1601,12 +1873,13 @@ void D3D12RaytracingResourceAndUtilHandler::InitReplayBlasPatchingResources()
 
   if(shaderCache != NULL)
   {
-    ID3DBlob *rootSig = shaderCache->MakeRootSig(rootParameters, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+    bytebuf rootSig = EncodeRootSig(m_wrappedDevice->RootSigVersion(), rootParameters,
+                                    D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
-    if(rootSig)
+    if(!rootSig.empty())
     {
       HRESULT result = m_wrappedDevice->GetReal()->CreateRootSignature(
-          0, rootSig->GetBufferPointer(), rootSig->GetBufferSize(), __uuidof(ID3D12RootSignature),
+          0, rootSig.data(), rootSig.size(), __uuidof(ID3D12RootSignature),
           (void **)&m_accStructPatchInfo.m_rootSignature);
 
       if(!SUCCEEDED(result))
@@ -1633,8 +1906,6 @@ void D3D12RaytracingResourceAndUtilHandler::InitReplayBlasPatchingResources()
         if(!SUCCEEDED(result))
           RDCERR("Unable to create pipeline for patching the BLAS");
       }
-
-      SAFE_RELEASE(rootSig);
     }
   }
   else
@@ -1643,7 +1914,7 @@ void D3D12RaytracingResourceAndUtilHandler::InitReplayBlasPatchingResources()
   }
 }
 
-uint32_t D3D12RaytracingResourceAndUtilHandler::RegisterLocalRootSig(const D3D12RootSignature &sig)
+uint32_t D3D12RTManager::RegisterLocalRootSig(const D3D12RootSignature &sig)
 {
   rdcarray<uint32_t> patchOffsets;
   uint32_t offset = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
@@ -1688,7 +1959,7 @@ uint32_t D3D12RaytracingResourceAndUtilHandler::RegisterLocalRootSig(const D3D12
   return idx;
 }
 
-void D3D12RaytracingResourceAndUtilHandler::RegisterExportDatabase(D3D12ShaderExportDatabase *db)
+void D3D12RTManager::RegisterExportDatabase(D3D12ShaderExportDatabase *db)
 {
   SCOPED_LOCK(m_LookupBufferLock);
   m_ExportDatabases.push_back(db);
@@ -1696,7 +1967,7 @@ void D3D12RaytracingResourceAndUtilHandler::RegisterExportDatabase(D3D12ShaderEx
   m_LookupBufferDirty = true;
 }
 
-void D3D12RaytracingResourceAndUtilHandler::UnregisterExportDatabase(D3D12ShaderExportDatabase *db)
+void D3D12RTManager::UnregisterExportDatabase(D3D12ShaderExportDatabase *db)
 {
   SCOPED_LOCK(m_LookupBufferLock);
   m_ExportDatabases.removeOne(db);
@@ -1980,6 +2251,25 @@ bool D3D12GpuBufferAllocator::D3D12GpuBufferResource::CreateBufferResource(
   }
 
   return false;
+}
+
+void D3D12ResourceManager::ResolveDeferredWrappers()
+{
+  rdcarray<ID3D12DeviceChild *> wrappers;
+  for(auto it = m_WrapperMap.begin(); it != m_WrapperMap.end();)
+  {
+    if((uint64_t)it->first >= m_DummyHandle)
+    {
+      wrappers.push_back(it->second);
+      it = m_WrapperMap.erase(it);
+      continue;
+    }
+
+    ++it;
+  }
+
+  for(ID3D12DeviceChild *wrapper : wrappers)
+    AddWrapper(wrapper, Unwrap(wrapper));
 }
 
 void D3D12ResourceManager::ApplyBarriers(BarrierSet &barriers,
@@ -2306,116 +2596,22 @@ bool D3D12ResourceManager::ResourceTypeRelease(ID3D12DeviceChild *res)
   return true;
 }
 
-void GPUAddressRangeTracker::AddTo(const GPUAddressRange &range)
+rdcarray<ResourceId> D3D12ResourceManager::InitialContentResources()
 {
-  SCOPED_WRITELOCK(addressLock);
-  auto it = std::lower_bound(addresses.begin(), addresses.end(), range.start);
+  rdcarray<ResourceId> resources =
+      ResourceManager<D3D12ResourceManagerConfiguration>::InitialContentResources();
+  std::sort(resources.begin(), resources.end(), [this](ResourceId a, ResourceId b) {
+    const InitialContentData &aData = m_InitialContents[a].data;
+    const InitialContentData &bData = m_InitialContents[b].data;
 
-  addresses.insert(it - addresses.begin(), range);
-}
+    // Always sort BLASs before TLASs, as a TLAS holds device addresses for it's BLASs
+    // and we make sure those addresses are built first
+    if(aData.buildData && bData.buildData)
+      return aData.buildData->Type > bData.buildData->Type;
 
-void GPUAddressRangeTracker::RemoveFrom(const GPUAddressRange &range)
-{
-  {
-    SCOPED_WRITELOCK(addressLock);
-    size_t i = std::lower_bound(addresses.begin(), addresses.end(), range.start) - addresses.begin();
-
-    // there might be multiple buffers with the same range start, find the exact range for this
-    // buffer
-    while(i < addresses.size() && addresses[i].start == range.start)
-    {
-      if(addresses[i].id == range.id)
-      {
-        addresses.erase(i);
-        return;
-      }
-
-      ++i;
-    }
-  }
-
-  RDCERR("Couldn't find matching range to remove for %s", ToStr(range.id).c_str());
-}
-
-void GPUAddressRangeTracker::GetResIDFromAddr(D3D12_GPU_VIRTUAL_ADDRESS addr, ResourceId &id,
-                                              UINT64 &offs)
-{
-  id = ResourceId();
-  offs = 0;
-
-  if(addr == 0)
-    return;
-
-  GPUAddressRange range;
-
-  // this should really be a read-write lock
-  {
-    SCOPED_READLOCK(addressLock);
-
-    auto it = std::lower_bound(addresses.begin(), addresses.end(), addr);
-    if(it == addresses.end())
-      return;
-
-    range = *it;
-
-    // find the largest resource containing this address - not perfect but helps with trivially bad
-    // aliases where a tiny resource and a large resource are co-situated and the larger resource
-    // needs to be used for validity
-    while((it + 1)->start <= addr && (it + 1)->realEnd > range.realEnd)
-    {
-      it++;
-      range = *it;
-    }
-  }
-
-  if(addr < range.start || addr >= range.realEnd)
-    return;
-
-  id = range.id;
-  offs = addr - range.start;
-}
-
-void GPUAddressRangeTracker::GetResIDFromAddrAllowOutOfBounds(D3D12_GPU_VIRTUAL_ADDRESS addr,
-                                                              ResourceId &id, UINT64 &offs)
-{
-  id = ResourceId();
-  offs = 0;
-
-  if(addr == 0)
-    return;
-
-  GPUAddressRange range;
-
-  // this should really be a read-write lock
-  {
-    SCOPED_READLOCK(addressLock);
-
-    auto it = std::lower_bound(addresses.begin(), addresses.end(), addr);
-    if(it == addresses.end())
-      return;
-
-    range = *it;
-
-    // find the largest resource containing this address - not perfect but helps with trivially bad
-    // aliases where a tiny resource and a large resource are co-situated and the larger resource
-    // needs to be used for validity
-    while((it + 1)->start <= addr && (it + 1)->realEnd > range.realEnd)
-    {
-      it++;
-      range = *it;
-    }
-  }
-
-  if(addr < range.start)
-    return;
-
-  // still enforce the OOB end on ranges - which is the remaining range in the backing store.
-  // Otherwise we could end up passing through invalid addresses stored in stale descriptors
-  if(addr >= range.oobEnd)
-    return;
-
-  id = range.id;
-  offs = addr - range.start;
+    return aData.resourceType < bData.resourceType;
+  });
+  return resources;
 }
 
 void D3D12GpuBuffer::AddRef()
@@ -2432,4 +2628,71 @@ void D3D12GpuBuffer::Release()
 
     delete this;
   }
+}
+
+void ASBuildData::AddRef()
+{
+  InterlockedIncrement(&m_RefCount);
+}
+
+void ASBuildData::Release()
+{
+  unsigned int ret = InterlockedDecrement(&m_RefCount);
+  if(ret == 0)
+  {
+    {
+#if ENABLED(RDOC_DEVEL)
+      SCOPED_WRITELOCK(dataslock);
+      datas.removeOne(this);
+#endif
+    }
+
+    SAFE_RELEASE(buffer);
+
+    delete this;
+  }
+}
+
+#if ENABLED(RDOC_DEVEL)
+Threading::RWLock ASBuildData::dataslock;
+rdcarray<ASBuildData *> ASBuildData::datas;
+#endif
+
+void ASBuildData::GatherASAgeStatistics(D3D12ResourceManager *rm, double now, ASStats &blasAges,
+                                        ASStats &tlasAges)
+{
+#if ENABLED(RDOC_DEVEL)
+  SCOPED_READLOCK(dataslock);
+
+  blasAges.bucket[0].msThreshold = tlasAges.bucket[0].msThreshold = 50;
+  blasAges.bucket[1].msThreshold = tlasAges.bucket[1].msThreshold = 500;
+  blasAges.bucket[2].msThreshold = tlasAges.bucket[2].msThreshold = 5000;
+  blasAges.bucket[3].msThreshold = tlasAges.bucket[3].msThreshold = ~0U;
+
+  for(ASBuildData *buildData : datas)
+  {
+    if(buildData)
+    {
+      uint32_t age = uint32_t(now - buildData->timestamp);
+
+      ASStats &ages = buildData->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
+                          ? tlasAges
+                          : blasAges;
+
+      uint64_t size = buildData->buffer ? buildData->buffer->Size() : 0;
+
+      ages.overheadBytes += buildData->bytesOverhead;
+
+      for(size_t i = 0; i < ARRAY_COUNT(tlasAges.bucket); i++)
+      {
+        if(age <= ages.bucket[i].msThreshold)
+        {
+          ages.bucket[i].count++;
+          ages.bucket[i].bytes += size;
+          break;
+        }
+      }
+    }
+  }
+#endif
 }

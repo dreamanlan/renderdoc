@@ -101,6 +101,8 @@ void D3D12Replay::Shutdown()
     RDCASSERT(GetModuleHandleA("d3d12.dll") == NULL);
     RDCASSERT(GetModuleHandleA("d3d12core.dll") == NULL);
   }
+
+  Threading::JobSystem::Shutdown();
 }
 
 void D3D12Replay::Initialise(IDXGIFactory1 *factory, D3D12DevConfiguration *config)
@@ -141,6 +143,9 @@ void D3D12Replay::Initialise(IDXGIFactory1 *factory, D3D12DevConfiguration *conf
   }
 
   m_pDevice->SetDriverInfo(m_DriverInfo);
+
+  if(!m_Proxy)
+    Threading::JobSystem::Init();
 }
 
 RDResult D3D12Replay::FatalErrorCheck()
@@ -734,7 +739,7 @@ void D3D12Replay::FillDescriptor(Descriptor &dst, const D3D12Descriptor *src)
     return;
   }
 
-  if(src->GetHeap()->HasValidDescriptorCache(src->GetHeapIndex()))
+  if(src->GetHeap() && src->GetHeap()->HasValidDescriptorCache(src->GetHeapIndex()))
   {
     src->GetHeap()->GetFromDescriptorCache(src->GetHeapIndex(), dst);
     return;
@@ -748,7 +753,10 @@ void D3D12Replay::FillDescriptor(Descriptor &dst, const D3D12Descriptor *src)
     if(src->GetType() != D3D12DescriptorType::SRV ||
        src->GetSRV().ViewDimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
     {
-      src->GetHeap()->GetFromDescriptorCache(src->GetHeapIndex(), dst);
+      if(src->GetHeap())
+        src->GetHeap()->GetFromDescriptorCache(src->GetHeapIndex(), dst);
+      else
+        dst = {};
       return;
     }
   }
@@ -1083,7 +1091,8 @@ void D3D12Replay::FillDescriptor(Descriptor &dst, const D3D12Descriptor *src)
     dst.format = MakeResourceFormat(fmt);
   }
 
-  src->GetHeap()->SetToDescriptorCache(src->GetHeapIndex(), dst);
+  if(src->GetHeap())
+    src->GetHeap()->SetToDescriptorCache(src->GetHeapIndex(), dst);
 }
 
 void D3D12Replay::FillSamplerDescriptor(SamplerDescriptor &dst, const D3D12_SAMPLER_DESC2 &src)
@@ -2877,7 +2886,7 @@ void D3D12Replay::PickPixel(ResourceId texture, uint32_t x, uint32_t y, const Su
 
   float *pix = NULL;
   HRESULT hr = m_General.ResultReadbackBuffer->Map(0, &range, (void **)&pix);
-  m_pDevice->CheckHRESULT(hr);
+  CHECK_HR(m_pDevice, hr);
 
   if(FAILED(hr))
   {
@@ -3054,7 +3063,7 @@ bool D3D12Replay::GetMinMax(ResourceId texid, const Subresource &sub, CompType t
 
   void *data = NULL;
   HRESULT hr = m_General.ResultReadbackBuffer->Map(0, &range, &data);
-  m_pDevice->CheckHRESULT(hr);
+  CHECK_HR(m_pDevice, hr);
 
   if(FAILED(hr))
   {
@@ -3228,7 +3237,7 @@ bool D3D12Replay::GetHistogram(ResourceId texid, const Subresource &sub, CompTyp
 
   void *data = NULL;
   HRESULT hr = m_General.ResultReadbackBuffer->Map(0, &range, &data);
-  m_pDevice->CheckHRESULT(hr);
+  CHECK_HR(m_pDevice, hr);
 
   histogram.clear();
   histogram.resize(HGRAM_NUM_BUCKETS);
@@ -4145,7 +4154,7 @@ void D3D12Replay::GetTextureData(ResourceId tex, const Subresource &sub,
   // map the buffer and copy to return buffer
   byte *pData = NULL;
   hr = readbackBuf->Map(0, NULL, (void **)&pData);
-  m_pDevice->CheckHRESULT(hr);
+  CHECK_HR(m_pDevice, hr);
   if(FAILED(hr))
   {
     RDCERR("Couldn't map readback buffer: %s", ToStr(hr).c_str());

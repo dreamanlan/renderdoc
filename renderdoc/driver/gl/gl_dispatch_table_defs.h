@@ -986,7 +986,6 @@
   FUNC(glFramebufferTexture2DMultisampleEXT, glFramebufferTexture2DMultisampleEXT); \
   FUNC(glRenderbufferStorageMultisampleEXT, glRenderbufferStorageMultisampleEXT); \
   FUNC(glDiscardFramebufferEXT, glDiscardFramebufferEXT); \
-  FUNC(glClipControlEXT, glClipControlEXT); \
   FUNC(glDepthRangeArrayfvOES, glDepthRangeArrayfvOES); \
   FUNC(glDepthRangeArrayfvOES, glDepthRangeArrayfvNV); \
   FUNC(glDepthRangeIndexedfOES, glDepthRangeIndexedfOES); \
@@ -1608,7 +1607,6 @@
   FuncWrapper3(void, glDepthRangeIndexed, GLuint, index, GLdouble, n, GLdouble, f); \
   FuncWrapper3(void, glDepthRangeArrayv, GLuint, first, GLsizei, count, const GLdouble *, v); \
   FuncWrapper2(void, glClipControl, GLenum, origin, GLenum, depth); \
-  AliasWrapper2(void, glClipControlEXT, glClipControl, GLenum, origin, GLenum, depth); \
   FuncWrapper1(void, glProvokingVertex, GLenum, mode); \
   AliasWrapper1(void, glProvokingVertexEXT, glProvokingVertex, GLenum, mode); \
   FuncWrapper1(void, glPrimitiveRestartIndex, GLuint, index); \

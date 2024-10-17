@@ -343,7 +343,7 @@
   FUNC(glDepthRangeIndexed, glDepthRangeIndexed); \
   FUNC(glDepthRangeArrayv, glDepthRangeArrayv); \
   FUNC(glClipControl, glClipControl); \
-  FUNC(glClipControl, glClipControlEXT); \
+  FUNC(glClipControlEXT, glClipControlEXT); \
   FUNC(glProvokingVertex, glProvokingVertex); \
   FUNC(glProvokingVertex, glProvokingVertexEXT); \
   FUNC(glPrimitiveRestartIndex, glPrimitiveRestartIndex); \

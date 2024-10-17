@@ -32,7 +32,7 @@
 // from. If any later commits are cherry-picked or local patches are applied, this should still
 // point to the hash of the tree that the build was based on.
 #if !defined(GIT_COMMIT_HASH)
-#define GIT_COMMIT_HASH "NO_GIT_COMMIT_HASH_DEFINED_AT_BUILD_TIME"
+#define GIT_COMMIT_HASH "8a394019fdb62ad82be87bfd338a5ec43f4a5d95"
 #endif
 
 // Note the hash should be precisely 40 characters, as comes from git rev-parse.

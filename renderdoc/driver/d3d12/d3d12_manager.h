@@ -489,6 +489,8 @@ struct CmdListRecordingInfo
 
   BarrierSet barriers;
 
+  bool forceMapsListEvent = false;
+
   // a list of all resources dirtied by this command list
   std::set<ResourceId> dirtied;
 
@@ -655,6 +657,7 @@ struct D3D12ResourceRecord : public ResourceRecord
     cmdInfo->dirtied.swap(bakedCommands->cmdInfo->dirtied);
     cmdInfo->boundDescs.swap(bakedCommands->cmdInfo->boundDescs);
     cmdInfo->bundles.swap(bakedCommands->cmdInfo->bundles);
+    bakedCommands->cmdInfo->forceMapsListEvent = cmdInfo->forceMapsListEvent;
     bakedCommands->cmdInfo->alloc = cmdInfo->alloc;
     bakedCommands->cmdInfo->allocRecord = cmdInfo->allocRecord;
   }
@@ -979,6 +982,15 @@ enum class D3D12PatchTLASBuildParam
   Count
 };
 
+enum class D3D12TLASInstanceCopyParam
+{
+  RootCB,
+  SourceSRV,
+  DestUAV,
+  RootAddressPairSrv,
+  Count
+};
+
 enum class D3D12IndirectPrepParam
 {
   GeneralCB,
@@ -1005,9 +1017,8 @@ enum class D3D12PatchRayDispatchParam
 
 struct D3D12AccStructPatchInfo
 {
-  D3D12AccStructPatchInfo() : m_rootSignature(NULL), m_pipeline(NULL) {}
-  ID3D12RootSignature *m_rootSignature;
-  ID3D12PipelineState *m_pipeline;
+  ID3D12RootSignature *m_rootSignature = NULL;
+  ID3D12PipelineState *m_pipeline = NULL;
 };
 
 struct PatchedRayDispatch
@@ -1122,6 +1133,8 @@ struct ASBuildData
   static void GatherASAgeStatistics(D3D12ResourceManager *rm, double now, ASStats &blasAges,
                                     ASStats &tlasAges);
 
+  std::function<bool()> cleanupCallback;
+
 private:
   ASBuildData()
   {
@@ -1176,6 +1189,11 @@ public:
     SAFE_RELEASE(m_gpuFence);
     SAFE_RELEASE(m_accStructPatchInfo.m_rootSignature);
     SAFE_RELEASE(m_accStructPatchInfo.m_pipeline);
+    SAFE_RELEASE(m_TLASCopyingData.ArgsBuffer);
+    SAFE_RELEASE(m_TLASCopyingData.PreparePipe);
+    SAFE_RELEASE(m_TLASCopyingData.CopyPipe);
+    SAFE_RELEASE(m_TLASCopyingData.RootSig);
+    SAFE_RELEASE(m_TLASCopyingData.IndirectSig);
     SAFE_RELEASE(m_RayPatchingData.descPatchRootSig);
     SAFE_RELEASE(m_RayPatchingData.descPatchPipe);
     SAFE_RELEASE(m_RayPatchingData.indirectComSig);
@@ -1194,6 +1212,12 @@ public:
 
   ASBuildData *CopyBuildInputs(ID3D12GraphicsCommandList4 *unwrappedCmd,
                                const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS &inputs);
+
+  D3D12GpuBuffer *UnrollBLASInstancesList(
+      ID3D12GraphicsCommandList4 *unwrappedCmd,
+      const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS &inputs,
+      D3D12_GPU_VIRTUAL_ADDRESS addressPairResAddress, uint64_t addressCount,
+      D3D12GpuBuffer *copyDestUAV);
 
   PatchedRayDispatch PatchRayDispatch(ID3D12GraphicsCommandList4 *unwrappedCmd,
                                       rdcarray<ResourceId> heaps,
@@ -1221,6 +1245,7 @@ public:
 
 private:
   void InitRayDispatchPatchingResources();
+  void InitTLASInstanceCopyingResources();
   void InitReplayBlasPatchingResources();
 
   void CopyFromVA(ID3D12GraphicsCommandList4 *unwrappedCmd, ID3D12Resource *dstRes,
@@ -1255,6 +1280,17 @@ private:
 
   // is the lookup buffer dirty and needs to be recreated with the latest data?
   bool m_LookupBufferDirty = true;
+
+  // pipeline data for indirect-copying instances in a TLAS build
+  struct
+  {
+    D3D12GpuBuffer *ArgsBuffer = NULL;
+    D3D12GpuBuffer *ScratchBuffer = NULL;
+    ID3D12PipelineState *PreparePipe = NULL;
+    ID3D12PipelineState *CopyPipe = NULL;
+    ID3D12RootSignature *RootSig = NULL;
+    ID3D12CommandSignature *IndirectSig = NULL;
+  } m_TLASCopyingData;
 
   // pipeline data for patching ray dispatches
   struct

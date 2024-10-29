@@ -1160,7 +1160,7 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   int retTypes[DXBC::NUM_RETURN_TYPES] = {
       0,                     // RETURN_TYPE_UNKNOWN
       DEBUG_SAMPLE_UNORM,    // RETURN_TYPE_UNORM
-      DEBUG_SAMPLE_SNORM,    // RETURN_TYPE_UNORM
+      DEBUG_SAMPLE_SNORM,    // RETURN_TYPE_SNORM
       DEBUG_SAMPLE_INT,      // RETURN_TYPE_SINT
       DEBUG_SAMPLE_UINT,     // RETURN_TYPE_UINT
       DEBUG_SAMPLE_FLOAT,    // RETURN_TYPE_FLOAT
@@ -1175,7 +1175,8 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   cbufferData.debugSampleGatherChannel = (int)gatherChannel;
   cbufferData.debugSampleSampleIndex = multisampleIndex;
   cbufferData.debugSampleOperation = sampleOp;
-  cbufferData.debugSampleLodCompare = lodOrCompareValue;
+  cbufferData.debugSampleLod = lodOrCompareValue;
+  cbufferData.debugSampleCompare = lodOrCompareValue;
 
   D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
 

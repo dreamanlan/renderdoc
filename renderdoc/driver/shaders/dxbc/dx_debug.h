@@ -114,7 +114,11 @@ double dxbc_min(double a, double b);
 float dxbc_max(float a, float b);
 double dxbc_max(double a, double b);
 float round_ne(float x);
+double round_ne(double x);
 float flush_denorm(const float f);
+
+uint32_t BitwiseReverseLSB16(uint32_t x);
+uint32_t PopCount(uint32_t x);
 
 void get_sample_position(uint32_t sampleIndex, uint32_t sampleCount, float *position);
 };

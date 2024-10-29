@@ -1975,6 +1975,9 @@ void WrappedID3D12Device::Unmap(ID3D12Resource *Resource, UINT Subresource, byte
 
   D3D12_RANGE range = {0, (SIZE_T)map.totalSize};
 
+  // unfortunately this can't be trusted - e.g. imgui maps/unmaps with empty written range. We have
+  // to assume the worst and assume it's all modified
+#if 0
   if(pWrittenRange)
   {
     range = *pWrittenRange;
@@ -1983,6 +1986,7 @@ void WrappedID3D12Device::Unmap(ID3D12Resource *Resource, UINT Subresource, byte
     if(range.End < range.Begin)
       range.End = range.Begin;
   }
+#endif
 
   if(capframe)
     MapDataWrite(Resource, Subresource, mapPtr, range, false);
@@ -3228,7 +3232,6 @@ void WrappedID3D12Device::UploadBLASBufferAddresses()
     if(resManager->HasLiveResource(resId))
     {
       WrappedID3D12Resource *wrappedRes = (WrappedID3D12Resource *)resManager->GetLiveResource(resId);
-      if(wrappedRes->IsAccelerationStructureResource())
       {
         BlasAddressPair addressPair;
         addressPair.oldAddress.start = addressRange.start;
@@ -3236,7 +3239,15 @@ void WrappedID3D12Device::UploadBLASBufferAddresses()
 
         addressPair.newAddress.start = wrappedRes->GetGPUVirtualAddress();
         addressPair.newAddress.end = addressPair.newAddress.start + wrappedRes->GetDesc().Width;
-        blasAddressPair.push_back(addressPair);
+
+        // ASB addresses are far more likely to be used so put them at the front to be found first
+        // as this isn't sorted.
+        // The only time we are looking up 'normal' buffers on the GPU to patch is when we're
+        // unrolling an ARRAY_OF_POINTERS list on replay when building a TLAS
+        if(wrappedRes->IsAccelerationStructureResource())
+          blasAddressPair.insert(0, addressPair);
+        else
+          blasAddressPair.push_back(addressPair);
       }
     }
   }

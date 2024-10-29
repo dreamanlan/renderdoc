@@ -159,6 +159,7 @@
     <addaction name="action_API_Inspector"/>
     <addaction name="action_Mesh_Output"/>
     <addaction name="action_Errors_and_Warnings"/>
+    <addaction name="action_Diagnostic"/>
     <addaction name="action_Timeline"/>
     <addaction name="action_Statistics_Viewer"/>
     <addaction name="action_Counter_Viewer"/>
@@ -279,6 +280,11 @@
    <property name="text">
     <string>Errors and &amp;Warnings</string>
    </property>
+  </action>
+  <action name="action_Diagnostic">
+    <property name="text">
+      <string>Diagnostic &amp;Log Viewer</string>
+    </property>
   </action>
   <action name="action_Timeline">
    <property name="text">

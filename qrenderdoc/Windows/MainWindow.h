@@ -160,6 +160,7 @@ private slots:
   void on_action_Pipeline_State_triggered();
   void on_action_Launch_Application_triggered();
   void on_action_Errors_and_Warnings_triggered();
+  void on_action_Diagnostic_triggered();
   void on_action_Comments_triggered();
   void on_action_Statistics_Viewer_triggered();
   void on_action_Timeline_triggered();

@@ -2488,6 +2488,16 @@ void MainWindow::on_action_Errors_and_Warnings_triggered()
     ui->toolWindowManager->addToolWindow(debugMessages, mainToolArea());
 }
 
+void MainWindow::on_action_Diagnostic_triggered()
+{
+  QWidget *diagnosticLog = m_Ctx.GetDiagnosticLogView()->Widget();
+
+  if(ui->toolWindowManager->toolWindows().contains(diagnosticLog))
+    ToolWindowManager::raiseToolWindow(diagnosticLog);
+  else
+    ui->toolWindowManager->addToolWindow(diagnosticLog, mainToolArea());
+}
+
 void MainWindow::on_action_Comments_triggered()
 {
   QWidget *comments = m_Ctx.GetCommentView()->Widget();

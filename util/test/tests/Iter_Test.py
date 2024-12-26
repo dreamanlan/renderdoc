@@ -59,7 +59,7 @@ class Iter_Test(rdtest.TestCase):
             rdtest.log.print("No vertex shader bound at {}".format(action.eventId))
             return
 
-        if not (action.flags & rd.ActionFlags.Drawcall):
+        if not (action.flags & rd.ActionFlags.Drawcall) and action.drawIndex == 0:
             rdtest.log.print("{} is not a debuggable action".format(action.eventId))
             return
 
@@ -94,6 +94,10 @@ class Iter_Test(rdtest.TestCase):
                 return
 
             idx = indices[0]
+
+            if idx is None:
+                rdtest.log.print("Index buffer out of bounds for idx 0, skipping")
+                return
 
             striprestart_index = pipe.GetRestartIndex() & ((1 << (ib.byteStride*8)) - 1)
 
@@ -214,8 +218,18 @@ class Iter_Test(rdtest.TestCase):
             mod = history[i]
             action = self.find_action('', mod.eventId)
 
-            if action is None or not (action.flags & rd.ActionFlags.Drawcall):
+            if action is None:
                 continue
+
+            if not(action.flags & rd.ActionFlags.Drawcall):
+                if action.drawIndex == 0:
+                    continue
+                if not(action.flags & rd.ActionFlags.Clea):
+                    continue
+                if not(action.flags & rd.ActionFlags.Copy):
+                    continue
+                if not(action.flags & rd.ActionFlags.Resolve):
+                    continue
 
             rdtest.log.print("  hit %d at %d (%s)" % (i, mod.eventId, str(action.flags)))
 
@@ -233,6 +247,11 @@ class Iter_Test(rdtest.TestCase):
                 lastmod = None
                 continue
 
+            if mod.primitiveID == 0xffffffff:
+                rdtest.log.print("This hit's primitive ID is invalid, looking for one that is valid....")
+                lastmod = None
+                continue
+
             break
 
         if target == pipe.GetDepthTarget().resource:
@@ -244,6 +263,10 @@ class Iter_Test(rdtest.TestCase):
             self.controller.SetFrameEvent(lastmod.eventId, True)
 
             pipe: rd.PipeState = self.controller.GetPipelineState()
+
+            if pipe.GetShader(rd.ShaderStage.Pixel) == rd.ResourceId.Null():
+                rdtest.log.print("Nothing to debug. No pixel shader bound at {}".format(action.eventId))
+                return
 
             inputs = rd.DebugPixelInputs()
             inputs.sample = 0

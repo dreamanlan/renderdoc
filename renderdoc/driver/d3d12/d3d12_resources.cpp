@@ -141,13 +141,14 @@ ID3D12DeviceChild *Unwrap(ID3D12DeviceChild *ptr)
 
 WRAPPED_POOL_INST(D3D12AccelerationStructure);
 
-D3D12AccelerationStructure::D3D12AccelerationStructure(WrappedID3D12Device *wrappedDevice,
-                                                       WrappedID3D12Resource *bufferRes,
-                                                       D3D12BufferOffset bufferOffset,
-                                                       UINT64 byteSize)
-    : WrappedDeviceChild12(NULL, wrappedDevice),
+D3D12AccelerationStructure::D3D12AccelerationStructure(
+    WrappedID3D12Device *wrappedDevice, ResourceId id, WrappedID3D12Resource *bufferRes,
+    D3D12BufferOffset bufferOffset, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE type,
+    UINT64 byteSize)
+    : WrappedDeviceChild12(NULL, wrappedDevice, id),
       m_asbWrappedResource(bufferRes),
       m_asbWrappedResourceBufferOffset(bufferOffset),
+      type(type),
       byteSize(byteSize)
 {
 }
@@ -158,29 +159,29 @@ D3D12AccelerationStructure::~D3D12AccelerationStructure()
   Shutdown();
 }
 
-bool WrappedID3D12Resource::CreateAccStruct(D3D12BufferOffset bufferOffset, UINT64 byteSize,
+bool WrappedID3D12Resource::CreateAccStruct(D3D12BufferOffset bufferOffset,
+                                            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE type,
+                                            UINT64 byteSize, ResourceId id,
                                             D3D12AccelerationStructure **accStruct)
 {
   SCOPED_LOCK(m_accStructResourcesCS);
-  if(m_accelerationStructMap.find(bufferOffset) == m_accelerationStructMap.end())
+  auto existing = m_accelerationStructMap.find(bufferOffset);
+  if(existing != m_accelerationStructMap.end())
   {
-    m_accelerationStructMap[bufferOffset] =
-        new D3D12AccelerationStructure(m_pDevice, this, bufferOffset, byteSize);
-
-    if(accStruct)
-    {
-      *accStruct = m_accelerationStructMap[bufferOffset];
-
-      if(IsCaptureMode(m_pDevice->GetState()))
-      {
-        DeleteOverlappingAccStructsInRangeAtOffset(bufferOffset);
-      }
-    }
-
-    return true;
+    if(IsCaptureMode(m_pDevice->GetState()))
+      RDCASSERTEQUAL((uint32_t)existing->second->Release(), 0);
+    m_accelerationStructMap.erase(existing);
   }
 
-  return false;
+  m_accelerationStructMap[bufferOffset] =
+      new D3D12AccelerationStructure(m_pDevice, id, this, bufferOffset, type, byteSize);
+
+  *accStruct = m_accelerationStructMap[bufferOffset];
+
+  if(IsCaptureMode(m_pDevice->GetState()))
+    DeleteOverlappingAccStructsInRangeAtOffset(bufferOffset);
+
+  return true;
 }
 
 WrappedID3D12Resource::~WrappedID3D12Resource()
@@ -434,10 +435,8 @@ bool WrappedID3D12Resource::DeleteAccStructAtOffset(D3D12BufferOffset bufferOffs
   D3D12AccelerationStructure *accStruct = NULL;
   if(GetAccStructIfExist(bufferOffset, &accStruct))
   {
-    if(m_accelerationStructMap[bufferOffset]->Release() == 0)
-    {
-      m_accelerationStructMap.erase(bufferOffset);
-    }
+    RDCASSERTEQUAL((uint32_t)accStruct->Release(), 0);
+    m_accelerationStructMap.erase(bufferOffset);
 
     return true;
   }
@@ -940,16 +939,18 @@ void D3D12ShaderExportDatabase::PopulateDatabase(size_t NumSubobjects,
             if(exports.contains(sub.name) || exports.empty())
             {
               localRSs.push_back(sub.name);
-              dxilLocalRootSigs[sub.name] = m_RayManager->RegisterLocalRootSig(
+              uint32_t rsIndex = m_RayManager->RegisterLocalRootSig(
                   DecodeRootSig(sub.rs.data.data(), sub.rs.data.size(), false));
 
               // ignore these if an explicit default association has been made
               if(!explicitDXILDefault)
               {
                 // if multiple root signatures are defined, then there can't be an unspecified default
-                unassocDXILDefaultValid = explicitDefaultDxilAssocs.empty();
-                dxilDefaultRoot = dxilLocalRootSigs[sub.assoc.subobject];
+                unassocDXILDefaultValid = dxilLocalRootSigs.empty();
+                dxilDefaultRoot = rsIndex;
               }
+
+              dxilLocalRootSigs[sub.name] = rsIndex;
             }
           }
           else if(sub.type == DXIL::RDATData::SubobjectInfo::SubobjectType::SubobjectToExportsAssoc)

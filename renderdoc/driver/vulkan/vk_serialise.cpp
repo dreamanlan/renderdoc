@@ -1089,6 +1089,14 @@ SERIALISE_VK_HANDLES();
   PNEXT_STRUCT(VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR,                  \
                VkRenderingFragmentShadingRateAttachmentInfoKHR)                                        \
                                                                                                        \
+  /* VK_KHR_dynamic_rendering_local_read */                                                            \
+  PNEXT_STRUCT(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,            \
+               VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR)                                   \
+  PNEXT_STRUCT(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,                               \
+               VkRenderingAttachmentLocationInfoKHR)                                                   \
+  PNEXT_STRUCT(VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR,                            \
+               VkRenderingInputAttachmentIndexInfoKHR)                                                 \
+                                                                                                       \
   /* VK_KHR_external_fence_capabilities */                                                             \
   PNEXT_STRUCT(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,                                  \
                VkPhysicalDeviceExternalFenceInfo)                                                      \
@@ -1716,11 +1724,6 @@ SERIALISE_VK_HANDLES();
   PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR)                               \
   PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR)               \
   PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR)                 \
-                                                                                                       \
-  /* VK_KHR_dynamic_rendering_local_read */                                                            \
-  PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR)       \
-  PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR)                          \
-  PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR)                       \
                                                                                                        \
   /* VK_KHR_map_memory2 */                                                                             \
   PNEXT_UNSUPPORTED(VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR)                                             \
@@ -9183,6 +9186,22 @@ void Deserialise(const VkPhysicalDeviceDynamicRenderingFeatures &el)
 }
 
 template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR &el)
+{
+  RDCASSERT(ser.IsReading() ||
+            el.sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
+  SerialiseNext(ser, el.sType, el.pNext);
+
+  SERIALISE_MEMBER(dynamicRenderingLocalRead);
+}
+
+template <>
+void Deserialise(const VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR &el)
+{
+  DeserialiseNext(el.pNext);
+}
+
+template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VkRenderingFragmentDensityMapAttachmentInfoEXT &el)
 {
   RDCASSERT(ser.IsReading() ||
@@ -9326,6 +9345,45 @@ void Deserialise(const VkRenderingInfo &el)
   delete[] el.pColorAttachments;
   delete el.pDepthAttachment;
   delete el.pStencilAttachment;
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkRenderingAttachmentLocationInfoKHR &el)
+{
+  RDCASSERT(ser.IsReading() || el.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR);
+  SerialiseNext(ser, el.sType, el.pNext);
+
+  SERIALISE_MEMBER(colorAttachmentCount).Important();
+  SERIALISE_MEMBER_ARRAY(pColorAttachmentLocations, colorAttachmentCount);
+}
+
+template <>
+void Deserialise(const VkRenderingAttachmentLocationInfoKHR &el)
+{
+  DeserialiseNext(el.pNext);
+  delete[] el.pColorAttachmentLocations;
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkRenderingInputAttachmentIndexInfoKHR &el)
+{
+  RDCASSERT(ser.IsReading() ||
+            el.sType == VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR);
+  SerialiseNext(ser, el.sType, el.pNext);
+
+  SERIALISE_MEMBER(colorAttachmentCount).Important();
+  SERIALISE_MEMBER_ARRAY(pColorAttachmentInputIndices, colorAttachmentCount);
+  SERIALISE_MEMBER_OPT(pDepthInputAttachmentIndex);
+  SERIALISE_MEMBER_OPT(pStencilInputAttachmentIndex);
+}
+
+template <>
+void Deserialise(const VkRenderingInputAttachmentIndexInfoKHR &el)
+{
+  DeserialiseNext(el.pNext);
+  delete[] el.pColorAttachmentInputIndices;
+  delete el.pDepthInputAttachmentIndex;
+  delete el.pStencilInputAttachmentIndex;
 }
 
 template <typename SerialiserType>
@@ -12391,6 +12449,45 @@ void DoSerialise(SerialiserType &ser, VkStridedDeviceAddressRegionKHR &el)
   SERIALISE_MEMBER(size);
 }
 
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkAccelerationStructureInfo::GeometryData::Triangles &el)
+{
+  SERIALISE_MEMBER(vertexFormat);
+  SERIALISE_MEMBER(vertexStride);
+  SERIALISE_MEMBER(maxVertex);
+  SERIALISE_MEMBER(indexType);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkAccelerationStructureInfo::GeometryData::Aabbs &el)
+{
+  SERIALISE_MEMBER(stride);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkAccelerationStructureInfo::GeometryData &el)
+{
+  SERIALISE_MEMBER(geometryType);
+  SERIALISE_MEMBER_VKFLAGS(VkGeometryFlagsKHR, flags);
+
+  SERIALISE_MEMBER(tris);
+  SERIALISE_MEMBER(aabbs);
+
+  SERIALISE_MEMBER(buildRangeInfo);
+  SERIALISE_MEMBER(memOffset);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, VkAccelerationStructureInfo &el)
+{
+  SERIALISE_MEMBER(type);
+  SERIALISE_MEMBER_VKFLAGS(VkBuildAccelerationStructureFlagsKHR, flags);
+  SERIALISE_MEMBER(geometryData);
+  SERIALISE_MEMBER(memSize);
+}
+
+INSTANTIATE_SERIALISE_TYPE(VkAccelerationStructureInfo);
+
 // pNext structs - always have deserialise for the next chain
 INSTANTIATE_SERIALISE_TYPE(VkAccelerationStructureBuildGeometryInfoKHR);
 INSTANTIATE_SERIALISE_TYPE(VkAccelerationStructureBuildSizesInfoKHR);
@@ -12585,6 +12682,7 @@ INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceDescriptorIndexingProperties)
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceDiscardRectanglePropertiesEXT);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceDriverProperties);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceDynamicRenderingFeatures);
+INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceExtendedDynamicState2FeaturesEXT);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT);
 INSTANTIATE_SERIALISE_TYPE(VkPhysicalDeviceExtendedDynamicState3PropertiesEXT);
@@ -12769,6 +12867,8 @@ INSTANTIATE_SERIALISE_TYPE(VkRenderingAttachmentInfo);
 INSTANTIATE_SERIALISE_TYPE(VkRenderingFragmentDensityMapAttachmentInfoEXT);
 INSTANTIATE_SERIALISE_TYPE(VkRenderingFragmentShadingRateAttachmentInfoKHR);
 INSTANTIATE_SERIALISE_TYPE(VkRenderingInfo);
+INSTANTIATE_SERIALISE_TYPE(VkRenderingAttachmentLocationInfoKHR);
+INSTANTIATE_SERIALISE_TYPE(VkRenderingInputAttachmentIndexInfoKHR);
 INSTANTIATE_SERIALISE_TYPE(VkRenderPassAttachmentBeginInfo);
 INSTANTIATE_SERIALISE_TYPE(VkRenderPassBeginInfo);
 INSTANTIATE_SERIALISE_TYPE(VkRenderPassCreateInfo);

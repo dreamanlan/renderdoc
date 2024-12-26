@@ -62,10 +62,12 @@ struct D3D12DevConfiguration
   ID3D12DeviceFactory *devfactory = NULL;
   ID3D12DeviceConfiguration *devconfig = NULL;
   ID3D12Debug *debug = NULL;
+  ID3D12DeviceRemovedExtendedDataSettings *dred = NULL;
 };
 
 bool EnableD3D12DebugLayer(D3D12DevConfiguration *devConfig,
                            PFN_D3D12_GET_DEBUG_INTERFACE getDebugInterface);
+bool EnableDRED(D3D12DevConfiguration *devConfig, PFN_D3D12_GET_DEBUG_INTERFACE getDebugInterface);
 HRESULT EnumAdapterByLuid(IDXGIFactory1 *factory, LUID luid, IDXGIAdapter **pAdapter);
 
 D3D12DevConfiguration *D3D12_PrepareReplaySDKVersion(bool untrustedCapture, UINT SDKVersion,
@@ -665,7 +667,31 @@ struct D3D12BufferLocation
   UINT64 Location;
 };
 
+// thin utility aliases of a ResourceId so that we know we're serialising an AS - distinct from
+// buffer locations above to ensure it's mapped naturally. We have dest/src as different types with
+// a common root because dest tries to draw from sideband data for its Id and source doesn't - this
+// distinction is needed since e.g. the build desc serialises two AS locations and we need to tell
+// which one should pull from sideband.
+struct D3D12ASLocation
+{
+  D3D12ASLocation() : Location(0) {}
+  D3D12ASLocation(UINT64 l) : Location(l) {}
+  operator UINT64() const { return Location; }
+  UINT64 Location;
+};
+
+struct D3D12SrcASLocation : public D3D12ASLocation
+{
+};
+
+struct D3D12DestASLocation : public D3D12ASLocation
+{
+  static const uint64_t SidebandGUID = 0x3FD533B58697ULL;
+};
+
 DECLARE_REFLECTION_STRUCT(D3D12BufferLocation);
+DECLARE_REFLECTION_STRUCT(D3D12SrcASLocation);
+DECLARE_REFLECTION_STRUCT(D3D12DestASLocation);
 
 DECLARE_REFLECTION_STRUCT(D3D12_CPU_DESCRIPTOR_HANDLE);
 DECLARE_REFLECTION_STRUCT(D3D12_GPU_DESCRIPTOR_HANDLE);

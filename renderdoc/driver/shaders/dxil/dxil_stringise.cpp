@@ -128,6 +128,41 @@ rdcstr DoStringise(const DXIL::AtomicBinOpCode &el)
 }
 
 template <>
+rdcstr DoStringise(const DXIL::QuadOpKind &el)
+{
+  BEGIN_ENUM_STRINGISE(DXIL::QuadOpKind)
+  {
+    STRINGISE_ENUM_CLASS(ReadAcrossX)
+    STRINGISE_ENUM_CLASS(ReadAcrossY)
+    STRINGISE_ENUM_CLASS(ReadAcrossDiagonal)
+  }
+  END_ENUM_STRINGISE();
+};
+
+template <>
+rdcstr DoStringise(const DXIL::PackMode &el)
+{
+  BEGIN_ENUM_STRINGISE(DXIL::PackMode)
+  {
+    STRINGISE_ENUM_CLASS(Trunc)
+    STRINGISE_ENUM_CLASS(UClamp)
+    STRINGISE_ENUM_CLASS(SClamp)
+  }
+  END_ENUM_STRINGISE();
+};
+
+template <>
+rdcstr DoStringise(const DXIL::UnpackMode &el)
+{
+  BEGIN_ENUM_STRINGISE(DXIL::UnpackMode)
+  {
+    STRINGISE_ENUM_CLASS(Unsigned)
+    STRINGISE_ENUM_CLASS(Signed)
+  }
+  END_ENUM_STRINGISE();
+};
+
+template <>
 rdcstr DoStringise(const DXIL::Operation &el)
 {
   BEGIN_ENUM_STRINGISE(DXIL::Operation)
@@ -524,13 +559,17 @@ rdcstr DoStringise(const DXIL::Type::ScalarKind &el)
 }
 
 template <>
-rdcstr DoStringise(const DXIL::LLVMDbgOp &el)
+rdcstr DoStringise(const DXIL::LLVMIntrinsicOp &el)
 {
-  BEGIN_ENUM_STRINGISE(DXIL::LLVMDbgOp);
+  BEGIN_ENUM_STRINGISE(DXIL::LLVMIntrinsicOp);
   {
-    STRINGISE_ENUM_CLASS(Declare);
-    STRINGISE_ENUM_CLASS(Value);
     STRINGISE_ENUM_CLASS(Unknown);
+    STRINGISE_ENUM_CLASS(DbgDeclare);
+    STRINGISE_ENUM_CLASS(DbgValue);
+    STRINGISE_ENUM_CLASS(LifetimeStart);
+    STRINGISE_ENUM_CLASS(LifetimeEnd);
+    STRINGISE_ENUM_CLASS(InvariantStart);
+    STRINGISE_ENUM_CLASS(InvariantEnd);
   }
   END_ENUM_STRINGISE();
 }
@@ -724,6 +763,68 @@ rdcstr DoStringise(const DXIL::DW_OP &el)
     STRINGISE_ENUM_CLASS(DW_OP_GNU_push_tls_address);
     STRINGISE_ENUM_CLASS(DW_OP_GNU_addr_index);
     STRINGISE_ENUM_CLASS(DW_OP_GNU_const_index);
+  }
+  END_ENUM_STRINGISE();
+};
+
+template <>
+rdcstr DoStringise(const DXIL::ValueKind &el)
+{
+  BEGIN_ENUM_STRINGISE(DXIL::ValueKind);
+  {
+    STRINGISE_ENUM_CLASS(ForwardReferencePlaceholder);
+    STRINGISE_ENUM_CLASS(Literal);
+    STRINGISE_ENUM_CLASS(Alias);
+    STRINGISE_ENUM_CLASS(Constant);
+    STRINGISE_ENUM_CLASS(GlobalVar);
+    STRINGISE_ENUM_CLASS(Metadata);
+    STRINGISE_ENUM_CLASS(Instruction);
+    STRINGISE_ENUM_CLASS(Function);
+    STRINGISE_ENUM_CLASS(BasicBlock);
+  }
+  END_ENUM_STRINGISE();
+};
+
+template <>
+rdcstr DoStringise(const DXIL::BarrierMode &el)
+{
+  BEGIN_BITFIELD_STRINGISE(DXIL::BarrierMode);
+  {
+    STRINGISE_BITFIELD_CLASS_BIT(Invalid);
+    STRINGISE_BITFIELD_CLASS_BIT(SyncThreadGroup);
+    STRINGISE_BITFIELD_CLASS_BIT(UAVFenceGlobal);
+    STRINGISE_BITFIELD_CLASS_BIT(UAVFenceThreadGroup);
+    STRINGISE_BITFIELD_CLASS_BIT(TGSMFence);
+  }
+  END_BITFIELD_STRINGISE();
+};
+
+template <>
+rdcstr DoStringise(const DXIL::ResourceKind &el)
+{
+  BEGIN_ENUM_STRINGISE(DXIL::ResourceKind);
+  {
+    STRINGISE_ENUM_CLASS(Unknown);
+    STRINGISE_ENUM_CLASS(Texture1D);
+    STRINGISE_ENUM_CLASS(Texture2D);
+    STRINGISE_ENUM_CLASS(Texture2DMS);
+    STRINGISE_ENUM_CLASS(Texture3D);
+    STRINGISE_ENUM_CLASS(TextureCube);
+    STRINGISE_ENUM_CLASS(Texture1DArray);
+    STRINGISE_ENUM_CLASS(Texture2DArray);
+    STRINGISE_ENUM_CLASS(Texture2DMSArray);
+    STRINGISE_ENUM_CLASS(TextureCubeArray);
+    STRINGISE_ENUM_CLASS(TypedBuffer);
+    STRINGISE_ENUM_CLASS(RawBuffer);
+    STRINGISE_ENUM_CLASS(StructuredBuffer);
+    STRINGISE_ENUM_CLASS(CBuffer);
+    STRINGISE_ENUM_CLASS(Sampler);
+    STRINGISE_ENUM_CLASS(TBuffer);
+    STRINGISE_ENUM_CLASS(RTAccelerationStructure);
+    STRINGISE_ENUM_CLASS(FeedbackTexture2D);
+    STRINGISE_ENUM_CLASS(FeedbackTexture2DArray);
+    STRINGISE_ENUM_CLASS(StructuredBufferWithCounter);
+    STRINGISE_ENUM_CLASS(SamplerComparison);
   }
   END_ENUM_STRINGISE();
 };

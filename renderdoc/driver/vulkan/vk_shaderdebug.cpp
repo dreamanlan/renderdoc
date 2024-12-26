@@ -1300,7 +1300,7 @@ public:
       };
       ObjDisp(cmd)->CmdCopyImageToBuffer(Unwrap(cmd), Unwrap(m_DebugData.Image),
                                          VK_IMAGE_LAYOUT_GENERAL,
-                                         Unwrap(m_DebugData.ReadbackBuffer.buf), 1, &region);
+                                         m_DebugData.ReadbackBuffer.UnwrappedBuffer(), 1, &region);
 
       VkBufferMemoryBarrier bufBarrier = {
           VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -1309,7 +1309,7 @@ public:
           VK_ACCESS_HOST_READ_BIT,
           VK_QUEUE_FAMILY_IGNORED,
           VK_QUEUE_FAMILY_IGNORED,
-          Unwrap(m_DebugData.ReadbackBuffer.buf),
+          m_DebugData.ReadbackBuffer.UnwrappedBuffer(),
           0,
           VK_WHOLE_SIZE,
       };
@@ -1438,7 +1438,7 @@ public:
           VK_ACCESS_TRANSFER_READ_BIT,
           VK_QUEUE_FAMILY_IGNORED,
           VK_QUEUE_FAMILY_IGNORED,
-          Unwrap(m_DebugData.MathResult.buf),
+          m_DebugData.MathResult.UnwrappedBuffer(),
           0,
           VK_WHOLE_SIZE,
       };
@@ -1447,12 +1447,12 @@ public:
 
       VkBufferCopy bufCopy = {0, 0, 0};
       bufCopy.size = sizeof(Vec4f) * 2;
-      ObjDisp(cmd)->CmdCopyBuffer(Unwrap(cmd), Unwrap(m_DebugData.MathResult.buf),
-                                  Unwrap(m_DebugData.ReadbackBuffer.buf), 1, &bufCopy);
+      ObjDisp(cmd)->CmdCopyBuffer(Unwrap(cmd), m_DebugData.MathResult.UnwrappedBuffer(),
+                                  m_DebugData.ReadbackBuffer.UnwrappedBuffer(), 1, &bufCopy);
 
       bufBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
       bufBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-      bufBarrier.buffer = Unwrap(m_DebugData.ReadbackBuffer.buf);
+      bufBarrier.buffer = m_DebugData.ReadbackBuffer.UnwrappedBuffer();
 
       // wait for copy to finish before reading back to host
       DoPipelineBarrier(cmd, 1, &bufBarrier);
@@ -4399,7 +4399,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
            feedbackStorageSize);
   }
 
-  if(feedbackStorageSize > m_BindlessFeedback.FeedbackBuffer.sz)
+  if(feedbackStorageSize > m_BindlessFeedback.FeedbackBuffer.TotalSize())
   {
     uint32_t flags = GPUBuffer::eGPUBufferGPULocal | GPUBuffer::eGPUBufferSSBO;
 
@@ -4409,7 +4409,8 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
     m_BindlessFeedback.FeedbackBuffer.Destroy();
     m_BindlessFeedback.FeedbackBuffer.Create(m_pDriver, dev, feedbackStorageSize, 1, flags);
 
-    NameVulkanObject(m_BindlessFeedback.FeedbackBuffer.buf, "m_BindlessFeedback.FeedbackBuffer");
+    NameUnwrappedVulkanObject(m_BindlessFeedback.FeedbackBuffer.UnwrappedBuffer(),
+                              "m_BindlessFeedback.FeedbackBuffer");
   }
 
   struct SpecData
@@ -4436,12 +4437,12 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
                           VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT,
                       "KHR and EXT buffer_device_address should be interchangeable here.");
     VkBufferDeviceAddressInfo getAddressInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-    getAddressInfo.buffer = m_BindlessFeedback.FeedbackBuffer.buf;
+    getAddressInfo.buffer = m_BindlessFeedback.FeedbackBuffer.UnwrappedBuffer();
 
     if(storageMode == KHR_bda)
-      specData.bufferAddress = m_pDriver->vkGetBufferDeviceAddress(dev, &getAddressInfo);
+      specData.bufferAddress = ObjDisp(dev)->GetBufferDeviceAddress(Unwrap(dev), &getAddressInfo);
     else
-      specData.bufferAddress = m_pDriver->vkGetBufferDeviceAddressEXT(dev, &getAddressInfo);
+      specData.bufferAddress = ObjDisp(dev)->GetBufferDeviceAddressEXT(Unwrap(dev), &getAddressInfo);
 
     if(Vulkan_Debug_ShaderDebugLogging())
     {
@@ -4733,7 +4734,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
     CHECK_VKR(m_pDriver, vkr);
 
     // fill destination buffer with 0s to ensure a baseline to then feedback against
-    ObjDisp(dev)->CmdFillBuffer(Unwrap(cmd), Unwrap(m_BindlessFeedback.FeedbackBuffer.buf), 0,
+    ObjDisp(dev)->CmdFillBuffer(Unwrap(cmd), m_BindlessFeedback.FeedbackBuffer.UnwrappedBuffer(), 0,
                                 feedbackStorageSize, 0);
 
     VkBufferMemoryBarrier feedbackbufBarrier = {
@@ -4743,7 +4744,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
         VK_ACCESS_SHADER_WRITE_BIT,
         VK_QUEUE_FAMILY_IGNORED,
         VK_QUEUE_FAMILY_IGNORED,
-        Unwrap(m_BindlessFeedback.FeedbackBuffer.buf),
+        m_BindlessFeedback.FeedbackBuffer.UnwrappedBuffer(),
         0,
         feedbackStorageSize,
     };
@@ -4766,7 +4767,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
   }
 
   bytebuf data;
-  GetBufferData(GetResID(m_BindlessFeedback.FeedbackBuffer.buf), 0, 0, data);
+  GetDebugManager()->GetBufferData(m_BindlessFeedback.FeedbackBuffer, 0, 0, data);
 
   byte *base = data.data();
   uint32_t numHits = ((uint32_t *)base)[0];
@@ -5074,6 +5075,89 @@ ShaderDebugTrace *VulkanReplay::DebugThread(uint32_t eventId,
   rdcspv::Debugger *debugger = new rdcspv::Debugger;
   debugger->Parse(shader.spirv.GetSPIRV());
   ShaderDebugTrace *ret = debugger->BeginDebug(apiWrapper, ShaderStage::Compute, entryPoint, spec,
+                                               shadRefl.instructionLines, shadRefl.patchData, 0);
+  apiWrapper->ResetReplay();
+
+  return ret;
+}
+
+ShaderDebugTrace *VulkanReplay::DebugMeshThread(uint32_t eventId,
+                                                const rdcfixedarray<uint32_t, 3> &groupid,
+                                                const rdcfixedarray<uint32_t, 3> &threadid)
+{
+  const VulkanRenderState &state = m_pDriver->GetRenderState();
+  VulkanCreationInfo &c = m_pDriver->m_CreationInfo;
+
+  rdcstr regionName =
+      StringFormat::Fmt("DebugMeshThread @ %u of (%u,%u,%u) (%u,%u,%u)", eventId, groupid[0],
+                        groupid[1], groupid[2], threadid[0], threadid[1], threadid[2]);
+
+  VkMarkerRegion region(regionName);
+
+  if(Vulkan_Debug_ShaderDebugLogging())
+    RDCLOG("%s", regionName.c_str());
+
+  const ActionDescription *action = m_pDriver->GetAction(eventId);
+
+  if(!(action->flags & ActionFlags::MeshDispatch))
+  {
+    RDCLOG("No mesh dispatch selected");
+    return new ShaderDebugTrace();
+  }
+
+  // get ourselves in pristine state before this dispatch (without any side effects it may have had)
+  m_pDriver->ReplayLog(0, eventId, eReplay_WithoutDraw);
+
+  const VulkanCreationInfo::Pipeline &pipe = c.m_Pipeline[state.graphics.pipeline];
+  const VulkanCreationInfo::ShaderEntry &shaderEntry =
+      state.graphics.shaderObject
+          ? c.m_ShaderObject[state.shaderObjects[(size_t)ShaderStage::Mesh]].shad
+          : pipe.shaders[(size_t)ShaderStage::Mesh];
+  VulkanCreationInfo::ShaderModule &shader = c.m_ShaderModule[shaderEntry.module];
+  rdcstr entryPoint = shaderEntry.entryPoint;
+  const rdcarray<SpecConstant> &spec = shaderEntry.specialization;
+
+  VulkanCreationInfo::ShaderModuleReflection &shadRefl =
+      shader.GetReflection(ShaderStage::Mesh, entryPoint, state.graphics.pipeline);
+
+  if(!shadRefl.refl->debugInfo.debuggable)
+  {
+    RDCLOG("Shader is not debuggable: %s", shadRefl.refl->debugInfo.debugStatus.c_str());
+    return new ShaderDebugTrace();
+  }
+
+  shadRefl.PopulateDisassembly(shader.spirv);
+
+  VulkanAPIWrapper *apiWrapper =
+      new VulkanAPIWrapper(m_pDriver, c, ShaderStage::Mesh, eventId, shadRefl.refl->resourceId);
+
+  uint32_t threadDim[3];
+  threadDim[0] = shadRefl.refl->dispatchThreadsDimension[0];
+  threadDim[1] = shadRefl.refl->dispatchThreadsDimension[1];
+  threadDim[2] = shadRefl.refl->dispatchThreadsDimension[2];
+
+  std::map<ShaderBuiltin, ShaderVariable> &builtins = apiWrapper->builtin_inputs;
+  builtins[ShaderBuiltin::DispatchSize] =
+      ShaderVariable(rdcstr(), action->dispatchDimension[0], action->dispatchDimension[1],
+                     action->dispatchDimension[2], 0U);
+  builtins[ShaderBuiltin::DispatchThreadIndex] = ShaderVariable(
+      rdcstr(), groupid[0] * threadDim[0] + threadid[0], groupid[1] * threadDim[1] + threadid[1],
+      groupid[2] * threadDim[2] + threadid[2], 0U);
+  builtins[ShaderBuiltin::GroupIndex] =
+      ShaderVariable(rdcstr(), groupid[0], groupid[1], groupid[2], 0U);
+  builtins[ShaderBuiltin::GroupSize] =
+      ShaderVariable(rdcstr(), threadDim[0], threadDim[1], threadDim[2], 0U);
+  builtins[ShaderBuiltin::GroupThreadIndex] =
+      ShaderVariable(rdcstr(), threadid[0], threadid[1], threadid[2], 0U);
+  builtins[ShaderBuiltin::GroupFlatIndex] = ShaderVariable(
+      rdcstr(), threadid[2] * threadDim[0] * threadDim[1] + threadid[1] * threadDim[0] + threadid[0],
+      0U, 0U, 0U);
+  builtins[ShaderBuiltin::DeviceIndex] = ShaderVariable(rdcstr(), 0U, 0U, 0U, 0U);
+  builtins[ShaderBuiltin::DrawIndex] = ShaderVariable(rdcstr(), action->drawIndex, 0U, 0U, 0U);
+
+  rdcspv::Debugger *debugger = new rdcspv::Debugger;
+  debugger->Parse(shader.spirv.GetSPIRV());
+  ShaderDebugTrace *ret = debugger->BeginDebug(apiWrapper, ShaderStage::Mesh, entryPoint, spec,
                                                shadRefl.instructionLines, shadRefl.patchData, 0);
   apiWrapper->ResetReplay();
 

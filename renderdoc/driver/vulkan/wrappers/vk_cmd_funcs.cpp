@@ -1258,6 +1258,9 @@ bool WrappedVulkan::Serialise_vkBeginCommandBuffer(SerialiserType &ser, VkComman
               BeginInfo.pInheritanceInfo->subpass;
           // framebuffer is not useful here since it may be incomplete (imageless) and it's
           // optional, so we should just treat it as never present.
+
+          m_BakedCmdBufferInfo[BakedCommandBuffer].state.dynamicRendering.localRead.Init(
+              (const VkBaseInStructure *)BeginInfo.pInheritanceInfo);
         }
 
         ObjDisp(cmd)->BeginCommandBuffer(Unwrap(cmd), &unwrappedBeginInfo);
@@ -4574,8 +4577,8 @@ void WrappedVulkan::vkCmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQ
             queryCount * resultSize,
         };
         ObjDisp(commandBuffer)
-            ->CmdCopyBuffer(Unwrap(commandBuffer), Unwrap(qpInfo->m_Buffer.buf), Unwrap(destBuffer),
-                            1, &region);
+            ->CmdCopyBuffer(Unwrap(commandBuffer), qpInfo->m_Buffer.UnwrappedBuffer(),
+                            Unwrap(destBuffer), 1, &region);
       }
       else
       {
@@ -4587,8 +4590,8 @@ void WrappedVulkan::vkCmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQ
               {(firstQuery + i) * sizeof(uint64_t), destOffset + (i * destStride), resultSize});
 
         ObjDisp(commandBuffer)
-            ->CmdCopyBuffer(Unwrap(commandBuffer), Unwrap(qpInfo->m_Buffer.buf), Unwrap(destBuffer),
-                            (uint32_t)regions.size(), regions.data());
+            ->CmdCopyBuffer(Unwrap(commandBuffer), qpInfo->m_Buffer.UnwrappedBuffer(),
+                            Unwrap(destBuffer), (uint32_t)regions.size(), regions.data());
       }
 
       if(hasAvailability)
@@ -4596,7 +4599,7 @@ void WrappedVulkan::vkCmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQ
         const uint64_t availability = 1;
         for(size_t i = 0; i < queryCount; ++i)
           ObjDisp(commandBuffer)
-              ->CmdUpdateBuffer(Unwrap(commandBuffer), Unwrap(qpInfo->m_Buffer.buf),
+              ->CmdUpdateBuffer(Unwrap(commandBuffer), qpInfo->m_Buffer.UnwrappedBuffer(),
                                 destOffset + (queryCount * resultSize) + resultSize, resultSize,
                                 (uint32_t *)&availability);
       }
@@ -5604,6 +5607,23 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSetKHR(SerialiserType &ser,
             pImageInfo[d].imageView = Unwrap(pImageInfo[d].imageView);
             pImageInfo[d].sampler = Unwrap(pImageInfo[d].sampler);
           }
+
+          if(writes[i].pNext)
+          {
+            VkBaseInStructure *next = (VkBaseInStructure *)writes[i].pNext;
+            if(next->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR)
+            {
+              VkWriteDescriptorSetAccelerationStructureKHR *accWrite =
+                  (VkWriteDescriptorSetAccelerationStructureKHR *)next;
+              VkAccelerationStructureKHR *as =
+                  (VkAccelerationStructureKHR *)accWrite->pAccelerationStructures;
+
+              for(uint32_t a = 0; a < accWrite->accelerationStructureCount; a++)
+              {
+                as[a] = Unwrap(as[a]);
+              }
+            }
+          }
         }
       }
 
@@ -5894,6 +5914,23 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSetWithTemplateKHR(
           {
             pImageInfo[d].imageView = Unwrap(pImageInfo[d].imageView);
             pImageInfo[d].sampler = Unwrap(pImageInfo[d].sampler);
+          }
+
+          if(writes[i].pNext)
+          {
+            VkBaseInStructure *next = (VkBaseInStructure *)writes[i].pNext;
+            if(next->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR)
+            {
+              VkWriteDescriptorSetAccelerationStructureKHR *accWrite =
+                  (VkWriteDescriptorSetAccelerationStructureKHR *)next;
+              VkAccelerationStructureKHR *as =
+                  (VkAccelerationStructureKHR *)accWrite->pAccelerationStructures;
+
+              for(uint32_t a = 0; a < accWrite->accelerationStructureCount; a++)
+              {
+                as[a] = Unwrap(as[a]);
+              }
+            }
           }
         }
       }
@@ -7875,19 +7912,24 @@ bool WrappedVulkan::Serialise_vkCmdBuildAccelerationStructuresKHR(
     if(IsActiveReplaying(m_State))
     {
       if(InRerecordRange(m_LastCmdBufferID))
+      {
         commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
-      else
-        return true;
+        ObjDisp(commandBuffer)
+            ->CmdBuildAccelerationStructuresKHR(Unwrap(commandBuffer), infoCount, unwrappedInfos,
+                                                tmpBuildRangeInfos.data());
+      }
     }
+    else
+    {
+      ObjDisp(commandBuffer)
+          ->CmdBuildAccelerationStructuresKHR(Unwrap(commandBuffer), infoCount, unwrappedInfos,
+                                              tmpBuildRangeInfos.data());
 
-    ObjDisp(commandBuffer)
-        ->CmdBuildAccelerationStructuresKHR(Unwrap(commandBuffer), infoCount, unwrappedInfos,
-                                            tmpBuildRangeInfos.data());
-
-    AddEvent();
-    ActionDescription action;
-    action.flags = ActionFlags::BuildAccStruct;
-    AddAction(action);
+      AddEvent();
+      ActionDescription action;
+      action.flags = ActionFlags::BuildAccStruct;
+      AddAction(action);
+    }
   }
 
   return true;
@@ -7968,12 +8010,25 @@ bool WrappedVulkan::Serialise_vkCmdCopyAccelerationStructureKHR(
     unwrappedInfo.src = Unwrap(unwrappedInfo.src);
     unwrappedInfo.dst = Unwrap(unwrappedInfo.dst);
 
-    ObjDisp(commandBuffer)->CmdCopyAccelerationStructureKHR(Unwrap(commandBuffer), &unwrappedInfo);
+    m_LastCmdBufferID = GetResourceManager()->GetOriginalID(GetResID(commandBuffer));
 
-    AddEvent();
-    ActionDescription action;
-    action.flags = ActionFlags::BuildAccStruct;
-    AddAction(action);
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+      {
+        commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
+        ObjDisp(commandBuffer)->CmdCopyAccelerationStructureKHR(Unwrap(commandBuffer), &unwrappedInfo);
+      }
+    }
+    else
+    {
+      ObjDisp(commandBuffer)->CmdCopyAccelerationStructureKHR(Unwrap(commandBuffer), &unwrappedInfo);
+
+      AddEvent();
+      ActionDescription action;
+      action.flags = ActionFlags::BuildAccStruct;
+      AddAction(action);
+    }
   }
 
   return true;
@@ -8051,12 +8106,27 @@ bool WrappedVulkan::Serialise_vkCmdCopyMemoryToAccelerationStructureKHR(
     VkCopyMemoryToAccelerationStructureInfoKHR unwrappedInfo = Info;
     unwrappedInfo.dst = Unwrap(unwrappedInfo.dst);
 
-    ObjDisp(commandBuffer)->CmdCopyMemoryToAccelerationStructureKHR(Unwrap(commandBuffer), &unwrappedInfo);
+    m_LastCmdBufferID = GetResourceManager()->GetOriginalID(GetResID(commandBuffer));
 
-    AddEvent();
-    ActionDescription action;
-    action.flags = ActionFlags::BuildAccStruct;
-    AddAction(action);
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+      {
+        commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
+        ObjDisp(commandBuffer)
+            ->CmdCopyMemoryToAccelerationStructureKHR(Unwrap(commandBuffer), &unwrappedInfo);
+      }
+    }
+    else
+    {
+      ObjDisp(commandBuffer)
+          ->CmdCopyMemoryToAccelerationStructureKHR(Unwrap(commandBuffer), &unwrappedInfo);
+
+      AddEvent();
+      ActionDescription action;
+      action.flags = ActionFlags::BuildAccStruct;
+      AddAction(action);
+    }
   }
 
   return true;
@@ -8113,7 +8183,7 @@ void WrappedVulkan::vkCmdWriteAccelerationStructuresPropertiesKHR(
       const VkDeviceSize numBytes = RDCMIN(maxTransferrableBytes, totalBytes);
       const VkDeviceSize startOffset = (firstQuery * sizeof(uint64_t)) + i;
       ObjDisp(commandBuffer)
-          ->CmdUpdateBuffer(Unwrap(commandBuffer), Unwrap(qpInfo->m_Buffer.buf), startOffset,
+          ->CmdUpdateBuffer(Unwrap(commandBuffer), qpInfo->m_Buffer.UnwrappedBuffer(), startOffset,
                             numBytes, (uint32_t *)((byte *)sizes.data() + i));
     }
   }

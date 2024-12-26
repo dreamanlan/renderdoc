@@ -952,11 +952,7 @@ private:
     return ret;
   }
 
-  void AddForcedReference(VkResourceRecord *record)
-  {
-    SCOPED_LOCK(m_ForcedReferencesLock);
-    m_ForcedReferences.push_back(record);
-  }
+  void AddForcedReference(VkResourceRecord *record);
 
   // used on replay side to track the queue family of command buffers and pools
   std::map<ResourceId, uint32_t> m_commandQueueFamilies;
@@ -2786,6 +2782,15 @@ public:
                                 const VkRenderingInfo *pRenderingInfo);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdEndRendering, VkCommandBuffer commandBuffer);
+
+  // VK_KHR_dynamic_rendering_local_read
+
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRenderingAttachmentLocationsKHR,
+                                VkCommandBuffer commandBuffer,
+                                const VkRenderingAttachmentLocationInfoKHR *pLocationInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRenderingInputAttachmentIndicesKHR,
+                                VkCommandBuffer commandBuffer,
+                                const VkRenderingInputAttachmentIndexInfoKHR *pLocationInfo);
 
   // VK_KHR_fragment_shading_rate
 

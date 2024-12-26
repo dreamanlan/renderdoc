@@ -133,6 +133,19 @@ enum class GlobalShaderFlags : int64_t
   ShadingRate = 0x080000,
   Raytracing1_1 = 0x100000,
   SamplerFeedback = 0x200000,
+  AtomicInt64OnTypedResource = 0x400000,
+  AtomicInt64OnGroupShared = 0x800000,
+  DerivativesInMeshAndAmpShaders = 0x1000000,
+  ResourceDescriptorHeapIndexing = 0x2000000,
+  SamplerDescriptorHeapIndexing = 0x4000000,
+  Reserved = 0x8000000,
+  AtomicInt64OnHeapResource = 0x10000000,
+  AdvancedTextureOps = 0x20000000,
+  WriteableMSAATextures = 0x40000000,
+  SampleCmpGradientOrBias = 0x80000000,
+  ShaderFeatureInfo_ExtendedCommandInfo = 0x100000000,
+  KNOWN_FLAGS_MASK =
+      ShaderFeatureInfo_ExtendedCommandInfo + (ShaderFeatureInfo_ExtendedCommandInfo - 1),
 };
 
 BITMASK_OPERATORS(GlobalShaderFlags);
@@ -162,6 +175,7 @@ static const uint32_t FOURCC_SFI0 = MAKE_FOURCC('S', 'F', 'I', '0');
 static const uint32_t FOURCC_PSV0 = MAKE_FOURCC('P', 'S', 'V', '0');
 static const uint32_t FOURCC_RTS0 = MAKE_FOURCC('R', 'T', 'S', '0');
 static const uint32_t FOURCC_RDAT = MAKE_FOURCC('R', 'D', 'A', 'T');
+static const uint32_t FOURCC_VERS = MAKE_FOURCC('V', 'E', 'R', 'S');
 
 struct RDEFHeader;
 
@@ -229,6 +243,7 @@ public:
   const DXIL::Program *GetDXILByteCode() const { return m_DXILByteCode; }
   DXIL::Program *GetDXILByteCode() { return m_DXILByteCode; }
   static void GetHash(uint32_t hash[4], const void *ByteCode, size_t BytecodeLength);
+  GlobalShaderFlags GetGlobalShaderFlags() const { return m_GlobalFlags; }
 
   const byte *GetNonDebugDXILByteCode() const
   {

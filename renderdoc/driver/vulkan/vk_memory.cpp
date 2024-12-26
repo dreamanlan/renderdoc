@@ -42,6 +42,19 @@ GPUAddressRange WrappedVulkan::CreateAddressRange(VkDevice device, VkBuffer buff
   VkResourceRecord *record = GetRecord(buffer);
   VkResourceRecord *memrecord = GetResourceManager()->GetResourceRecord(record->baseResourceMem);
 
+  const bool isSparse = record->resInfo && record->resInfo->IsSparse();
+
+  // If the buffer is not sparse and there's no baseResourceMem, then the buffer is being destroyed
+  // without being bound so exit early as there's nothing to do
+  if(!isSparse && !memrecord)
+    return {};
+
+  // Sparse buffers may not have a single device allocation so set the OOB size to the same as the
+  // buffer
+  VkDeviceSize oobSize = record->memSize;
+  if(!isSparse && memrecord)
+    oobSize = memrecord->memSize - record->memOffset;
+
   const VkBufferDeviceAddressInfo addrInfo = {
       VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
       NULL,
@@ -54,7 +67,7 @@ GPUAddressRange WrappedVulkan::CreateAddressRange(VkDevice device, VkBuffer buff
   return {
       address,
       address + record->memSize,
-      address + (memrecord->memSize - record->memOffset),
+      address + oobSize,
       record->GetResourceID(),
   };
 }
@@ -335,7 +348,7 @@ MemoryAllocation WrappedVulkan::AllocateMemoryForResource(bool buffer, VkMemoryR
     }
 
     uint64_t initStateLimitMB = RenderDoc::Inst().GetCaptureOptions().softMemoryLimit;
-    if(initStateLimitMB > 0)
+    if(initStateLimitMB > 0 && initStateLimitMB < 512)
       allocSize = RDCMAX(initStateLimitMB, allocSize);
 
     uint32_t memoryTypeIndex = 0;

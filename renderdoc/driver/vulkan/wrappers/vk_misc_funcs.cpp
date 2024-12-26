@@ -1591,6 +1591,16 @@ bool WrappedVulkan::Serialise_vkCreateQueryPool(SerialiserType &ser, VkDevice de
           ObjDisp(cmd)->CmdWriteTimestamp(Unwrap(cmd), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                           Unwrap(pool), i);
         }
+        else if(CreateInfo.queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ||
+                CreateInfo.queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ||
+                CreateInfo.queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR)
+        {
+          /*
+          ObjDisp(cmd)->CmdWriteAccelerationStructuresPropertiesKHR(
+              Unwrap(commandBuffer), 1, UnwrapPtr(m_DummyQueryAS), CreateInfo.queryType,
+              Unwrap(pool), i);
+              */
+        }
         else
         {
           ObjDisp(cmd)->CmdBeginQuery(Unwrap(cmd), Unwrap(pool), i, 0);
@@ -1655,8 +1665,6 @@ VkResult WrappedVulkan::vkCreateQueryPool(VkDevice device, const VkQueryPoolCrea
       if(pCreateInfo->queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
       {
         record->queryPoolInfo = new QueryPoolInfo(this, device, pCreateInfo);
-        GetResourceManager()->SetInternalResource(GetResID(record->queryPoolInfo->m_Buffer.buf));
-        GetResourceManager()->SetInternalResource(GetResID(record->queryPoolInfo->m_Buffer.mem));
       }
 
       record->AddChunk(chunk);
@@ -1682,13 +1690,11 @@ VkResult WrappedVulkan::vkGetQueryPoolResults(VkDevice device, VkQueryPool query
   if(qpInfo)
   {
     VkMappedMemoryRange range = {
-        VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-        NULL,
-        qpInfo->m_Buffer.mem,
-        firstQuery * sizeof(uint64_t),
+        VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL,
+        qpInfo->m_Buffer.UnwrappedMemory(),    firstQuery * sizeof(uint64_t),
         queryCount * sizeof(uint64_t),
     };
-    vkInvalidateMappedMemoryRanges(device, 1, &range);
+    ObjDisp(device)->InvalidateMappedMemoryRanges(Unwrap(device), 1, &range);
 
     const bool is64bit = (flags & VK_QUERY_RESULT_64_BIT) > 0;
     const bool hasAvailability = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) > 0;

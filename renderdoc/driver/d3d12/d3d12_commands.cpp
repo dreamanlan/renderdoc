@@ -671,9 +671,8 @@ void WrappedID3D12CommandQueue::CheckAndFreeRayDispatches()
   {
     if(signalled >= ray.fenceValue)
     {
-      SAFE_RELEASE(ray.patchScratchBuffer);
-      SAFE_RELEASE(ray.lookupBuffer);
-      SAFE_RELEASE(ray.argumentBuffer);
+      GetResourceManager()->GetRTManager()->AddDispatchTimer(ray.query);
+      ray.Release();
     }
   }
 
@@ -1416,6 +1415,10 @@ WrappedID3D12GraphicsCommandList::~WrappedID3D12GraphicsCommandList()
 {
   SAFE_RELEASE(m_AMDMarkers);
 
+  for(std::function<void()> &func : m_UnusedCleanupCallbacks)
+    func();
+  m_UnusedCleanupCallbacks.clear();
+
   if(m_pList)
     m_pDevice->GetResourceManager()->RemoveWrapper(m_pList);
 
@@ -1472,9 +1475,7 @@ void WrappedID3D12GraphicsCommandList::AddRayDispatches(rdcarray<PatchedRayDispa
   for(const PatchedRayDispatch::Resources &r : m_RayDispatches)
   {
     dispatches.push_back(r);
-    SAFE_ADDREF(r.lookupBuffer);
-    SAFE_ADDREF(r.patchScratchBuffer);
-    SAFE_ADDREF(r.argumentBuffer);
+    r.AddRef();
   }
 }
 

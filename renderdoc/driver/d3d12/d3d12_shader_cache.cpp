@@ -35,6 +35,8 @@
 
 RDOC_CONFIG(rdcstr, D3D12_DXCPath, "", "The location of the dxcompiler.dll library to use.");
 
+RDOC_EXTERN_CONFIG(bool, D3D12_Debug_EnableGPUVA);
+
 static void *SearchForDXC(rdcstr &path)
 {
   void *ret = NULL;
@@ -354,7 +356,7 @@ D3D12ShaderCache::D3D12ShaderCache(WrappedID3D12Device *device)
   if(device->GetReal())
     device->GetReal()->QueryInterface(IRenderDoc_uuid, (void **)&dummy);
 
-  if(dummy)
+  if(dummy || D3D12_Debug_EnableGPUVA())
   {
     m_CompileFlags |=
         D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_OPTIMIZATION_LEVEL0;
@@ -493,6 +495,11 @@ rdcstr D3D12ShaderCache::GetShaderBlob(const char *source, const char *entry,
       uint32_t flags = DXBC::DecodeFlags(compileFlags) & ~D3DCOMPILE_NO_PRESHADER;
       rdcarray<rdcwstr> argsData;
       DXBC::EncodeDXCFlags(flags, argsData);
+      for(const ShaderCompileFlag &flag : compileFlags.flags)
+      {
+        if(flag.name == "@compile_option")
+          argsData.push_back(StringFormat::UTF82Wide(flag.value));
+      }
       argsData.push_back(L"-select-validator internal");
       rdcarray<LPCWSTR> arguments;
       for(const rdcwstr &arg : argsData)

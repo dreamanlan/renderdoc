@@ -132,6 +132,7 @@ set(sources
     common/result.h
     common/shader_cache.h
     common/jobsystem.cpp
+    common/tex_data.h
     common/threading.h
     common/timing.h
     common/wrapped_pool.h
@@ -584,7 +585,7 @@ if(ENABLE_GL OR ENABLE_GLES)
 endif()
 
 # pull in the NVIDIA folder
-if(NOT ANDROID AND NOT APPLE AND (ENABLE_GL OR ENABLE_GLES OR ENABLE_VULKAN))
+if(ENABLE_GL OR ENABLE_GLES OR ENABLE_VULKAN)
     add_subdirectory(driver/ihv/nv)
     list(APPEND renderdoc_objects $<TARGET_OBJECTS:rdoc_nv>)
 endif()

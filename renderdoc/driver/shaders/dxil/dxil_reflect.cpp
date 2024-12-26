@@ -28,9 +28,6 @@
 #include "dxil_bytecode.h"
 #include "dxil_common.h"
 
-RDOC_DEBUG_CONFIG(bool, D3D12_Experimental_EnableDXILShaderDebugging, false,
-                  "Enable support for experimental DXIL shader debugger");
-
 namespace DXIL
 {
 enum class ResourcesTag
@@ -290,6 +287,9 @@ EntryPointInterface::Signature::Signature(const Metadata *signature)
   cols = getival<uint8_t>(signature->children[SignatureElement::Cols]);
   startRow = getival<int32_t>(signature->children[SignatureElement::StartRow]);
   startCol = getival<int8_t>(signature->children[SignatureElement::StartCol]);
+  // System value entries have row, col = -1, reset start column to 0 to make parameter matching simpler
+  if((startRow == -1) && (startCol == -1))
+    startCol = 0;
 }
 
 EntryPointInterface::ResourceBase::ResourceBase(ResourceClass resourceClass, const Metadata *md)
@@ -306,6 +306,8 @@ EntryPointInterface::ResourceBase::ResourceBase(ResourceClass resourceClass, con
     SRV &srv = srvData;
     srv.shape = getival<ResourceKind>(md->children[(size_t)ResField::SRVShape]);
     srv.sampleCount = getival<uint32_t>(md->children[(size_t)ResField::SRVSampleCount]);
+    srv.compType = ComponentType::Invalid;
+    srv.elementStride = ~0U;
     const Metadata *tags = md->children[(size_t)ResField::SRVTags];
     for(size_t t = 0; tags && t < tags->children.size(); t += 2)
     {
@@ -332,6 +334,11 @@ EntryPointInterface::ResourceBase::ResourceBase(ResourceClass resourceClass, con
     uav.hasCounter = (getival<uint32_t>(md->children[(size_t)ResField::UAVHiddenCounter]) == 1);
     uav.rasterizerOrderedView =
         (getival<uint32_t>(md->children[(size_t)ResField::UAVRasterOrder]) == 1);
+    uav.compType = ComponentType::Invalid;
+    uav.elementStride = ~0U;
+    uav.samplerFeedback = SamplerFeedbackType::LastEntry;
+    uav.atomic64Use = false;
+
     const Metadata *tags = md->children[(size_t)ResField::UAVTags];
     for(size_t t = 0; tags && t < tags->children.size(); t += 2)
     {
@@ -360,6 +367,7 @@ EntryPointInterface::ResourceBase::ResourceBase(ResourceClass resourceClass, con
     CBuffer &cbuffer = cbufferData;
     cbuffer.sizeInBytes = getival<uint32_t>(md->children[(size_t)ResField::CBufferByteSize]);
     const Metadata *tags = md->children[(size_t)ResField::CBufferTags];
+    cbuffer.isTBuffer = false;
     for(size_t t = 0; tags && t < tags->children.size(); t += 2)
     {
       RDCASSERT(tags->children[t]->isConstant);
@@ -1231,6 +1239,12 @@ static void AddResourceBind(DXBC::Reflection *refl, const TypeInfo &typeInfo, co
   RDCASSERT(resType->type == Type::Pointer);
   resType = resType->inner;
 
+  bool structType = resType->type == Type::Struct;
+
+  const Type *bufType = NULL;
+  if(resType->type == Type::Struct && resType->members.size() == 1)
+    bufType = resType->members[0];
+
   // textures are a struct containing the inner type and a mips type
   if(resType->type == Type::Struct && !resType->members.empty())
     resType = resType->members[0];
@@ -1250,6 +1264,9 @@ static void AddResourceBind(DXBC::Reflection *refl, const TypeInfo &typeInfo, co
     else if(resType->scalarType == Type::Int)
       bind.retType = RETURN_TYPE_SINT;
   }
+
+  if(bufType && (resType->type == Type::Scalar))
+    structType = false;
 
   const Metadata *tags =
       srv ? r->children[(size_t)ResField::SRVTags] : r->children[(size_t)ResField::UAVTags];
@@ -1371,20 +1388,23 @@ static void AddResourceBind(DXBC::Reflection *refl, const TypeInfo &typeInfo, co
       bind.type = srv ? ShaderInputBind::TYPE_BYTEADDRESS : ShaderInputBind::TYPE_UAV_RWBYTEADDRESS;
       defName = srv ? "ByteAddressBuffer" : "RWByteAddressBuffer";
       bind.dimension = ShaderInputBind::DIM_BUFFER;
-      bind.retType = RETURN_TYPE_MIXED;
+      if(bind.retType == RETURN_TYPE_UNKNOWN && structType)
+        bind.retType = RETURN_TYPE_MIXED;
       break;
     case ResourceKind::StructuredBuffer:
       bind.type = srv ? ShaderInputBind::TYPE_STRUCTURED : ShaderInputBind::TYPE_UAV_RWSTRUCTURED;
       defName = srv ? "StructuredBuffer" : "RWStructuredBuffer";
       bind.dimension = ShaderInputBind::DIM_BUFFER;
-      bind.retType = RETURN_TYPE_MIXED;
+      if(bind.retType == RETURN_TYPE_UNKNOWN && structType)
+        bind.retType = RETURN_TYPE_MIXED;
       break;
     case ResourceKind::StructuredBufferWithCounter:
       bind.type = srv ? ShaderInputBind::TYPE_STRUCTURED
                       : ShaderInputBind::TYPE_UAV_RWSTRUCTURED_WITH_COUNTER;
       defName = srv ? "StructuredBufferWithCounter" : "RWStructuredBufferWithCounter";
       bind.dimension = ShaderInputBind::DIM_BUFFER;
-      bind.retType = RETURN_TYPE_MIXED;
+      if(bind.retType == RETURN_TYPE_UNKNOWN && structType)
+        bind.retType = RETURN_TYPE_MIXED;
       break;
   }
 
@@ -1425,6 +1445,18 @@ static void AddResourceBind(DXBC::Reflection *refl, const TypeInfo &typeInfo, co
     refl->SRVs.push_back(bind);
   else
     refl->UAVs.push_back(bind);
+}
+
+const DXIL::EntryPointInterface *Program::GetEntryPointInterface() const
+{
+  RDCASSERT(!m_EntryPointInterfaces.isEmpty());
+  for(size_t e = 0; e < m_EntryPointInterfaces.size(); ++e)
+  {
+    if(m_EntryPoint == m_EntryPointInterfaces[e].name)
+      return &m_EntryPointInterfaces[e];
+  }
+  RDCERR("Couldn't find entry point interface for %s", m_EntryPoint.c_str());
+  return NULL;
 }
 
 rdcarray<ShaderEntryPoint> Program::GetEntryPoints()
@@ -1747,9 +1779,6 @@ DXBC::Reflection *Program::BuildReflection()
 
 rdcstr Program::GetDebugStatus()
 {
-  if(!D3D12_Experimental_EnableDXILShaderDebugging())
-    return "Debugging DXIL is not supported";
-
   if((m_Type != DXBC::ShaderType::Vertex) && (m_Type != DXBC::ShaderType::Compute) &&
      (m_Type != DXBC::ShaderType::Pixel))
     return "Only DXIL Vertex, Pixel and Compute shaders are supported for debugging";
@@ -1760,7 +1789,8 @@ rdcstr Program::GetDebugStatus()
     // Only support "dx.op" external functions
     if(f.external)
     {
-      if(!f.name.beginsWith("dx.op.") && !f.name.beginsWith("llvm.dbg."))
+      if(!f.name.beginsWith("dx.op.") && !f.name.beginsWith("llvm.dbg.") &&
+         !f.name.beginsWith("llvm.lifetime.") && !f.name.beginsWith("llvm.invariant."))
         return StringFormat::Fmt("Unsupported external function '%s'", f.name.c_str());
     }
 
@@ -1770,7 +1800,6 @@ rdcstr Program::GetDebugStatus()
       {
         case Operation::AddrSpaceCast:
         case Operation::InsertValue:
-        case Operation::CompareExchange:
           return StringFormat::Fmt("Unsupported instruction '%s'", ToStr(inst->op).c_str());
         case Operation::Call:
         {
@@ -1783,46 +1812,33 @@ rdcstr Program::GetDebugStatus()
             RDCASSERT(dxOpCode < DXOp::NumOpCodes, dxOpCode, DXOp::NumOpCodes);
             switch(dxOpCode)
             {
+              case DXOp::QuadReadLaneAt:
+              case DXOp::QuadOp:
+                // Only supported on pixel shaders
+                if(m_Type != DXBC::ShaderType::Pixel)
+                  return StringFormat::Fmt(
+                      "Only supported when debugging pixel shaders dx.op call `%s` %s",
+                      callFunc->name.c_str(), ToStr(dxOpCode).c_str());
+                continue;
               case DXOp::TempRegLoad:
               case DXOp::TempRegStore:
               case DXOp::MinPrecXRegLoad:
               case DXOp::MinPrecXRegStore:
-              case DXOp::UAddc:
-              case DXOp::USubb:
-              case DXOp::Fma:
-              case DXOp::IMad:
-              case DXOp::UMad:
-              case DXOp::Msad:
-              case DXOp::Ibfe:
-              case DXOp::Ubfe:
-              case DXOp::Bfi:
               case DXOp::CBufferLoad:
               case DXOp::BufferUpdateCounter:
               case DXOp::CheckAccessFullyMapped:
-              case DXOp::AtomicBinOp:
-              case DXOp::AtomicCompareExchange:
-              case DXOp::CalculateLOD:
-              case DXOp::Discard:
-              case DXOp::DerivFineX:
-              case DXOp::DerivFineY:
               case DXOp::EvalSnapped:
               case DXOp::EvalSampleIndex:
               case DXOp::EvalCentroid:
-              case DXOp::SampleIndex:
-              case DXOp::Coverage:
-              case DXOp::InnerCoverage:
               case DXOp::EmitStream:
               case DXOp::CutStream:
               case DXOp::EmitThenCutStream:
               case DXOp::GSInstanceID:
-              case DXOp::MakeDouble:
-              case DXOp::SplitDouble:
               case DXOp::LoadOutputControlPoint:
               case DXOp::LoadPatchConstant:
               case DXOp::DomainLocation:
               case DXOp::StorePatchConstant:
               case DXOp::OutputControlPointID:
-              case DXOp::PrimitiveID:
               case DXOp::CycleCounterLegacy:
               case DXOp::WaveIsFirstLane:
               case DXOp::WaveGetLaneIndex:
@@ -1836,23 +1852,9 @@ rdcstr Program::GetDebugStatus()
               case DXOp::WaveActiveOp:
               case DXOp::WaveActiveBit:
               case DXOp::WavePrefixOp:
-              case DXOp::QuadReadLaneAt:
-              case DXOp::QuadOp:
-              case DXOp::BitcastI16toF16:
-              case DXOp::BitcastF16toI16:
-              case DXOp::BitcastI32toF32:
-              case DXOp::BitcastF32toI32:
-              case DXOp::BitcastI64toF64:
-              case DXOp::BitcastF64toI64:
-              case DXOp::LegacyF32ToF16:
-              case DXOp::LegacyF16ToF32:
-              case DXOp::LegacyDoubleToFloat:
-              case DXOp::LegacyDoubleToSInt32:
-              case DXOp::LegacyDoubleToUInt32:
               case DXOp::WaveAllBitCount:
               case DXOp::WavePrefixBitCount:
               case DXOp::AttributeAtVertex:
-              case DXOp::ViewID:
               case DXOp::InstanceID:
               case DXOp::InstanceIndex:
               case DXOp::HitKind:
@@ -1874,9 +1876,6 @@ rdcstr Program::GetDebugStatus()
               case DXOp::CallShader:
               case DXOp::CreateHandleForLib:
               case DXOp::PrimitiveIndex:
-              case DXOp::Dot2AddHalf:
-              case DXOp::Dot4AddI8Packed:
-              case DXOp::Dot4AddU8Packed:
               case DXOp::WaveMatch:
               case DXOp::WaveMultiPrefixOp:
               case DXOp::WaveMultiPrefixBitCount:
@@ -1928,10 +1927,6 @@ rdcstr Program::GetDebugStatus()
               case DXOp::GeometryIndex:
               case DXOp::RayQuery_CandidateInstanceContributionToHitGroupIndex:
               case DXOp::RayQuery_CommittedInstanceContributionToHitGroupIndex:
-              case DXOp::CreateHandleFromHeap:
-              case DXOp::Unpack4x8:
-              case DXOp::Pack4x8:
-              case DXOp::IsHelperLane:
               case DXOp::QuadVote:
               case DXOp::TextureGatherRaw:
               case DXOp::TextureStoreSample:
@@ -1976,6 +1971,14 @@ rdcstr Program::GetDebugStatus()
           {
             break;
           }
+          else if(funcCallName.beginsWith("llvm.lifetime."))
+          {
+            break;
+          }
+          else if(funcCallName.beginsWith("llvm.invariant."))
+          {
+            break;
+          }
           else
           {
             return StringFormat::Fmt("Unsupported function call '%s'", ToStr(callFunc->name).c_str());
@@ -2015,7 +2018,7 @@ void Program::GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo &
     if(getLineInfo)
     {
       const Instruction *const inst = f.instructions[instruction];
-      uint32_t dbgLoc = inst->debugLoc;
+      uint32_t dbgLoc = ShouldIgnoreSourceMapping(*inst) ? ~0U : inst->debugLoc;
       if(dbgLoc != ~0U)
       {
         const DebugLocation &debugLoc = m_DebugLocations[dbgLoc];
@@ -2076,12 +2079,13 @@ void Program::GetLocals(const DXBC::DXBCContainer *dxbc, size_t instruction, uin
   }
 }
 
-const ResourceReference *Program::GetResourceReference(const rdcstr &handleStr) const
+const ResourceReference *Program::GetResourceReference(const DXILDebug::Id handleId) const
 {
-  if(m_ResourceHandles.count(handleStr) > 0)
+  auto it = m_ResourceByIdHandles.find(handleId);
+  if(it != m_ResourceByIdHandles.end())
   {
-    size_t resRefIndex = m_ResourceHandles.find(handleStr)->second;
-    if(resRefIndex < m_ResourceHandles.size())
+    size_t resRefIndex = it->second;
+    if(resRefIndex < m_ResourceReferences.size())
     {
       return &m_ResourceReferences[resRefIndex];
     }

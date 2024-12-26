@@ -30,6 +30,7 @@
 #include "driver/ihv/intel/intel_counters.h"
 #include "driver/ihv/nv/nv_counters.h"
 #include "driver/ihv/nv/nv_d3d11_counters.h"
+#include "driver/shaders/dxbc/dxbc_common.h"
 #include "maths/camera.h"
 #include "maths/formatpacking.h"
 #include "maths/matrix.h"
@@ -78,6 +79,8 @@ void D3D11Replay::Shutdown()
   m_ProxyResources.clear();
 
   m_RealState.state.Clear();
+
+  DXBC::ResetSearchDirsCache();
 
   // explicitly delete the device, as all the replay resources created will be keeping refs on it
   delete m_pDevice;
@@ -131,12 +134,14 @@ void D3D11Replay::CreateResources(IDXGIFactory *factory)
     {
       DXGI_ADAPTER_DESC desc = {};
       pDXGIAdapter->GetDesc(&desc);
+      LARGE_INTEGER version = {};
+      pDXGIAdapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &version);
 
       RDCEraseEl(m_DriverInfo);
 
       m_DriverInfo.vendor = GPUVendorFromPCIVendor(desc.VendorId);
 
-      rdcstr descString = GetDriverVersion(desc);
+      rdcstr descString = GetDriverVersion(desc, version);
       descString.resize(RDCMIN(descString.size(), ARRAY_COUNT(m_DriverInfo.version) - 1));
       memcpy(m_DriverInfo.version, descString.c_str(), descString.size());
 

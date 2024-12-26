@@ -93,6 +93,9 @@ void main()
 
 #pragma warning(push)
 #pragma warning(disable : 4127)
+#pragma warning(disable : 4189)
+#pragma warning(disable : 4324)
+#pragma warning(disable : 4505)
 
 #include "vk_headers.h"
 
@@ -717,6 +720,8 @@ bool VulkanGraphicsTest::Init()
   }
 
   VmaVulkanFunctions funcs = {
+      vkGetInstanceProcAddr,
+      vkGetDeviceProcAddr,
       vkGetPhysicalDeviceProperties,
       vkGetPhysicalDeviceMemoryProperties,
       vkAllocateMemory,
@@ -733,17 +738,27 @@ bool VulkanGraphicsTest::Init()
       vkDestroyBuffer,
       vkCreateImage,
       vkDestroyImage,
+      vkCmdCopyBuffer,
       vkGetBufferMemoryRequirements2KHR,
       vkGetImageMemoryRequirements2KHR,
+      vkBindBufferMemory2KHR,
+      vkBindImageMemory2KHR,
+      vkGetPhysicalDeviceMemoryProperties2KHR,
+      vkGetDeviceBufferMemoryRequirements,
+      vkGetDeviceImageMemoryRequirements,
   };
 
   VmaAllocatorCreateInfo allocInfo = {};
+  allocInfo.instance = instance;
   allocInfo.physicalDevice = phys;
   allocInfo.device = device;
-  allocInfo.frameInUseCount = 4;
   allocInfo.pVulkanFunctions = &funcs;
+  allocInfo.vulkanApiVersion = devVersion;
   if(hasExt(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME) && vmaDedicated)
     allocInfo.flags |= VMA_ALLOCATOR_CREATE_KHR_DEDICATED_ALLOCATION_BIT;
+  if((hasExt(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) || devVersion >= VK_MAKE_VERSION(1, 2, 0)) &&
+     vmaBDA)
+    allocInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 
   vmaCreateAllocator(&allocInfo, &allocator);
 
@@ -1033,6 +1048,12 @@ void VulkanGraphicsTest::setName(VkSemaphore obj, const std::string &name)
   setName(VK_OBJECT_TYPE_SEMAPHORE, (uint64_t)obj, name);
 }
 
+template <>
+void VulkanGraphicsTest::setName(VkFence obj, const std::string &name)
+{
+  setName(VK_OBJECT_TYPE_FENCE, (uint64_t)obj, name);
+}
+
 void VulkanGraphicsTest::setName(VkObjectType objType, uint64_t obj, const std::string &name)
 {
   if(vkSetDebugUtilsObjectNameEXT)
@@ -1195,6 +1216,11 @@ VkDescriptorSet VulkanGraphicsTest::allocateDescriptorSet(VkDescriptorSetLayout 
 
       inlineCreateInfo.maxInlineUniformBlockBindings = 1024;
       next = &inlineCreateInfo;
+    }
+
+    if(hasExt(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME))
+    {
+      poolSizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1024});
     }
 
     CHECK_VKR(vkCreateDescriptorPool(
@@ -1409,6 +1435,12 @@ VulkanWindow::VulkanWindow(VulkanGraphicsTest *test, GraphicsWindow *win)
 
       test->setName(renderStartSemaphore[i], title + " renderStartSemaphore" + std::to_string(i));
       test->setName(renderEndSemaphore[i], title + " renderEndSemaphore" + std::to_string(i));
+
+      // create signalled so the first wait works
+      CHECK_VKR(vkCreateFence(m_Test->device, vkh::FenceCreateInfo(VK_FENCE_CREATE_SIGNALED_BIT),
+                              NULL, &imageFences[i]));
+
+      test->setName(imageFences[i], title + " fence" + std::to_string(i));
     }
 
 #if defined(WIN32)
@@ -1467,6 +1499,7 @@ VulkanWindow::~VulkanWindow()
     {
       vkDestroySemaphore(m_Test->device, renderStartSemaphore[i], NULL);
       vkDestroySemaphore(m_Test->device, renderEndSemaphore[i], NULL);
+      vkDestroyFence(m_Test->device, imageFences[i], NULL);
     }
 
     if(surface)
@@ -1597,8 +1630,12 @@ void VulkanWindow::Acquire()
 
   semIdx = (semIdx + 1) % ARRAY_COUNT(renderStartSemaphore);
 
+  // acquire next image stupidly does not properly block, do a manual block
+  vkWaitForFences(m_Test->device, 1, &imageFences[semIdx], VK_FALSE, UINT64_MAX);
+  vkResetFences(m_Test->device, 1, &imageFences[semIdx]);
+
   VkResult vkr = vkAcquireNextImageKHR(m_Test->device, swap, UINT64_MAX,
-                                       renderStartSemaphore[semIdx], VK_NULL_HANDLE, &imgIndex);
+                                       renderStartSemaphore[semIdx], imageFences[semIdx], &imgIndex);
 
   if(vkr == VK_SUBOPTIMAL_KHR || vkr == VK_ERROR_OUT_OF_DATE_KHR)
   {
@@ -1795,6 +1832,16 @@ AllocatedBuffer::AllocatedBuffer(VulkanGraphicsTest *test, const VkBufferCreateI
   vmaCreateBuffer(allocator, &bufInfo, &allocInfo, &buffer, &alloc, NULL);
 
   test->bufferAllocs[buffer] = alloc;
+
+  if(bufInfo.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+  {
+    VkBufferDeviceAddressInfoKHR info = {
+        VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_KHR,
+        NULL,
+        buffer,
+    };
+    address = vkGetBufferDeviceAddressKHR(test->device, &info);
+  }
 }
 
 void AllocatedBuffer::free()

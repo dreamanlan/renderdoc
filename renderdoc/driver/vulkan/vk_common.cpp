@@ -189,6 +189,8 @@ VkObjectType objType<VkFramebuffer>()
 void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, uint32_t ringSize,
                        uint32_t flags)
 {
+  RDCASSERT(size > 0 && ringSize > 0, size, ringSize);
+
   m_pDriver = driver;
   device = dev;
   createFlags = flags;
@@ -233,11 +235,11 @@ void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, u
   if(flags & eGPUBufferAddressable)
     bufInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
-  VkResult vkr = driver->vkCreateBuffer(dev, &bufInfo, NULL, &buf);
+  VkResult vkr = ObjDisp(dev)->CreateBuffer(Unwrap(dev), &bufInfo, NULL, &buf);
   CHECK_VKR(driver, vkr);
 
   VkMemoryRequirements mrq = {};
-  driver->vkGetBufferMemoryRequirements(dev, buf, &mrq);
+  ObjDisp(dev)->GetBufferMemoryRequirements(Unwrap(dev), buf, &mrq);
 
   VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mrq.size, 0};
 
@@ -257,19 +259,19 @@ void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, u
     memFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
   }
 
-  vkr = driver->vkAllocateMemory(dev, &allocInfo, NULL, &mem);
+  vkr = ObjDisp(dev)->AllocateMemory(Unwrap(dev), &allocInfo, NULL, &mem);
   CHECK_VKR(driver, vkr);
 
   if(vkr != VK_SUCCESS)
     return;
 
-  vkr = driver->vkBindBufferMemory(dev, buf, mem, 0);
+  vkr = ObjDisp(dev)->BindBufferMemory(Unwrap(dev), buf, mem, 0);
   CHECK_VKR(driver, vkr);
 }
 
 void GPUBuffer::FillDescriptor(VkDescriptorBufferInfo &desc)
 {
-  desc.buffer = Unwrap(buf);
+  desc.buffer = buf;
   desc.offset = 0;
   desc.range = sz;
 }
@@ -278,8 +280,8 @@ void GPUBuffer::Destroy()
 {
   if(device != VK_NULL_HANDLE)
   {
-    m_pDriver->vkDestroyBuffer(device, buf, NULL);
-    m_pDriver->vkFreeMemory(device, mem, NULL);
+    ObjDisp(device)->DestroyBuffer(Unwrap(device), buf, NULL);
+    ObjDisp(device)->FreeMemory(Unwrap(device), mem, NULL);
   }
 }
 
@@ -314,7 +316,7 @@ void *GPUBuffer::Map(uint32_t *bindoffset, VkDeviceSize usedsize)
   }
 
   void *ptr = NULL;
-  VkResult vkr = m_pDriver->vkMapMemory(device, mem, offset, size, 0, (void **)&ptr);
+  VkResult vkr = ObjDisp(device)->MapMemory(Unwrap(device), mem, offset, size, 0, (void **)&ptr);
   CHECK_VKR(m_pDriver, vkr);
 
   if(!ptr)
@@ -329,7 +331,7 @@ void *GPUBuffer::Map(uint32_t *bindoffset, VkDeviceSize usedsize)
         VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, mem, offset, size,
     };
 
-    vkr = m_pDriver->vkInvalidateMappedMemoryRanges(device, 1, &range);
+    vkr = ObjDisp(device)->InvalidateMappedMemoryRanges(Unwrap(device), 1, &range);
     CHECK_VKR(m_pDriver, vkr);
   }
 
@@ -355,11 +357,11 @@ void GPUBuffer::Unmap()
         VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, mem, mapoffset, VK_WHOLE_SIZE,
     };
 
-    VkResult vkr = m_pDriver->vkFlushMappedMemoryRanges(device, 1, &range);
+    VkResult vkr = ObjDisp(device)->FlushMappedMemoryRanges(Unwrap(device), 1, &range);
     CHECK_VKR(m_pDriver, vkr);
   }
 
-  m_pDriver->vkUnmapMemory(device, mem);
+  ObjDisp(device)->UnmapMemory(Unwrap(device), mem);
 }
 
 bool VkInitParams::IsSupportedVersion(uint64_t ver)
@@ -1364,6 +1366,108 @@ void DescriptorSetSlot::AccumulateBindRefs(DescriptorBindRefs &refs, VulkanResou
   {
     AddBindFrameRef(refs, resource, eFrameRef_Read);
   }
+}
+
+void DynamicRenderingLocalRead::Init(const VkBaseInStructure *infoStruct)
+{
+  const VkRenderingAttachmentLocationInfoKHR *attachmentLocationInfo =
+      (const VkRenderingAttachmentLocationInfoKHR *)FindNextStruct(
+          infoStruct, VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR);
+  if(attachmentLocationInfo != NULL)
+  {
+    UpdateLocations(*attachmentLocationInfo);
+  }
+
+  const VkRenderingInputAttachmentIndexInfoKHR *inputAttachmentIndexInfo =
+      (const VkRenderingInputAttachmentIndexInfoKHR *)FindNextStruct(
+          infoStruct, VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR);
+  if(inputAttachmentIndexInfo != NULL)
+  {
+    UpdateInputIndices(*inputAttachmentIndexInfo);
+  }
+}
+
+void DynamicRenderingLocalRead::UpdateLocations(
+    const VkRenderingAttachmentLocationInfoKHR &attachmentLocationInfo)
+{
+  // If NULL is given, an identity mapping is assumed.  This is indicated by an empty
+  // array.  This works out because not providing VkRenderingAttachmentLocationInfoKHR has the
+  // same meaning.
+  if(attachmentLocationInfo.pColorAttachmentLocations == NULL)
+  {
+    colorAttachmentLocations.clear();
+  }
+  else
+  {
+    colorAttachmentLocations.assign(attachmentLocationInfo.pColorAttachmentLocations,
+                                    attachmentLocationInfo.colorAttachmentCount);
+  }
+}
+
+void DynamicRenderingLocalRead::UpdateInputIndices(
+    const VkRenderingInputAttachmentIndexInfoKHR &inputAttachmentIndexInfo)
+{
+  // If NULL is given, an identity mapping is assumed.  This is indicated by an empty
+  // array.  This works out because not providing VkRenderingInputAttachmentIndexInfoKHR has the
+  // same meaning.
+  if(inputAttachmentIndexInfo.pColorAttachmentInputIndices == NULL)
+  {
+    colorAttachmentInputIndices.clear();
+  }
+  else
+  {
+    colorAttachmentInputIndices.assign(inputAttachmentIndexInfo.pColorAttachmentInputIndices,
+                                       inputAttachmentIndexInfo.colorAttachmentCount);
+  }
+  isDepthInputAttachmentIndexImplicit = inputAttachmentIndexInfo.pDepthInputAttachmentIndex == NULL;
+  isStencilInputAttachmentIndexImplicit =
+      inputAttachmentIndexInfo.pStencilInputAttachmentIndex == NULL;
+  if(!isDepthInputAttachmentIndexImplicit)
+  {
+    depthInputAttachmentIndex = *inputAttachmentIndexInfo.pDepthInputAttachmentIndex;
+  }
+  if(!isStencilInputAttachmentIndexImplicit)
+  {
+    stencilInputAttachmentIndex = *inputAttachmentIndexInfo.pStencilInputAttachmentIndex;
+  }
+}
+
+void DynamicRenderingLocalRead::CopyLocations(const DynamicRenderingLocalRead &from)
+{
+  colorAttachmentLocations = from.colorAttachmentLocations;
+}
+
+void DynamicRenderingLocalRead::CopyInputIndices(const DynamicRenderingLocalRead &from)
+{
+  colorAttachmentInputIndices = from.colorAttachmentInputIndices;
+  isDepthInputAttachmentIndexImplicit = from.isDepthInputAttachmentIndexImplicit;
+  isStencilInputAttachmentIndexImplicit = from.isStencilInputAttachmentIndexImplicit;
+  depthInputAttachmentIndex = from.depthInputAttachmentIndex;
+  stencilInputAttachmentIndex = from.stencilInputAttachmentIndex;
+}
+
+void DynamicRenderingLocalRead::SetLocations(VkCommandBuffer cmd)
+{
+  VkRenderingAttachmentLocationInfoKHR attachmentLocations = {};
+  attachmentLocations.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR;
+  attachmentLocations.colorAttachmentCount = colorAttachmentLocations.count();
+  attachmentLocations.pColorAttachmentLocations = colorAttachmentLocations.data();
+
+  ObjDisp(cmd)->CmdSetRenderingAttachmentLocationsKHR(Unwrap(cmd), &attachmentLocations);
+}
+
+void DynamicRenderingLocalRead::SetInputIndices(VkCommandBuffer cmd)
+{
+  VkRenderingInputAttachmentIndexInfoKHR inputIndices = {};
+  inputIndices.sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR;
+  inputIndices.colorAttachmentCount = colorAttachmentInputIndices.count();
+  inputIndices.pColorAttachmentInputIndices = colorAttachmentInputIndices.data();
+  inputIndices.pDepthInputAttachmentIndex =
+      isDepthInputAttachmentIndexImplicit ? NULL : &depthInputAttachmentIndex;
+  inputIndices.pStencilInputAttachmentIndex =
+      isStencilInputAttachmentIndexImplicit ? NULL : &stencilInputAttachmentIndex;
+
+  ObjDisp(cmd)->CmdSetRenderingInputAttachmentIndicesKHR(Unwrap(cmd), &inputIndices);
 }
 
 #if ENABLED(ENABLE_UNIT_TESTS)

@@ -169,6 +169,10 @@ RWBuffer<float> unbounduav1 : register(u4);
 RWTexture2D<float> unbounduav2 : register(u5);
 
 RWBuffer<float> narrowtypeduav : register(u6);
+
+RWTexture2D<float4> floattexrwtest : register(u7);
+RWBuffer<int> intbufrwtest : register(u8);
+
 Buffer<float> narrowtypedsrv : register(t102);
 
 Buffer<float4> rgb_srv : register(t103);
@@ -178,6 +182,11 @@ SamplerState linearclamp : register(s0);
 StructuredBuffer<MyStruct> rootsrv : register(t20);
 StructuredBuffer<MyStruct> appendsrv : register(t40);
 Texture2D<float> dimtex_edge : register(t41);
+#if (SM_6_2 || SM_6_6) && HAS_16BIT_SHADER_OPS 
+StructuredBuffer<int16_t> int16srv : register(t42);
+#else
+Buffer<int> int16srv : register(t42);
+#endif
 
 float4 main(v2f IN) : SV_Target0
 {
@@ -193,7 +202,11 @@ float4 main(v2f IN) : SV_Target0
   int intval = IN.intval;
 
   if(IN.tri == 0)
+#if SM_6_2
+    return float4(int16srv[0].x, int16srv[1].x, int16srv[2].x, int16srv[3].x);
+#else
     return float4(log(negone), log(zero), log(posone), 1.0f);
+#endif
   if(IN.tri == 1)
     return float4(log(posinf), log(neginf), log(nan), 1.0f);
   if(IN.tri == 2)
@@ -742,6 +755,147 @@ float4 main(v2f IN) : SV_Target0
     float2 uv = posone * float2(0.55f, 0.48f);
     return smileyint.Load(int3(uv*16,0));
   }
+  if(IN.tri == 82)
+  {
+    uint f16_half = f32tof16(posone*0.5);
+    uint f16_one = f32tof16(posone*1.0);
+    uint f16_two = f32tof16(posone*2.0);
+    return float4(f16tof32(f16_half), f16tof32(f16_one), f16tof32(f16_two), 0.0f);
+  }
+  if(IN.tri == 83)
+  {
+    float4 value = float4(posone, posone/3, posone/4, posone/5);
+    int2 uv = int2(31,37);
+    floattexrwtest[uv] = value;
+    return floattexrwtest[uv];
+  }
+  if(IN.tri == 84)
+  {
+    return float4(int16srv[0].x, int16srv[1].x, int16srv[2].x, int16srv[3].x);
+  }
+  if(IN.tri == 85)
+  {
+    int value = IN.tri;
+    int original;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 10;
+    InterlockedAdd(intbufrwtest[u], value, original);
+    InterlockedAdd(intbufrwtest[u], -value, original);
+    return intbufrwtest[u];
+  }
+  if(IN.tri == 86)
+  {
+    int value = IN.tri;
+    int original;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 20;
+    InterlockedAnd(intbufrwtest[u], value, original);
+    return intbufrwtest[u];
+  }
+  if(IN.tri == 87)
+  {
+    int value = IN.tri;
+    int original;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 30;
+    InterlockedOr(intbufrwtest[u], value, original);
+    return intbufrwtest[u];
+  }
+  if(IN.tri == 88)
+  {
+    int value = IN.tri;
+    int original;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 40;
+    InterlockedXor(intbufrwtest[u], value, original);
+    InterlockedXor(intbufrwtest[u], value, original);
+    return intbufrwtest[u];
+  }
+  if(IN.tri == 89)
+  {
+    int value = IN.tri;
+    int original;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 50;
+    InterlockedMin(intbufrwtest[u], value, original);
+    return intbufrwtest[u];
+  }
+  if(IN.tri == 90)
+  {
+    int value = IN.tri;
+    int original;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 60;
+    InterlockedMax(intbufrwtest[u], value, original);
+    return intbufrwtest[u];
+  }
+  if(IN.tri == 91)
+  {
+    int value = IN.tri;
+    int original;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 70;
+    InterlockedExchange(intbufrwtest[u], value, original);
+    return intbufrwtest[u];
+  }
+  if(IN.tri == 92)
+  {
+    int value = IN.tri;
+    int original;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 80;
+    InterlockedCompareExchange(intbufrwtest[u], value, value+1, original);
+    return intbufrwtest[u];
+  }
+  if(IN.tri == 93)
+  {
+    int value = IN.tri;
+    int u = mad(3, (IN.tri - 85), 17);
+    intbufrwtest[u] = 90;
+    InterlockedCompareStore(intbufrwtest[u], value, value+1);
+    return intbufrwtest[u];
+  }
+#if SM_6_6
+  if(IN.tri == 94)
+  {
+    uint a = IN.tri - 94 + 0x01020304;
+    uint b = IN.tri - 94 + 0x05060708;
+    uint c = IN.tri - 94 + 0x090a0b0c;
+    uint res = dot4add_i8packed(a, b, c);
+    return float4(res & 0xFF, (res >> 8) & 0xFF, (res >> 16) & 0xFF, (res >> 24) & 0xFF);
+  }
+  if(IN.tri == 95)
+  {
+    uint a = IN.tri - 94 + 0x01020304;
+    uint b = IN.tri - 94 + 0x05060708;
+    uint c = IN.tri - 94 + 0x090a0b0c;
+    uint res = dot4add_u8packed(a, b, c);
+    return float4(res & 0xFF, (res >> 8) & 0xFF, (res >> 16) & 0xFF, (res >> 24) & 0xFF);
+  }
+  if(IN.tri == 96)
+  {
+    half2 a = half2(IN.tri - 96 + 0.25f, IN.tri - 96 + 0.5f);
+    half2 b = half2(IN.tri - 96 + 0.5f, IN.tri - 96 + 0.25f);
+    float c = IN.tri - 96 + 0.3f;
+    return dot2add(a, b, c);
+  }
+  if(IN.tri == 97)
+  {
+    int val = IN.tri - 97;
+    int4 raw = int4(val-200, val+1, val+200, val+3);
+    uint packed = pack_clamp_u8(raw);
+    int4 unpacked = unpack_s8s32(packed);
+    return float4(unpacked.x, unpacked.y, unpacked.z, unpacked.w);
+  }
+  if(IN.tri == 98)
+  {
+    int val = IN.tri - 97;
+    int4 raw = int4(val, val+100, val+200, val+300);
+    int packed = pack_s8(raw);
+    uint4 unpacked = unpack_u8u32(packed);
+    return float4(unpacked.x, unpacked.y, unpacked.z, unpacked.w);
+  }
+#endif // #if SM_6_6
 
   return float4(0.4f, 0.4f, 0.4f, 0.4f);
 }
@@ -809,8 +963,13 @@ void main()
       return 3;
 
     bool supportSM60 = (m_HighestShaderModel >= D3D_SHADER_MODEL_6_0) && m_DXILSupport;
+    bool supportSM62 = (m_HighestShaderModel >= D3D_SHADER_MODEL_6_2) && m_DXILSupport;
     bool supportSM66 = (m_HighestShaderModel >= D3D_SHADER_MODEL_6_6) && m_DXILSupport;
-    TEST_ASSERT(!supportSM66 || supportSM60, "SM 6.6 requires SM 6.0 support");
+    TEST_ASSERT(!supportSM62 || supportSM60, "SM 6.2 requires SM 6.0 support");
+    TEST_ASSERT(!supportSM66 || supportSM62, "SM 6.6 requires SM 6.2 support");
+
+    std::string shaderDefines =
+        opts4.Native16BitShaderOpsSupported ? "#define HAS_16BIT_SHADER_OPS 1\n" : "";
 
     size_t lastTest = pixel.rfind("IN.tri == ");
     lastTest += sizeof("IN.tri == ") - 1;
@@ -878,7 +1037,7 @@ void main()
     staticSamp.AddressU = staticSamp.AddressV = staticSamp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     staticSamp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-    D3D12_DESCRIPTOR_RANGE1 multiRanges[3] = {
+    D3D12_DESCRIPTOR_RANGE1 multiRanges[4] = {
         {
             D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             2,
@@ -906,6 +1065,15 @@ void main()
                 D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
             D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
         },
+        {
+            D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            1,
+            42,
+            0,
+            D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE |
+                D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            42,
+        },
     };
     D3D12_ROOT_PARAMETER1 multiRangeParam;
     multiRangeParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
@@ -918,7 +1086,7 @@ void main()
             tableParam(D3D12_SHADER_VISIBILITY_PIXEL, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 0, 8, 0),
             tableParam(D3D12_SHADER_VISIBILITY_PIXEL, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 1, 2, 10),
             tableParam(D3D12_SHADER_VISIBILITY_PIXEL, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 100, 5, 20),
-            tableParam(D3D12_SHADER_VISIBILITY_PIXEL, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 4, 3, 30),
+            tableParam(D3D12_SHADER_VISIBILITY_PIXEL, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 4, 5, 30),
             multiRangeParam,
             uavParam(D3D12_SHADER_VISIBILITY_PIXEL, 0, 21),
             srvParam(D3D12_SHADER_VISIBILITY_PIXEL, 0, 20),
@@ -941,32 +1109,48 @@ void main()
                                          .PS(psblob)
                                          .RTVs({DXGI_FORMAT_R32G32B32A32_FLOAT});
 
-    ID3D12PipelineStatePtr psos[4] = {pso_5_0, pso_5_1, NULL, NULL};
+    ID3D12PipelineStatePtr pso_6_0 = NULL;
+    ID3D12PipelineStatePtr pso_6_2 = NULL;
+    ID3D12PipelineStatePtr pso_6_6 = NULL;
 
-    // Recompile with SM 6.0 and SM 6.6
+    // Recompile with SM 6.0, SM 6.2 and SM 6.6
+    uint32_t compileOptions = CompileOptionFlags::SkipOptimise | CompileOptionFlags::Enable16BitTypes;
     if(supportSM60)
     {
       vsblob = Compile(common + vertex, "main", "vs_6_0");
-      psblob = Compile(common + "\n#define SM_6_0 1\n" + pixel, "main", "ps_6_0");
-      psos[2] = MakePSO()
+      psblob = Compile(common + "\n#define SM_6_0 1\n" + shaderDefines + pixel, "main", "ps_6_0");
+      pso_6_0 = MakePSO()
                     .RootSig(sig)
                     .InputLayout(inputLayout)
                     .VS(vsblob)
                     .PS(psblob)
                     .RTVs({DXGI_FORMAT_R32G32B32A32_FLOAT});
     }
-
+    if(supportSM62)
+    {
+      vsblob = Compile(common + vertex, "main", "vs_6_2");
+      psblob = Compile(common + "\n#define SM_6_2 1\n" + shaderDefines + pixel, "main", "ps_6_2",
+                       compileOptions);
+      pso_6_2 = MakePSO()
+                    .RootSig(sig)
+                    .InputLayout(inputLayout)
+                    .VS(vsblob)
+                    .PS(psblob)
+                    .RTVs({DXGI_FORMAT_R32G32B32A32_FLOAT});
+    }
     if(supportSM66)
     {
       vsblob = Compile(common + vertex, "main", "vs_6_6");
-      psblob = Compile(common + "\n#define SM_6_6 1\n" + pixel, "main", "ps_6_6");
-      psos[3] = MakePSO()
+      psblob = Compile(common + "\n#define SM_6_6 1\n" + shaderDefines + pixel, "main", "ps_6_6",
+                       compileOptions);
+      pso_6_6 = MakePSO()
                     .RootSig(sig)
                     .InputLayout(inputLayout)
                     .VS(vsblob)
                     .PS(psblob)
                     .RTVs({DXGI_FORMAT_R32G32B32A32_FLOAT});
     }
+    ID3D12PipelineStatePtr psos[5] = {pso_5_0, pso_5_1, pso_6_0, pso_6_2, pso_6_6};
 
     static const uint32_t texDim = AlignUp(numTests, 64U) * 4;
 
@@ -1002,6 +1186,13 @@ void main()
 
     ID3D12ResourcePtr srvBuf = MakeBuffer().Data(testdata);
     MakeSRV(srvBuf).Format(DXGI_FORMAT_R32_FLOAT).CreateGPU(0);
+
+    int16_t test16data[] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    };
+
+    ID3D12ResourcePtr srv16Buf = MakeBuffer().Data(test16data);
+    MakeSRV(srv16Buf).Format(DXGI_FORMAT_R16_SINT).CreateGPU(42);
 
     ID3D12ResourcePtr testTex = MakeTexture(DXGI_FORMAT_R32G32B32A32_FLOAT, 16, 16).Mips(3);
 
@@ -1039,7 +1230,8 @@ void main()
 
     ID3D12ResourcePtr smiley = MakeTexture(DXGI_FORMAT_R8G8B8A8_TYPELESS, 48, 48)
                                    .Mips(1)
-                                   .InitialState(D3D12_RESOURCE_STATE_COPY_DEST);
+                                   .InitialState(D3D12_RESOURCE_STATE_COPY_DEST)
+                                   .UAV();
 
     ID3D12ResourcePtr uploadBuf = MakeBuffer().Size(1024 * 1024).Upload();
     ID3D12ResourcePtr constBuf = MakeBuffer().Size(256).Upload();
@@ -1123,6 +1315,10 @@ void main()
     ID3D12ResourcePtr narrowtypedbuf = MakeBuffer().UAV().Data(narrowdata);
     MakeSRV(narrowtypedbuf).Format(DXGI_FORMAT_R16_FLOAT).CreateGPU(22);
     MakeUAV(narrowtypedbuf).Format(DXGI_FORMAT_R16_FLOAT).CreateGPU(32);
+
+    MakeUAV(smiley).Format(DXGI_FORMAT_R8G8B8A8_UNORM).CreateGPU(33);
+    ID3D12ResourcePtr atomicBuffer = MakeBuffer().Size(1024).UAV();
+    MakeUAV(atomicBuffer).Format(DXGI_FORMAT_R32_UINT).CreateGPU(34);
 
     float structdata[220];
     for(int i = 0; i < 220; i++)
@@ -1345,17 +1541,21 @@ void main()
 
       setMarker(cmd, undefined_tests);
 
-      float blitOffsets[4] = {0.0f, 4.0f, 8.0f, 12.0f};
-      D3D12_RECT scissors[4] = {
-          {0, 0, (int)texDim, 4},
-          {0, 4, (int)texDim, 8},
-          {0, 8, (int)texDim, 12},
-          {0, 12, (int)texDim, 16},
+      float blitOffsets[5] = {0.0f, 4.0f, 8.0f, 12.0f, 16.0f};
+      D3D12_RECT scissors[5] = {
+          {0, 0, (int)texDim, 4},   {0, 4, (int)texDim, 8},   {0, 8, (int)texDim, 12},
+          {0, 12, (int)texDim, 16}, {0, 16, (int)texDim, 20},
       };
-      const char *markers[4] = {"sm_5_0", "sm_5_1", "sm_6_0", "sm_6_6"};
+      const char *markers[5] = {"sm_5_0", "sm_5_1", "sm_6_0", "sm_6_2", "sm_6_6"};
 
-      // Clear, draw, and blit to backbuffer twice - once for each SM 5.0, 5.1, 6.0, 6.6
-      size_t countGraphicsPasses = supportSM66 ? 4 : (supportSM60 ? 3 : 2);
+      // Clear, draw, and blit to backbuffer - once for each SM 5.0, 5.1, 6.0, 6.2, 6.6
+      size_t countGraphicsPasses = 2;
+      if(supportSM60)
+        countGraphicsPasses++;
+      if(supportSM62)
+        countGraphicsPasses++;
+      if(supportSM66)
+        countGraphicsPasses++;
       TEST_ASSERT(countGraphicsPasses <= ARRAY_COUNT(psos), "More graphic passes than psos");
       for(size_t i = 0; i < countGraphicsPasses; ++i)
       {
@@ -1387,7 +1587,8 @@ void main()
 
         // Add a marker so we can easily locate this draw
         setMarker(cmd, markers[i]);
-        cmd->DrawInstanced(3, numTests, 0, 0);
+        uint32_t instanceCount = (strcmp(markers[i], "sm_6_2") == 0) ? 1 : numTests;
+        cmd->DrawInstanced(3, instanceCount, 0, 0);
 
         ResourceBarrier(cmd, fltTex, D3D12_RESOURCE_STATE_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

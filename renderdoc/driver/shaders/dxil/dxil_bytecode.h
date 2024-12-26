@@ -60,13 +60,18 @@ enum class FunctionFamily : uint8_t
   LLVM,
   DXOp,
   LLVMDbg,
+  LLVMInstrinsic,
 };
 
-enum class LLVMDbgOp : uint8_t
+enum class LLVMIntrinsicOp : uint8_t
 {
   Unknown = 0,
-  Declare,
-  Value,
+  DbgDeclare,
+  DbgValue,
+  LifetimeStart,
+  LifetimeEnd,
+  InvariantStart,
+  InvariantEnd,
 };
 
 struct BumpAllocator
@@ -613,6 +618,41 @@ enum class AtomicBinOpCode : uint32_t
   Invalid    // Must be last.
 };
 
+enum class QuadOpKind : uint32_t
+{
+  ReadAcrossX = 0,           // returns the value from the other lane in the quad in the
+                             // horizontal direction
+  ReadAcrossY = 1,           // returns the value from the other lane in the quad in the
+                             // vertical direction
+  ReadAcrossDiagonal = 2,    // returns the value from the lane across the quad in
+                             // horizontal and vertical direction
+};
+
+// Packing/unpacking intrinsics
+enum class UnpackMode : uint32_t
+{
+  Unsigned = 0,    // not sign extended
+  Signed = 1,      // sign extended
+};
+
+enum class PackMode : uint32_t
+{
+  Trunc = 0,     // Pack low bits, drop the rest
+  UClamp = 1,    // Unsigned clamp - [0, 255] for 8-bits
+  SClamp = 2,    // Signed clamp - [-128, 127] for 8-bits
+};
+
+enum class BarrierMode : uint32_t
+{
+  Invalid = 0,
+  SyncThreadGroup = 0x00000001,
+  UAVFenceGlobal = 0x00000002,
+  UAVFenceThreadGroup = 0x00000004,
+  TGSMFence = 0x00000008,
+};
+
+BITMASK_OPERATORS(BarrierMode);
+
 inline Operation DecodeBinOp(const Type *type, uint64_t opcode)
 {
   bool isFloatOp = (type->scalarType == Type::Float);
@@ -947,6 +987,8 @@ struct Constant : public ForwardReferencableValue<Constant>
   rdcstr str;
   // used during encoding to sort constants by number of uses...
   uint32_t refCount = 0;
+  // unique global ID used by the debugger and disassembly similar to Instruction member variable slot
+  uint32_t ssaId = ~0U;
 
   bool isUndef() const { return (flags & 0x1) != 0; }
   bool isNULL() const { return (flags & 0x2) != 0; }
@@ -1386,7 +1428,7 @@ struct Function : public Value
   AttachedMetadata attachedMeta;
 
   FunctionFamily family = FunctionFamily::Unknown;
-  LLVMDbgOp llvmDbgOp = LLVMDbgOp::Unknown;
+  LLVMIntrinsicOp llvmIntrinsicOp = LLVMIntrinsicOp::Unknown;
 };
 
 class LLVMOrderAccumulator
@@ -1436,6 +1478,7 @@ private:
 
 struct EntryPointInterface
 {
+  explicit EntryPointInterface() = default;
   EntryPointInterface(const Metadata *entryPoint);
 
   struct Signature
@@ -1562,6 +1605,7 @@ public:
   void FetchEntryPoint();
   DXBC::Reflection *BuildReflection();
   rdcstr GetDebugStatus();
+  const DXIL::EntryPointInterface *GetEntryPointInterface() const;
   rdcarray<ShaderEntryPoint> GetEntryPoints();
   void FillEntryPointInterfaces();
   size_t GetInstructionCount() const;
@@ -1617,11 +1661,13 @@ protected:
   uint32_t GetMetaSlot(const DebugLocation *l) const;
   void AssignMetaSlot(rdcarray<Metadata *> &metaSlots, uint32_t &nextMetaSlot, DebugLocation &l);
 
-  const ResourceReference *GetResourceReference(const rdcstr &handleStr) const;
+  const ResourceReference *GetResourceReference(const DXILDebug::Id handleId) const;
   rdcstr GetHandleAlias(const rdcstr &handleStr) const;
+  static DXILDebug::Id GetResultSSAId(const DXIL::Instruction &inst);
   static void MakeResultId(const Instruction &inst, rdcstr &resultId);
   rdcstr GetArgId(const Instruction &inst, uint32_t arg) const;
   rdcstr GetArgId(const Value *v) const;
+  rdcstr GetArgumentName(const Value *v) const;
 
   const Metadata *FindMetadata(uint32_t slot) const;
   rdcstr ArgToString(const Value *v, bool withTypes, const rdcstr &attrString = "") const;
@@ -1692,7 +1738,7 @@ protected:
   rdcstr m_Triple, m_Datalayout;
 
   rdcarray<EntryPointInterface> m_EntryPointInterfaces;
-  std::map<rdcstr, size_t> m_ResourceHandles;
+  std::map<DXILDebug::Id, size_t> m_ResourceByIdHandles;
   std::map<rdcstr, rdcstr> m_SsaAliases;
   std::map<rdcstr, uint32_t> m_ResourceAnnotateCounts;
   rdcarray<LocalSourceVariable> m_Locals;
@@ -1726,21 +1772,32 @@ bool getival(const Value *v, T &out)
   return false;
 }
 
+bool FindSigParameter(const rdcarray<SigParameter> &inputSig,
+                      const EntryPointInterface::Signature &dxilParam, SigParameter &sigParam);
 bool IsSSA(const Value *dxilValue);
 DXILDebug::Id GetSSAId(const DXIL::Value *value);
 bool IsDXCNop(const Instruction &inst);
 bool IsLLVMDebugCall(const Instruction &inst);
+bool IsLLVMIntrinsicCall(const Instruction &inst);
+bool ShouldIgnoreSourceMapping(const Instruction &inst);
 
 bool isUndef(const Value *v);
+
+void SanitiseName(rdcstr &name);
 
 };    // namespace DXIL
 
 DECLARE_REFLECTION_ENUM(DXIL::Attribute);
 DECLARE_STRINGISE_TYPE(DXIL::InstructionFlags);
 DECLARE_STRINGISE_TYPE(DXIL::AtomicBinOpCode);
+DECLARE_STRINGISE_TYPE(DXIL::QuadOpKind);
+DECLARE_STRINGISE_TYPE(DXIL::PackMode);
+DECLARE_STRINGISE_TYPE(DXIL::UnpackMode);
 DECLARE_STRINGISE_TYPE(DXIL::Operation);
 DECLARE_STRINGISE_TYPE(DXIL::DXOp);
 DECLARE_STRINGISE_TYPE(DXIL::Type::TypeKind);
 DECLARE_STRINGISE_TYPE(DXIL::Type::ScalarKind);
-DECLARE_STRINGISE_TYPE(DXIL::LLVMDbgOp);
+DECLARE_STRINGISE_TYPE(DXIL::LLVMIntrinsicOp);
 DECLARE_STRINGISE_TYPE(DXIL::DIBase::Type);
+DECLARE_STRINGISE_TYPE(DXIL::ValueKind);
+DECLARE_STRINGISE_TYPE(DXIL::BarrierMode);

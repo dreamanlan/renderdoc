@@ -38,6 +38,80 @@ using namespace DXILDebug;
 
 namespace DXILDebug
 {
+static DXBC::ResourceRetType ConvertCompTypeToResourceRetType(const CompType compType)
+{
+  switch(compType)
+  {
+    case CompType::Float: return DXBC::ResourceRetType::RETURN_TYPE_FLOAT;
+    case CompType::UNormSRGB:
+    case CompType::UNorm: return DXBC::ResourceRetType::RETURN_TYPE_UNORM;
+    case CompType::SNorm: return DXBC::ResourceRetType::RETURN_TYPE_SNORM;
+    case CompType::UInt: return DXBC::ResourceRetType::RETURN_TYPE_UINT;
+    case CompType::SInt: return DXBC::ResourceRetType::RETURN_TYPE_SINT;
+    case CompType::Typeless:
+    case CompType::UScaled:
+    case CompType::SScaled:
+    case CompType::Depth:
+    default:
+      RDCERR("Unexpected component type %s", ToStr(compType).c_str());
+      return DXBC::ResourceRetType ::RETURN_TYPE_UNKNOWN;
+  }
+}
+
+static DXBCBytecode::ResourceDimension ConvertSRVResourceDimensionToResourceDimension(
+    D3D12_SRV_DIMENSION dim)
+{
+  switch(dim)
+  {
+    case D3D12_SRV_DIMENSION_UNKNOWN:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_UNKNOWN;
+    case D3D12_SRV_DIMENSION_BUFFER:
+      return DXBCBytecode::ResourceDimension ::RESOURCE_DIMENSION_BUFFER;
+    case D3D12_SRV_DIMENSION_TEXTURE1D:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURE1D;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURE1DARRAY;
+    case D3D12_SRV_DIMENSION_TEXTURE2D:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURE2D;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURE2DARRAY;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMS:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURE2DMS;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURE2DMSARRAY;
+    case D3D12_SRV_DIMENSION_TEXTURE3D:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURE3D;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURECUBE;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_TEXTURECUBEARRAY;
+    default:
+      RDCERR("Unexpected SRV dimension %s", ToStr(dim).c_str());
+      return DXBCBytecode::ResourceDimension::RESOURCE_DIMENSION_UNKNOWN;
+  }
+}
+
+static DXDebug::SamplerMode ConvertSamplerFilterToSamplerMode(D3D12_FILTER filter)
+{
+  switch(filter)
+  {
+    case D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT:
+    case D3D12_FILTER_COMPARISON_MIN_MAG_POINT_MIP_LINEAR:
+    case D3D12_FILTER_COMPARISON_MIN_POINT_MAG_LINEAR_MIP_POINT:
+    case D3D12_FILTER_COMPARISON_MIN_POINT_MAG_MIP_LINEAR:
+    case D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_MIP_POINT:
+    case D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR:
+    case D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT:
+    case D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR:
+    case D3D12_FILTER_COMPARISON_MIN_MAG_ANISOTROPIC_MIP_POINT:
+    case D3D12_FILTER_COMPARISON_ANISOTROPIC:
+      return DXBCBytecode::SamplerMode::SAMPLER_MODE_COMPARISON;
+      break;
+    default: break;
+  }
+  return DXBCBytecode::SamplerMode::SAMPLER_MODE_DEFAULT;
+}
+
 static bool IsShaderParameterVisible(DXBC::ShaderType shaderType,
                                      D3D12_SHADER_VISIBILITY shaderVisibility)
 {
@@ -60,79 +134,60 @@ static bool IsShaderParameterVisible(DXBC::ShaderType shaderType,
   return false;
 }
 
-static void FillViewFmt(DXGI_FORMAT format, GlobalState::ViewFmt &viewFmt)
+static void FillViewFmtFromResourceFormat(DXGI_FORMAT format, GlobalState::ViewFmt &viewFmt)
 {
-  if(format != DXGI_FORMAT_UNKNOWN)
-  {
-    ResourceFormat fmt = MakeResourceFormat(format);
+  RDCASSERT(format != DXGI_FORMAT_UNKNOWN);
+  ResourceFormat fmt = MakeResourceFormat(format);
 
-    viewFmt.byteWidth = fmt.compByteWidth;
-    viewFmt.numComps = fmt.compCount;
-    viewFmt.fmt = fmt.compType;
+  viewFmt.byteWidth = fmt.compByteWidth;
+  viewFmt.numComps = fmt.compCount;
+  viewFmt.compType = fmt.compType;
 
-    if(format == DXGI_FORMAT_R11G11B10_FLOAT)
-      viewFmt.byteWidth = 11;
-    else if(format == DXGI_FORMAT_R10G10B10A2_UINT || format == DXGI_FORMAT_R10G10B10A2_UNORM)
-      viewFmt.byteWidth = 10;
-  }
+  if(format == DXGI_FORMAT_R11G11B10_FLOAT)
+    viewFmt.byteWidth = 11;
+  else if(format == DXGI_FORMAT_R10G10B10A2_UINT || format == DXGI_FORMAT_R10G10B10A2_UNORM)
+    viewFmt.byteWidth = 10;
+
+  if(viewFmt.byteWidth == 10 || viewFmt.byteWidth == 11)
+    viewFmt.stride = 4;    // 10 10 10 2 or 11 11 10
+  else
+    viewFmt.stride = viewFmt.byteWidth * viewFmt.numComps;
 }
 
-static void LookupUAVFormatFromShaderReflection(const DXBC::Reflection &reflection,
-                                                const BindingSlot &slot,
-                                                GlobalState::ViewFmt &viewFmt)
+// Only valid/used fo root descriptors
+// Root descriptors only have RawBuffer and StructuredBuffer types
+static uint32_t GetUAVBufferStrideFromShaderMetadata(const DXIL::EntryPointInterface *reflection,
+                                                     const BindingSlot &slot)
 {
-  for(const DXBC::ShaderInputBind &bind : reflection.UAVs)
+  for(const DXIL::EntryPointInterface::ResourceBase &bind : reflection->uavs)
   {
-    if(bind.reg == slot.shaderRegister && bind.space == slot.registerSpace &&
-       bind.dimension == DXBC::ShaderInputBind::DIM_BUFFER &&
-       bind.retType < DXBC::RETURN_TYPE_MIXED && bind.retType != DXBC::RETURN_TYPE_UNKNOWN)
+    if(bind.MatchesBinding(slot.shaderRegister, slot.shaderRegister, slot.registerSpace))
     {
-      viewFmt.byteWidth = 4;
-      viewFmt.numComps = bind.numComps;
-
-      if(bind.retType == DXBC::RETURN_TYPE_UNORM)
-        viewFmt.fmt = CompType::UNorm;
-      else if(bind.retType == DXBC::RETURN_TYPE_SNORM)
-        viewFmt.fmt = CompType::SNorm;
-      else if(bind.retType == DXBC::RETURN_TYPE_UINT)
-        viewFmt.fmt = CompType::UInt;
-      else if(bind.retType == DXBC::RETURN_TYPE_SINT)
-        viewFmt.fmt = CompType::SInt;
-      else
-        viewFmt.fmt = CompType::Float;
-
-      break;
+      if(bind.uavData.shape == ResourceKind::RawBuffer ||
+         bind.uavData.shape == ResourceKind::StructuredBuffer)
+      {
+        return bind.uavData.elementStride;
+      }
     }
   }
+  return 0;
 }
 
-static void LookupSRVFormatFromShaderReflection(const DXBC::Reflection &reflection,
-                                                const BindingSlot &slot,
-                                                GlobalState::ViewFmt &viewFmt)
+static uint32_t GetSRVBufferStrideFromShaderMetadata(const DXIL::EntryPointInterface *reflection,
+                                                     const BindingSlot &slot)
 {
-  for(const DXBC::ShaderInputBind &bind : reflection.SRVs)
+  for(const DXIL::EntryPointInterface::ResourceBase &bind : reflection->srvs)
   {
-    if(bind.reg == slot.shaderRegister && bind.space == slot.registerSpace &&
-       bind.dimension == DXBC::ShaderInputBind::DIM_BUFFER &&
-       bind.retType < DXBC::RETURN_TYPE_MIXED && bind.retType != DXBC::RETURN_TYPE_UNKNOWN)
+    if(bind.MatchesBinding(slot.shaderRegister, slot.shaderRegister, slot.registerSpace))
     {
-      viewFmt.byteWidth = 4;
-      viewFmt.numComps = bind.numComps;
-
-      if(bind.retType == DXBC::RETURN_TYPE_UNORM)
-        viewFmt.fmt = CompType::UNorm;
-      else if(bind.retType == DXBC::RETURN_TYPE_SNORM)
-        viewFmt.fmt = CompType::SNorm;
-      else if(bind.retType == DXBC::RETURN_TYPE_UINT)
-        viewFmt.fmt = CompType::UInt;
-      else if(bind.retType == DXBC::RETURN_TYPE_SINT)
-        viewFmt.fmt = CompType::SInt;
-      else
-        viewFmt.fmt = CompType::Float;
-
-      break;
+      if(bind.srvData.shape == ResourceKind::RawBuffer ||
+         bind.srvData.shape == ResourceKind::StructuredBuffer)
+      {
+        return bind.srvData.elementStride;
+      }
     }
   }
+  return 0;
 }
 
 static void FlattenSingleVariable(const rdcstr &cbufferName, uint32_t byteOffset,
@@ -150,9 +205,8 @@ static void FlattenSingleVariable(const rdcstr &cbufferName, uint32_t byteOffset
 
   if(outvars[outIdx].columns > 0)
   {
-    // if we already have a variable in this slot, just copy the data for this variable and add the
-    // source mapping.
-    // We should not overlap into the next register as that's not allowed.
+    // if we already have a variable in this slot, just copy the data for this variable and add
+    // the source mapping. We should not overlap into the next register as that's not allowed.
     memcpy(&outvars[outIdx].value.u32v[outComp], &v.value.u32v[0], sizeof(uint32_t) * v.columns);
 
     SourceVariableMapping mapping;
@@ -297,6 +351,7 @@ static void AddCBufferToGlobalState(const DXIL::Program *program, GlobalState &g
                                : global.constantBlocks[i].members;
       RDCASSERTMSG("Reassigning previously filled cbuffer", targetVars.empty());
 
+      global.constantBlocksData[i] = cbufData;
       global.constantBlocks[i].name =
           Debugger::GetResourceReferenceName(program, ResourceClass::CBuffer, slot);
 
@@ -445,36 +500,49 @@ InterpolationMode GetInterpolationModeForInputParam(const SigParameter &sig,
   if(sig.varType == VarType::SInt || sig.varType == VarType::UInt)
     return InterpolationMode::INTERPOLATION_CONSTANT;
 
-  if(sig.varType == VarType::Float)
+  if((sig.varType == VarType::Float) || (sig.varType == VarType::Half))
   {
-    // if we're packed with ints on either side, we must be nointerpolation
+    // if we're packed with a different type on either side, we must be nointerpolation
     size_t numInputs = stageInputSig.size();
     for(size_t j = 0; j < numInputs; j++)
     {
-      if(sig.regIndex == stageInputSig[j].regIndex && stageInputSig[j].varType != VarType::Float)
+      if(sig.regIndex == stageInputSig[j].regIndex && (stageInputSig[j].varType != sig.varType))
         return DXBC::InterpolationMode::INTERPOLATION_CONSTANT;
     }
 
-    InterpolationMode interpolation = DXBC::InterpolationMode::INTERPOLATION_UNDEFINED;
-
-    // TODO SEARCH THE DXIL PROGRAM INPUTS FOR THE INTERPOLATION MODE
-#if 0
-    if(program)
+    if(!program)
     {
-      for(size_t d = 0; d < program->GetNumDeclarations(); d++)
+      RDCERR("No DXIL program");
+      return DXBC::InterpolationMode::INTERPOLATION_UNDEFINED;
+    }
+    // Search the DXIL shader meta data to get the interpolation mode
+    const DXIL::EntryPointInterface *entryPoint = program->GetEntryPointInterface();
+    if(!entryPoint)
+    {
+      RDCERR("No entry point interface found in DXIL program");
+      return DXBC::InterpolationMode::INTERPOLATION_UNDEFINED;
+    }
+    for(size_t j = 0; j < entryPoint->inputs.size(); ++j)
+    {
+      const EntryPointInterface::Signature &dxilParam = entryPoint->inputs[j];
+      int row = sig.regIndex;
+      if((dxilParam.startRow <= row) && (row < (int)(dxilParam.startRow + dxilParam.rows)))
       {
-        const DXBCBytecode::Declaration &decl = program->GetDeclaration(d);
-
-        if(decl.declaration == DXBCBytecode::OPCODE_DCL_INPUT_PS &&
-           decl.operand.indices[0].absolute && decl.operand.indices[0].index == sig.regIndex)
+        const int firstElem = sig.regChannelMask & 0x1   ? 0
+                              : sig.regChannelMask & 0x2 ? 1
+                              : sig.regChannelMask & 0x4 ? 2
+                              : sig.regChannelMask & 0x8 ? 3
+                                                         : -1;
+        if(dxilParam.startCol == firstElem)
         {
-          interpolation = decl.inputOutput.inputInterpolation;
-          break;
+          if(sig.semanticName == dxilParam.name)
+          {
+            return (InterpolationMode)dxilParam.interpolation;
+          }
         }
       }
     }
-#endif
-    return interpolation;
+    return DXBC::InterpolationMode::INTERPOLATION_UNDEFINED;
   }
 
   RDCERR("Unexpected input signature type: %s", ToStr(sig.varType).c_str());
@@ -494,13 +562,12 @@ void GetInterpolationModeForInputParams(const rdcarray<SigParameter> &inputSig,
   }
 }
 
-D3D12APIWrapper::D3D12APIWrapper(WrappedID3D12Device *device,
-                                 const DXBC::DXBCContainer *dxbcContainer, GlobalState &globalState,
-                                 uint32_t eventId)
+D3D12APIWrapper::D3D12APIWrapper(WrappedID3D12Device *device, const DXIL::Program &dxilProgram,
+                                 GlobalState &globalState, uint32_t eventId)
     : m_Device(device),
-      m_DXBC(dxbcContainer),
+      m_EntryPointInterface(dxilProgram.GetEntryPointInterface()),
       m_GlobalState(globalState),
-      m_ShaderType(dxbcContainer->m_Type),
+      m_ShaderType(dxilProgram.GetShaderType()),
       m_EventId(eventId)
 {
 }
@@ -561,32 +628,31 @@ void D3D12APIWrapper::FetchSRV(const BindingSlot &slot)
             {
               D3D12_RESOURCE_DESC resDesc = pResource->GetDesc();
 
-              // DXBC allows root buffers to have a stride of up to 16 bytes in the shader, which
-              // means encoding the byte offset into the first element here is wrong without knowing
-              // what the actual accessed stride is. Instead we only fetch the data from that offset
-              // onwards.
+              // DXC allows root buffers to have a stride of up to 16 bytes in the shader, which
+              // means encoding the byte offset into the first element here is wrong without
+              // knowing what the actual accessed stride is. Instead we only fetch the data from
+              // that offset onwards.
 
               // Root buffers are typeless, try with the resource desc format
               // The debugger code will handle DXGI_FORMAT_UNKNOWN
-              if(resDesc.Format == DXGI_FORMAT_UNKNOWN)
-              {
-                // If we didn't get a format from the resource, try to pull it from the
-                // shader reflection info
-                DXILDebug::LookupSRVFormatFromShaderReflection(*m_DXBC->GetReflection(), slot,
-                                                               srvData.format);
-              }
-              else
-              {
-                DXILDebug::FillViewFmt(resDesc.Format, srvData.format);
-              }
-              srvData.firstElement = 0;
-              // root arguments have no bounds checking, so use the most conservative number of
-              // elements
-              srvData.numElements = uint32_t(resDesc.Width - element.offset);
+              if(resDesc.Format != DXGI_FORMAT_UNKNOWN)
+                DXILDebug::FillViewFmtFromResourceFormat(resDesc.Format, srvData.resInfo.format);
+
+              srvData.resInfo.isRootDescriptor = true;
+              srvData.resInfo.firstElement = 0;
+              // root arguments have no bounds checking, so use the most conservative number of elements
+              srvData.resInfo.numElements = uint32_t(resDesc.Width - element.offset);
 
               if(resDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+              {
+                // Get the buffer stride from the shader metadata (for StructuredBuffer, RawBuffer)
+                uint32_t mdStride =
+                    DXILDebug::GetSRVBufferStrideFromShaderMetadata(m_EntryPointInterface, slot);
+                if(mdStride != 0)
+                  srvData.resInfo.format.stride = mdStride;
                 m_Device->GetDebugManager()->GetBufferData(pResource, element.offset, 0,
                                                            srvData.data);
+              }
             }
             return;
           }
@@ -645,26 +711,26 @@ void D3D12APIWrapper::FetchSRV(const BindingSlot &slot)
 
                   if(srvDesc.Format != DXGI_FORMAT_UNKNOWN)
                   {
-                    DXILDebug::FillViewFmt(srvDesc.Format, srvData.format);
+                    DXILDebug::FillViewFmtFromResourceFormat(srvDesc.Format, srvData.resInfo.format);
                   }
                   else
                   {
                     D3D12_RESOURCE_DESC resDesc = pResource->GetDesc();
                     if(resDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-                    {
-                      srvData.format.stride = srvDesc.Buffer.StructureByteStride;
-
-                      // If we didn't get a type from the SRV description, try to pull it from the
-                      // shader reflection info
-                      DXILDebug::LookupSRVFormatFromShaderReflection(*m_DXBC->GetReflection(), slot,
-                                                                     srvData.format);
-                    }
+                      srvData.resInfo.format.stride = srvDesc.Buffer.StructureByteStride;
                   }
 
                   if(srvDesc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
                   {
-                    srvData.firstElement = (uint32_t)srvDesc.Buffer.FirstElement;
-                    srvData.numElements = srvDesc.Buffer.NumElements;
+                    srvData.resInfo.firstElement = (uint32_t)srvDesc.Buffer.FirstElement;
+                    srvData.resInfo.numElements = srvDesc.Buffer.NumElements;
+                    srvData.resInfo.isByteBuffer =
+                        ((srvDesc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0) ? true : false;
+                    // Get the buffer stride from the shader metadata (for StructuredBuffer, RawBuffer)
+                    uint32_t mdStride =
+                        DXILDebug::GetSRVBufferStrideFromShaderMetadata(m_EntryPointInterface, slot);
+                    if(mdStride != 0)
+                      srvData.resInfo.format.stride = mdStride;
 
                     m_Device->GetDebugManager()->GetBufferData(pResource, 0, 0, srvData.data);
                   }
@@ -687,104 +753,6 @@ void D3D12APIWrapper::FetchSRV(const BindingSlot &slot)
 
   RDCERR("No root signature bound, couldn't identify SRV %u in space %u", slot.shaderRegister,
          slot.registerSpace);
-}
-
-bool D3D12APIWrapper::IsSRVBound(const BindingSlot &slot)
-{
-  const D3D12RenderState &rs = m_Device->GetQueue()->GetCommandData()->m_RenderState;
-  D3D12ResourceManager *rm = m_Device->GetResourceManager();
-
-  // Get the root signature
-  const D3D12RenderState::RootSignature *pRootSignature = NULL;
-  if(m_ShaderType == DXBC::ShaderType::Compute)
-  {
-    if(rs.compute.rootsig != ResourceId())
-    {
-      pRootSignature = &rs.compute;
-    }
-  }
-  else if(rs.graphics.rootsig != ResourceId())
-  {
-    pRootSignature = &rs.graphics;
-  }
-
-  if(pRootSignature)
-  {
-    WrappedID3D12RootSignature *pD3D12RootSig =
-        rm->GetCurrentAs<WrappedID3D12RootSignature>(pRootSignature->rootsig);
-
-    size_t numParams = RDCMIN(pD3D12RootSig->sig.Parameters.size(), pRootSignature->sigelems.size());
-    for(size_t i = 0; i < numParams; ++i)
-    {
-      const D3D12RootSignatureParameter &param = pD3D12RootSig->sig.Parameters[i];
-      const D3D12RenderState::SignatureElement &element = pRootSignature->sigelems[i];
-      if(IsShaderParameterVisible(m_ShaderType, param.ShaderVisibility))
-      {
-        if(param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV && element.type == eRootSRV)
-        {
-          if(param.Descriptor.ShaderRegister == slot.shaderRegister &&
-             param.Descriptor.RegisterSpace == slot.registerSpace)
-          {
-            // Found the requested SRV
-            ID3D12Resource *pResource = rm->GetCurrentAs<ID3D12Resource>(element.id);
-            return pResource != NULL;
-          }
-        }
-        else if(param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
-                element.type == eRootTable)
-        {
-          UINT prevTableOffset = 0;
-          WrappedID3D12DescriptorHeap *heap =
-              rm->GetCurrentAs<WrappedID3D12DescriptorHeap>(element.id);
-
-          size_t numRanges = param.ranges.size();
-          for(size_t r = 0; r < numRanges; ++r)
-          {
-            const D3D12_DESCRIPTOR_RANGE1 &range = param.ranges[r];
-
-            // For every range, check the number of descriptors so that we are accessing the
-            // correct data for append descriptor tables, even if the range type doesn't match
-            // what we need to fetch
-            UINT offset = range.OffsetInDescriptorsFromTableStart;
-            if(range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
-              offset = prevTableOffset;
-
-            D3D12Descriptor *desc = (D3D12Descriptor *)heap->GetCPUDescriptorHandleForHeapStart().ptr;
-            desc += element.offset;
-            desc += offset;
-
-            UINT numDescriptors = range.NumDescriptors;
-            if(numDescriptors == UINT_MAX)
-            {
-              // Find out how many descriptors are left after
-              numDescriptors = heap->GetNumDescriptors() - offset - (UINT)element.offset;
-
-              // TODO: Should we look up the bind point in the D3D12 state to try to get
-              // a better guess at the number of descriptors?
-            }
-
-            prevTableOffset = offset + numDescriptors;
-
-            // Check if the range is for SRVs and the slot we want is contained
-            if(range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
-               slot.shaderRegister >= range.BaseShaderRegister &&
-               slot.shaderRegister < range.BaseShaderRegister + numDescriptors &&
-               range.RegisterSpace == slot.registerSpace)
-            {
-              desc += slot.shaderRegister - range.BaseShaderRegister;
-              if(desc)
-              {
-                ResourceId srvId = desc->GetResResourceId();
-                ID3D12Resource *pResource = rm->GetCurrentAs<ID3D12Resource>(srvId);
-                return pResource != NULL;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  return false;
 }
 
 void D3D12APIWrapper::FetchUAV(const BindingSlot &slot)
@@ -840,31 +808,33 @@ void D3D12APIWrapper::FetchUAV(const BindingSlot &slot)
             if(pResource)
             {
               D3D12_RESOURCE_DESC resDesc = pResource->GetDesc();
-              // DXBC allows root buffers to have a stride of up to 16 bytes in the shader, which
-              // means encoding the byte offset into the first element here is wrong without knowing
-              // what the actual accessed stride is. Instead we only fetch the data from that offset
-              // onwards.
+              // DXC allows root buffers to have a stride of up to 16 bytes in the shader, which
+              // means encoding the byte offset into the first element here is wrong without
+              // knowing what the actual accessed stride is. Instead we only fetch the data from
+              // that offset onwards.
 
               // Root buffers are typeless, try with the resource desc format
               // The debugger code will handle DXGI_FORMAT_UNKNOWN
-              if(resDesc.Format == DXGI_FORMAT_UNKNOWN)
+              if(resDesc.Format != DXGI_FORMAT_UNKNOWN)
               {
-                // If we didn't get a format from the resource, try to pull it from the
-                // shader reflection info
-                DXILDebug::LookupUAVFormatFromShaderReflection(*m_DXBC->GetReflection(), slot,
-                                                               uavData.format);
+                DXILDebug::FillViewFmtFromResourceFormat(resDesc.Format, uavData.resInfo.format);
               }
-              else
-              {
-                DXILDebug::FillViewFmt(resDesc.Format, uavData.format);
-              }
-              uavData.firstElement = 0;
+
+              uavData.resInfo.isRootDescriptor = true;
+              uavData.resInfo.firstElement = 0;
               // root arguments have no bounds checking, use the most conservative number of elements
-              uavData.numElements = uint32_t(resDesc.Width - element.offset);
+              uavData.resInfo.numElements = uint32_t(resDesc.Width - element.offset);
 
               if(resDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+              {
+                // Get the buffer stride from the shader metadata (for StructuredBuffer, RawBuffer)
+                uint32_t mdStride =
+                    DXILDebug::GetUAVBufferStrideFromShaderMetadata(m_EntryPointInterface, slot);
+                if(mdStride != 0)
+                  uavData.resInfo.format.stride = mdStride;
                 m_Device->GetDebugManager()->GetBufferData(pResource, element.offset, 0,
                                                            uavData.data);
+              }
             }
 
             return;
@@ -928,23 +898,20 @@ void D3D12APIWrapper::FetchUAV(const BindingSlot &slot)
 
                   if(uavDesc.Format != DXGI_FORMAT_UNKNOWN)
                   {
-                    DXILDebug::FillViewFmt(uavDesc.Format, uavData.format);
-                  }
-                  else
-                  {
-                    D3D12_RESOURCE_DESC resDesc = pResource->GetDesc();
-                    if(resDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-                    {
-                      uavData.format.stride = uavDesc.Buffer.StructureByteStride;
-
-                      // TODO: Try looking up UAV from shader reflection info?
-                    }
+                    DXILDebug::FillViewFmtFromResourceFormat(uavDesc.Format, uavData.resInfo.format);
                   }
 
                   if(uavDesc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
                   {
-                    uavData.firstElement = (uint32_t)uavDesc.Buffer.FirstElement;
-                    uavData.numElements = uavDesc.Buffer.NumElements;
+                    uavData.resInfo.firstElement = (uint32_t)uavDesc.Buffer.FirstElement;
+                    uavData.resInfo.numElements = uavDesc.Buffer.NumElements;
+                    uavData.resInfo.isByteBuffer =
+                        ((uavDesc.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0) ? true : false;
+                    // Get the buffer stride from the shader metadata (for StructuredBuffer, RawBuffer)
+                    uint32_t mdStride =
+                        DXILDebug::GetUAVBufferStrideFromShaderMetadata(m_EntryPointInterface, slot);
+                    if(mdStride != 0)
+                      uavData.resInfo.format.stride = mdStride;
 
                     m_Device->GetDebugManager()->GetBufferData(pResource, 0, 0, uavData.data);
                   }
@@ -956,6 +923,8 @@ void D3D12APIWrapper::FetchUAV(const BindingSlot &slot)
 
                     D3D12_RESOURCE_DESC resDesc = pResource->GetDesc();
                     uavData.rowPitch = GetByteSize((int)resDesc.Width, 1, 1, uavDesc.Format, 0);
+                    uavData.depthPitch =
+                        GetByteSize((int)resDesc.Width, (int)(resDesc.Height), 1, uavDesc.Format, 0);
                   }
                 }
 
@@ -974,104 +943,6 @@ void D3D12APIWrapper::FetchUAV(const BindingSlot &slot)
 
   RDCERR("No root signature bound, couldn't identify UAV %u in space %u", slot.shaderRegister,
          slot.registerSpace);
-}
-
-bool D3D12APIWrapper::IsUAVBound(const BindingSlot &slot)
-{
-  const D3D12RenderState &rs = m_Device->GetQueue()->GetCommandData()->m_RenderState;
-  D3D12ResourceManager *rm = m_Device->GetResourceManager();
-
-  // Get the root signature
-  const D3D12RenderState::RootSignature *pRootSignature = NULL;
-  if(m_ShaderType == DXBC::ShaderType::Compute)
-  {
-    if(rs.compute.rootsig != ResourceId())
-    {
-      pRootSignature = &rs.compute;
-    }
-  }
-  else if(rs.graphics.rootsig != ResourceId())
-  {
-    pRootSignature = &rs.graphics;
-  }
-
-  if(pRootSignature)
-  {
-    WrappedID3D12RootSignature *pD3D12RootSig =
-        rm->GetCurrentAs<WrappedID3D12RootSignature>(pRootSignature->rootsig);
-
-    size_t numParams = RDCMIN(pD3D12RootSig->sig.Parameters.size(), pRootSignature->sigelems.size());
-    for(size_t i = 0; i < numParams; ++i)
-    {
-      const D3D12RootSignatureParameter &param = pD3D12RootSig->sig.Parameters[i];
-      const D3D12RenderState::SignatureElement &element = pRootSignature->sigelems[i];
-      if(IsShaderParameterVisible(m_ShaderType, param.ShaderVisibility))
-      {
-        if(param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV && element.type == eRootUAV)
-        {
-          if(param.Descriptor.ShaderRegister == slot.shaderRegister &&
-             param.Descriptor.RegisterSpace == slot.registerSpace)
-          {
-            // Found the requested UAV
-            ID3D12Resource *pResource = rm->GetCurrentAs<ID3D12Resource>(element.id);
-            return pResource != NULL;
-          }
-        }
-        else if(param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
-                element.type == eRootTable)
-        {
-          UINT prevTableOffset = 0;
-          WrappedID3D12DescriptorHeap *heap =
-              rm->GetCurrentAs<WrappedID3D12DescriptorHeap>(element.id);
-
-          size_t numRanges = param.ranges.size();
-          for(size_t r = 0; r < numRanges; ++r)
-          {
-            const D3D12_DESCRIPTOR_RANGE1 &range = param.ranges[r];
-
-            // For every range, check the number of descriptors so that we are accessing the
-            // correct data for append descriptor tables, even if the range type doesn't match
-            // what we need to fetch
-            UINT offset = range.OffsetInDescriptorsFromTableStart;
-            if(range.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
-              offset = prevTableOffset;
-
-            D3D12Descriptor *desc = (D3D12Descriptor *)heap->GetCPUDescriptorHandleForHeapStart().ptr;
-            desc += element.offset;
-            desc += offset;
-
-            UINT numDescriptors = range.NumDescriptors;
-            if(numDescriptors == UINT_MAX)
-            {
-              // Find out how many descriptors are left after
-              numDescriptors = heap->GetNumDescriptors() - offset - (UINT)element.offset;
-
-              // TODO: Should we look up the bind point in the D3D12 state to try to get
-              // a better guess at the number of descriptors?
-            }
-
-            prevTableOffset = offset + numDescriptors;
-
-            // Check if the range is for UAVs and the slot we want is contained
-            if(range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV &&
-               slot.shaderRegister >= range.BaseShaderRegister &&
-               slot.shaderRegister < range.BaseShaderRegister + numDescriptors &&
-               range.RegisterSpace == slot.registerSpace)
-            {
-              desc += slot.shaderRegister - range.BaseShaderRegister;
-              if(desc)
-              {
-                ResourceId uavId = desc->GetResResourceId();
-                ID3D12Resource *pResource = rm->GetCurrentAs<ID3D12Resource>(uavId);
-                return pResource != NULL;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  return false;
 }
 
 bool D3D12APIWrapper::CalculateMathIntrinsic(DXIL::DXOp dxOp, const ShaderVariable &input,
@@ -1131,10 +1002,6 @@ bool D3D12APIWrapper::CalculateSampleGather(
     case DXOp::CalculateLOD: sampleOp = DEBUG_SAMPLE_TEX_LOD; break;
     // In the shader DEBUG_SAMPLE_TEX_LOAD and DEBUG_SAMPLE_TEX_LOAD_MS behave equivalently
     case DXOp::TextureLoad: sampleOp = DEBUG_SAMPLE_TEX_LOAD; break;
-    // TODO: consider these DXIL opcode operations
-    // DXOp::TextureGatherRaw
-    // TODO: consider these DXBC opcode operations
-    // DEBUG_SAMPLE_TEX_GATHER4_PARAM_OFFSET_CMP
     default:
       // To support a new instruction, the shader created in
       // D3D12DebugManager::CreateShaderDebugResources will need updating
@@ -1190,27 +1057,126 @@ ShaderVariable D3D12APIWrapper::GetRenderTargetSampleInfo(const DXBC::ShaderType
   return D3D12ShaderDebug::GetRenderTargetSampleInfo(m_Device, shaderType, opString);
 }
 
-bool D3D12APIWrapper::IsResourceBound(DXIL::ResourceClass resClass, const DXDebug::BindingSlot &slot)
+ResourceReferenceInfo D3D12APIWrapper::GetResourceReferenceInfo(const DXDebug::BindingSlot &slot)
 {
-  if(resClass == ResourceClass::SRV)
+  const HeapDescriptorType heapType = slot.heapType;
+  RDCASSERT(heapType != HeapDescriptorType::NoHeap);
+  const uint32_t descriptorIndex = slot.descriptorIndex;
+  D3D12Descriptor desc = D3D12ShaderDebug::FindDescriptor(m_Device, heapType, descriptorIndex);
+
+  D3D12ResourceManager *rm = m_Device->GetResourceManager();
+
+  ResourceReferenceInfo resRefInfo;
+  resRefInfo.binding.heapType = heapType;
+  resRefInfo.binding.descriptorIndex = descriptorIndex;
+
+  switch(desc.GetType())
   {
-    GlobalState::SRVIterator srvIter = m_GlobalState.srvs.find(slot);
-    if(srvIter != m_GlobalState.srvs.end())
-      return true;
-    return IsSRVBound(slot);
+    case D3D12DescriptorType::CBV:
+    {
+      resRefInfo.resClass = DXIL::ResourceClass::CBuffer;
+      resRefInfo.category = DescriptorCategory::ConstantBlock;
+      resRefInfo.type = VarType::ConstantBlock;
+    }
+    case D3D12DescriptorType::SRV:
+    {
+      ResourceId srvId = desc.GetResResourceId();
+      ID3D12Resource *pResource = rm->GetCurrentAs<ID3D12Resource>(srvId);
+      if(pResource)
+      {
+        resRefInfo.resClass = DXIL::ResourceClass::SRV;
+        resRefInfo.category = DescriptorCategory::ReadOnlyResource;
+        resRefInfo.type = VarType::ReadOnlyResource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = desc.GetSRV();
+        if(srvDesc.ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN)
+          srvDesc = MakeSRVDesc(pResource->GetDesc());
+
+        GlobalState::ViewFmt viewFmt;
+        if(srvDesc.Format != DXGI_FORMAT_UNKNOWN)
+        {
+          resRefInfo.srvData.dim =
+              (DXDebug::ResourceDimension)ConvertSRVResourceDimensionToResourceDimension(
+                  srvDesc.ViewDimension);
+
+          DXILDebug::FillViewFmtFromResourceFormat(srvDesc.Format, viewFmt);
+          resRefInfo.srvData.compType =
+              (DXDebug::ResourceRetType)ConvertCompTypeToResourceRetType(viewFmt.compType);
+
+          D3D12_RESOURCE_DESC resDesc = pResource->GetDesc();
+          resRefInfo.srvData.sampleCount = resDesc.SampleDesc.Count;
+        }
+      }
+      else
+      {
+        RDCERR("Unknown SRV resource at Descriptor Index %s", descriptorIndex);
+        return ResourceReferenceInfo();
+      }
+      break;
+    }
+    case D3D12DescriptorType::UAV:
+    {
+      resRefInfo.resClass = DXIL::ResourceClass::UAV;
+      resRefInfo.category = DescriptorCategory::ReadWriteResource;
+      resRefInfo.type = VarType::ReadWriteResource;
+      break;
+    }
+    case D3D12DescriptorType::Sampler:
+    {
+      resRefInfo.resClass = DXIL::ResourceClass::Sampler;
+      resRefInfo.category = DescriptorCategory::Sampler;
+      resRefInfo.type = VarType::Sampler;
+      D3D12_SAMPLER_DESC2 samplerDesc = desc.GetSampler();
+      // Don't think SAMPLER_MODE_MONO is supported in D3D12 (set for filter mode D3D10_FILTER_TEXT_1BIT)
+      resRefInfo.samplerData.samplerMode =
+          (DXDebug::SamplerMode)ConvertSamplerFilterToSamplerMode(samplerDesc.Filter);
+      break;
+    }
+    default:
+      RDCERR("Unhandled Descriptor Type %s", ToStr(desc.GetType()).c_str());
+      return ResourceReferenceInfo();
   }
-  else if(resClass == ResourceClass::UAV)
-  {
-    GlobalState::UAVIterator uavIter = m_GlobalState.uavs.find(slot);
-    if(uavIter != m_GlobalState.uavs.end())
-      return true;
-    return IsUAVBound(slot);
-  }
-  else
-  {
-    RDCERR("Unhanded resource class %s", ToStr(resClass).c_str());
-  }
-  return false;
+  return resRefInfo;
 }
 
+ShaderDirectAccess D3D12APIWrapper::GetShaderDirectAccess(DescriptorCategory category,
+                                                          const DXDebug::BindingSlot &slot)
+{
+  const HeapDescriptorType heapType = slot.heapType;
+  RDCASSERT(heapType != HeapDescriptorType::NoHeap);
+  uint32_t descriptorIndex = slot.descriptorIndex;
+
+  const D3D12RenderState &rs = m_Device->GetQueue()->GetCommandData()->m_RenderState;
+  D3D12ResourceManager *rm = m_Device->GetResourceManager();
+
+  ShaderDirectAccess access;
+  uint32_t byteSize = DXILDebug::D3D12_DESCRIPTOR_BYTESIZE;
+  uint32_t byteOffset = descriptorIndex * byteSize;
+
+  // Fetch the correct heap sampler and resource descriptor heap
+  rdcarray<ResourceId> descHeaps = rs.heaps;
+  for(ResourceId heapId : descHeaps)
+  {
+    WrappedID3D12DescriptorHeap *pD3D12Heap = rm->GetCurrentAs<WrappedID3D12DescriptorHeap>(heapId);
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = pD3D12Heap->GetDesc();
+    if(heapDesc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+    {
+      if(heapType == HeapDescriptorType::Sampler)
+      {
+        RDCASSERTEQUAL(category, DescriptorCategory::Sampler);
+        return ShaderDirectAccess(category, rm->GetOriginalID(heapId), byteOffset, byteSize);
+      }
+    }
+    else
+    {
+      RDCASSERT(heapDesc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      if(heapType == HeapDescriptorType::CBV_SRV_UAV)
+      {
+        RDCASSERTNOTEQUAL(category, DescriptorCategory::Sampler);
+        return ShaderDirectAccess(category, rm->GetOriginalID(heapId), byteOffset, byteSize);
+      }
+    }
+  }
+  RDCERR("Failed to find descriptor %u %u", (uint32_t)heapType, descriptorIndex);
+  return ShaderDirectAccess();
+}
 };

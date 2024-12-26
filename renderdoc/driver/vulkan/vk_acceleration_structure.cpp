@@ -28,6 +28,13 @@
 #include "vk_manager.h"
 
 RDOC_EXTERN_CONFIG(bool, Vulkan_Debug_SingleSubmitFlushing);
+RDOC_CONFIG(uint32_t, Vulkan_Debug_RT_MaxVertexIncrement, 1000,
+            "Amount to add to the API-provided max vertex when building a BLAS with an index "
+            "buffer, to account for incorrectly set values by application.");
+RDOC_CONFIG(
+    uint32_t, Vulkan_Debug_RT_MaxVertexPercentIncrease, 10,
+    "Percentage increase for the API-provided max vertex when building a BLAS with an index "
+    "buffer, to account for incorrectly set values by application.");
 
 namespace
 {
@@ -50,53 +57,6 @@ VkDeviceSize IndexTypeSize(VkIndexType type)
   }
 }
 }
-
-DECLARE_STRINGISE_TYPE(VkAccelerationStructureInfo::GeometryData::Triangles);
-DECLARE_STRINGISE_TYPE(VkAccelerationStructureInfo::GeometryData::Aabbs);
-DECLARE_STRINGISE_TYPE(VkAccelerationStructureInfo::GeometryData);
-DECLARE_STRINGISE_TYPE(VkAccelerationStructureInfo);
-
-template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, VkAccelerationStructureInfo::GeometryData::Triangles &el)
-{
-  SERIALISE_MEMBER(vertexFormat);
-  SERIALISE_MEMBER(vertexStride);
-  SERIALISE_MEMBER(maxVertex);
-  SERIALISE_MEMBER(indexType);
-}
-INSTANTIATE_SERIALISE_TYPE(VkAccelerationStructureInfo::GeometryData::Triangles);
-
-template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, VkAccelerationStructureInfo::GeometryData::Aabbs &el)
-{
-  SERIALISE_MEMBER(stride);
-}
-INSTANTIATE_SERIALISE_TYPE(VkAccelerationStructureInfo::GeometryData::Aabbs);
-
-template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, VkAccelerationStructureInfo::GeometryData &el)
-{
-  SERIALISE_MEMBER(geometryType);
-  SERIALISE_MEMBER_TYPED(VkGeometryFlagBitsKHR, flags).TypedAs("VkGeometryFlagsKHR"_lit);
-
-  SERIALISE_MEMBER(tris);
-  SERIALISE_MEMBER(aabbs);
-
-  SERIALISE_MEMBER(buildRangeInfo);
-  SERIALISE_MEMBER(memOffset);
-}
-INSTANTIATE_SERIALISE_TYPE(VkAccelerationStructureInfo::GeometryData);
-
-template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, VkAccelerationStructureInfo &el)
-{
-  SERIALISE_MEMBER(type);
-  SERIALISE_MEMBER_TYPED(VkBuildAccelerationStructureFlagBitsKHR, flags)
-      .TypedAs("VkBuildAccelerationStructureFlagsKHR"_lit);
-  SERIALISE_MEMBER(geometryData);
-  SERIALISE_MEMBER(memSize);
-}
-INSTANTIATE_SERIALISE_TYPE(VkAccelerationStructureInfo);
 
 VkAccelerationStructureInfo::~VkAccelerationStructureInfo()
 {
@@ -323,9 +283,17 @@ RDResult VulkanAccelerationStructureManager::CopyInputBuffers(
 
         if(indexData)
         {
-          // If we're using an index buffer we don't know how much of the vertex buffer we need,
-          // and we can't trust the app to set maxVertex correctly, so we take the whole buffer
-          vertexData.size = vertexData.rao.record->memSize - vertexData.rao.offset;
+          // don't take maxVertex as perfect, applications have no reason to set it correctly for
+          // everything to work with drivers, and likely no validation. Add an overestimate factor
+          uint32_t untrustedVertexCount = triInfo.maxVertex;
+          uint32_t estimatedVertexCount =
+              untrustedVertexCount +
+              (untrustedVertexCount / 100) * Vulkan_Debug_RT_MaxVertexPercentIncrease() +
+              Vulkan_Debug_RT_MaxVertexIncrement();
+
+          // don't read more than what is left in the buffer
+          vertexData.size = RDCMIN(triInfo.vertexStride * estimatedVertexCount,
+                                   vertexData.rao.record->memSize - vertexData.rao.offset);
           vertexData.SetReadPosition(0);
         }
         else
@@ -533,7 +501,7 @@ RDResult VulkanAccelerationStructureManager::CopyInputBuffers(
 
   // Allocate the required memory block
   metadata->readbackMem = CreateTempReadBackBuffer(device, currentDstOffset);
-  if(metadata->readbackMem.mem == VK_NULL_HANDLE)
+  if(metadata->readbackMem.UnwrappedMemory() == VK_NULL_HANDLE)
   {
     RDCERR("Unable to allocate AS input buffer readback memory (size: %u bytes)", currentDstOffset);
     return {};
@@ -547,7 +515,7 @@ RDResult VulkanAccelerationStructureManager::CopyInputBuffers(
     // Queue the copying
     for(const BufferData &bufData : inputBuffersData)
       ObjDisp(device)->CmdCopyBuffer(Unwrap(commandBuffer), bufData.buf,
-                                     Unwrap(metadata->readbackMem.buf), 1, &bufData.region);
+                                     metadata->readbackMem.UnwrappedBuffer(), 1, &bufData.region);
 
     VkMemoryBarrier barrier = {
         VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -866,9 +834,6 @@ GPUBuffer VulkanAccelerationStructureManager::CreateTempReadBackBuffer(VkDevice 
   GPUBuffer result;
   result.Create(m_pDriver, device, size, 1,
                 GPUBuffer::eGPUBufferReadback | GPUBuffer::eGPUBufferAddressable);
-
-  m_pDriver->GetResourceManager()->SetInternalResource(GetResID(result.mem));
-  m_pDriver->GetResourceManager()->SetInternalResource(GetResID(result.buf));
 
   return result;
 }

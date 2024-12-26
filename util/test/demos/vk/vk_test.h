@@ -41,6 +41,7 @@ struct AllocatedBuffer
   VmaAllocator allocator = NULL;
   VkBuffer buffer = VK_NULL_HANDLE;
   VmaAllocation alloc = {};
+  VkDeviceAddress address = 0;
 
   AllocatedBuffer() {}
   AllocatedBuffer(VulkanGraphicsTest *test, const VkBufferCreateInfo &bufInfo,
@@ -184,6 +185,7 @@ private:
   uint32_t semIdx = 0;
   VkSemaphore renderStartSemaphore[4] = {};
   VkSemaphore renderEndSemaphore[4] = {};
+  VkFence imageFences[4] = {};
   std::vector<VkFramebuffer> fbs;
 
   GraphicsWindow *m_Win;
@@ -333,6 +335,7 @@ struct VulkanGraphicsTest : public GraphicsTest
 
   // VMA
   bool vmaDedicated = false;
+  bool vmaBDA = false;
   VmaAllocator allocator = VK_NULL_HANDLE;
 
 private:

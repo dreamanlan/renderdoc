@@ -36,6 +36,8 @@ RDOC_EXTERN_CONFIG(bool, D3D12_Debug_SingleSubmitFlushing);
 RDOC_CONFIG(bool, D3D12_Debug_DriverASSerialisation, false,
             "Use driver-side serialisation for saving and restoring ASs");
 
+RDOC_EXTERN_CONFIG(bool, D3D12_Debug_RT_Auditing);
+
 template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, ASBuildData::RVAWithStride &el)
 {
@@ -92,7 +94,12 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
     D3D12Descriptor *descs = new D3D12Descriptor[numElems];
     memcpy(descs, heap->GetDescriptors(), sizeof(D3D12Descriptor) * numElems);
 
-    SetInitialContents(heap->GetResourceID(), D3D12InitialContents(descs, numElems));
+    D3D12InitialContents initContents(descs, numElems);
+
+    if(heap->HasNames())
+      initContents.descriptorNames = heap->GetNames();
+
+    SetInitialContents(heap->GetResourceID(), initContents);
     return true;
   }
   else if(type == Resource_Resource)
@@ -616,6 +623,8 @@ uint64_t D3D12ResourceManager::GetSize_InitialState(ResourceId id, const D3D12In
       if(buildData->buffer)
         ret += 64 + buildData->buffer->Size();
 
+      ret += 64 + buildData->diskCache.size;
+
       return ret;
     }
   }
@@ -764,6 +773,7 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
   {
     D3D12Descriptor *Descriptors = initial ? initial->descriptors : NULL;
     uint32_t numElems = initial ? initial->numDescriptors : 0;
+    rdcarray<rdcstr> names = initial ? initial->descriptorNames : rdcarray<rdcstr>();
 
     // there's no point in setting up a lazy array when we're structured exporting because we KNOW
     // we're going to need all the data anyway.
@@ -773,6 +783,11 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
     SERIALISE_ELEMENT_ARRAY(Descriptors, numElems);
     SERIALISE_ELEMENT(numElems).Named("NumDescriptors"_lit).Important();
 
+    if(ser.VersionAtLeast(0x13))
+    {
+      SERIALISE_ELEMENT(names).Hidden();
+    }
+
     ser.SetLazyThreshold(0);
 
     SERIALISE_CHECK_READ_ERRORS();
@@ -780,6 +795,9 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
     if(IsReplayingAndReading())
     {
       WrappedID3D12DescriptorHeap *heap = (WrappedID3D12DescriptorHeap *)GetLiveResource(id);
+
+      if(!names.empty())
+        heap->GetNames() = names;
 
       D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
 
@@ -811,6 +829,23 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
 
       // only iterate over the 'real' number of descriptors, not the number after we've patched
       desc.NumDescriptors = heap->GetNumDescriptors();
+
+      // to remove any ray query work, force AS descriptors to NULL
+      if(D3D12_Debug_RT_Auditing())
+      {
+        for(uint32_t i = 0; i < RDCMIN(numElems, desc.NumDescriptors); i++)
+        {
+          if(Descriptors[i].GetType() == D3D12DescriptorType::SRV)
+          {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = Descriptors[i].GetSRV();
+            if(srvDesc.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+            {
+              srvDesc.RaytracingAccelerationStructure.Location = 0;
+              Descriptors[i].Init(NULL, &srvDesc);
+            }
+          }
+        }
+      }
 
       for(uint32_t i = 0; i < RDCMIN(numElems, desc.NumDescriptors); i++)
       {
@@ -1364,6 +1399,10 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
             ret = false;
           }
         }
+        else if(initial->buildData->diskCache.Valid())
+        {
+          ContentsLength = initial->buildData->diskCache.size;
+        }
 
         buildData = initial->buildData;
       }
@@ -1422,16 +1461,25 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
           BufferContents = tempAlloc = new byte[(size_t)ContentsLength];
       }
 
-      // not using SERIALISE_ELEMENT_ARRAY so we can deliberately avoid allocation - we serialise
-      // directly into already allocated memory (either directly upload memory for BLAS, or
-      // temporary memory to patch for TLASs)
-      ser.Serialise("BufferContents"_lit, BufferContents, ContentsLength, SerialiserFlags::NoFlags)
-          .Important();
+      if(buildData->diskCache.Valid() && ser.IsWriting())
+      {
+        GetRTManager()->ReadDiskCache(ser, "BufferContents"_lit, buildData->diskCache);
+      }
+      else
+      {
+        // not using SERIALISE_ELEMENT_ARRAY so we can deliberately avoid allocation - we serialise
+        // directly into already allocated memory (either directly upload memory for BLAS, or
+        // temporary memory to patch for TLASs)
+        ser.Serialise("BufferContents"_lit, BufferContents, ContentsLength, SerialiserFlags::NoFlags)
+            .Important();
+      }
 
       if(buildData)
       {
         if(IsReplayingAndReading())
         {
+          D3D12AccelerationStructure *as = (D3D12AccelerationStructure *)GetLiveResource(id);
+
           // if this is a TLAS, patch the addresses of any BLASs in the instance data before uploading it
           if(buildData->NumBLAS > 0)
           {
@@ -1447,10 +1495,32 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
               UINT64 blasOffs;
               m_Device->GetResIDFromOrigAddr(instances[i].AccelerationStructure, blasId, blasOffs);
 
-              WrappedID3D12Resource *blas = GetLiveAs<WrappedID3D12Resource>(blasId);
+              WrappedID3D12Resource *blasASB = GetLiveAs<WrappedID3D12Resource>(blasId);
 
-              D3D12AccelerationStructure *as = NULL;
-              if(blasId == ResourceId() || blas == NULL || !blas->GetAccStructIfExist(blasOffs, &as))
+              D3D12AccelerationStructure *blasCheck = NULL;
+
+              // check and log more fine-grained if we're auditing
+              if(D3D12_Debug_RT_Auditing())
+              {
+                rdcstr invalid;
+
+                if(blasId == ResourceId() || blasASB == NULL)
+                  invalid = StringFormat::Fmt("Address references non-existant buffer");
+                else if(!blasASB->GetAccStructIfExist(blasOffs, &blasCheck))
+                  invalid = StringFormat::Fmt("No valid AS created at buffer location");
+                else if(blasCheck->Type() == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)
+                  invalid = StringFormat::Fmt("TLAS referenced, assuming overwritten");
+
+                if(!invalid.empty())
+                {
+                  RDCWARN("%s %u: %s", ToStr(id).c_str(), i, invalid.c_str());
+                  instances[i].AccelerationStructure = 0;
+                  continue;
+                }
+              }
+
+              if(blasId == ResourceId() || blasASB == NULL ||
+                 !blasASB->GetAccStructIfExist(blasOffs, &blasCheck))
               {
                 RDCWARN(
                     "  %u: BLAS referenced by TLAS is not available on replay - possibly stale "
@@ -1460,7 +1530,33 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
                 continue;
               }
 
-              instances[i].AccelerationStructure = blas->GetGPUVirtualAddress() + blasOffs;
+              if(id < GetOriginalID(blasCheck->GetResourceID()))
+              {
+                RDCWARN("  %u: BLAS referenced by TLAS is newer than TLAS - possibly stale TLAS", i);
+                instances[i].AccelerationStructure = 0;
+                continue;
+              }
+
+              if(blasCheck->Type() != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
+              {
+                RDCWARN("  %u: BLAS is not of correct type - possibly stale TLAS", i);
+                instances[i].AccelerationStructure = 0;
+                continue;
+              }
+
+              if(D3D12_Debug_RT_Auditing())
+              {
+                RDCLOG("%s %u: remapped from %llx to %llx", ToStr(id).c_str(), i,
+                       instances[i].AccelerationStructure,
+                       blasASB->GetGPUVirtualAddress() + blasOffs);
+
+                as->children.push_back(blasCheck);
+              }
+
+              RDCASSERTEQUAL(blasCheck->GetVirtualAddress(),
+                             blasASB->GetGPUVirtualAddress() + blasOffs);
+
+              instances[i].AccelerationStructure = blasASB->GetGPUVirtualAddress() + blasOffs;
             }
 
             void *upload = mappedBuffer->Map();
@@ -1716,7 +1812,9 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
 
         HRESULT hr = S_OK;
 
-        if(copyDst->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        D3D12_RESOURCE_DESC desc = copyDst->GetDesc();
+
+        if(desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         {
           hr = Unwrap(copyDst)->Map(0, NULL, (void **)&dst);
           CHECK_HR(m_Device, hr);
@@ -1735,8 +1833,6 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
         }
         else
         {
-          D3D12_RESOURCE_DESC desc = copyDst->GetDesc();
-
           UINT numSubresources = desc.MipLevels;
           if(desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
             numSubresources *= desc.DepthOrArraySize;
@@ -1751,7 +1847,10 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
 
           for(UINT i = 0; i < numSubresources; i++)
           {
-            hr = Unwrap(copyDst)->Map(i, NULL, (void **)&dst);
+            if(desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN)
+              hr = Unwrap(copyDst)->Map(i, NULL, NULL);
+            else
+              hr = Unwrap(copyDst)->Map(i, NULL, (void **)&dst);
             CHECK_HR(m_Device, hr);
 
             if(FAILED(hr))
@@ -1765,15 +1864,33 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
               byte *bufPtr = src + layouts[i].Offset;
               byte *texPtr = dst;
 
+              D3D12_BOX box = {};
+
+              box.right = layouts[i].Footprint.Width;
+              box.back = 1;
+
               for(UINT d = 0; d < layouts[i].Footprint.Depth; d++)
               {
+                box.top = 0;
+                box.bottom = 1;
                 for(UINT r = 0; r < numrows[i]; r++)
                 {
-                  memcpy(bufPtr, texPtr, (size_t)rowsizes[i]);
+                  if(texPtr)
+                    memcpy(bufPtr, texPtr, (size_t)rowsizes[i]);
+                  else
+                    copyDst->WriteToSubresource(i, &box, bufPtr, (UINT)rowsizes[i],
+                                                (UINT)rowsizes[i]);
 
                   bufPtr += layouts[i].Footprint.RowPitch;
-                  texPtr += rowsizes[i];
+                  if(texPtr)
+                    texPtr += rowsizes[i];
+
+                  box.top++;
+                  box.bottom++;
                 }
+
+                box.front++;
+                box.back++;
               }
             }
 
@@ -1985,7 +2102,51 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
       if(buildData->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)
       {
         desc.DestAccelerationStructureData = as->GetVirtualAddress();
-        list->BuildRaytracingAccelerationStructure(&desc, 0, NULL);
+
+        UINT numPostBuilds = 0;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC postDesc = {};
+        if(GetRTManager()->PostbuildReadbackBuffer)
+        {
+          postDesc.DestBuffer = GetRTManager()->PostbuildReadbackBuffer->Address();
+          postDesc.InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE;
+          numPostBuilds++;
+        }
+
+        list->BuildRaytracingAccelerationStructure(&desc, numPostBuilds, &postDesc);
+
+        if(D3D12_Debug_RT_Auditing())
+        {
+          RDCLOG("Apply TLAS - Rebuilding %s to %llx",
+                 ToStr(GetOriginalID(as->GetResourceID())).c_str(),
+                 desc.DestAccelerationStructureData);
+
+          // verify that all children we intended to reference have now been built.
+          for(size_t i = 0; i < as->children.size(); i++)
+          {
+            if(!as->children[i]->seenReplayBuild)
+            {
+              RDCERR("TLAS child %u did not get built with initial contents");
+            }
+          }
+
+          if(GetRTManager()->PostbuildReadbackBuffer)
+          {
+            m_Device->CloseInitialStateList();
+            m_Device->ExecuteLists(NULL, true);
+            m_Device->FlushLists(true);
+
+            uint64_t *curSize = (uint64_t *)GetRTManager()->PostbuildReadbackBuffer->Map();
+
+            if(*curSize > as->Size())
+            {
+              RDCERR("BLAS built larger than recorded size - overlap checks will be incorrect");
+            }
+
+            GetRTManager()->PostbuildReadbackBuffer->Unmap();
+
+            list = m_Device->GetInitialStateList();
+          }
+        }
       }
       // if we haven't cached it, build and cache the AS then copy into place
       else if(data.cachedBuiltAS == NULL)
@@ -1994,8 +2155,23 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
                                    D3D12GpuBufferHeapMemoryFlag::Default,
                                    prebuild.ResultDataMaxSizeInBytes, 256, &data.cachedBuiltAS);
 
+        ResourceId origId = GetOriginalID(as->GetResourceID());
+
+        UINT numPostBuilds = 0;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC postDesc[2] = {};
+        if(GetRTManager()->PostbuildReadbackBuffer)
+        {
+          postDesc[0].DestBuffer = GetRTManager()->PostbuildReadbackBuffer->Address();
+          postDesc[0].InfoType = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_CURRENT_SIZE;
+          numPostBuilds++;
+          postDesc[1].DestBuffer = GetRTManager()->PostbuildReadbackBuffer->Address() + 8;
+          postDesc[1].InfoType =
+              D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+          numPostBuilds++;
+        }
+
         desc.DestAccelerationStructureData = data.cachedBuiltAS->Address();
-        list->BuildRaytracingAccelerationStructure(&desc, 0, NULL);
+        list->BuildRaytracingAccelerationStructure(&desc, numPostBuilds, postDesc);
 
         list->ResourceBarrier(1, &barrier);
 
@@ -2003,6 +2179,35 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
         list->CopyRaytracingAccelerationStructure(
             as->GetVirtualAddress(), desc.DestAccelerationStructureData,
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+
+        if(D3D12_Debug_RT_Auditing())
+        {
+          RDCLOG("Apply BLAS - Caching %s to %llx then copying to %llx", ToStr(origId).c_str(),
+                 desc.DestAccelerationStructureData, as->GetVirtualAddress());
+
+          if(GetRTManager()->PostbuildReadbackBuffer)
+          {
+            m_Device->CloseInitialStateList();
+            m_Device->ExecuteLists(NULL, true);
+            m_Device->FlushLists(true);
+
+            uint64_t *curSize = (uint64_t *)GetRTManager()->PostbuildReadbackBuffer->Map();
+
+            if(*curSize > as->Size())
+            {
+              RDCERR(
+                  "BLAS built is %llu which is larger than recorded size %llu (compacted size is "
+                  "%llu) - overlap checks will be incorrect",
+                  curSize[0], as->Size(), curSize[1]);
+            }
+
+            GetRTManager()->PostbuildReadbackBuffer->Unmap();
+
+            list = m_Device->GetInitialStateList();
+          }
+        }
+
+        as->seenReplayBuild = true;
       }
       // if we have a cached AS, just copy from it
       else
@@ -2015,6 +2220,13 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
         list->CopyRaytracingAccelerationStructure(
             as->GetVirtualAddress(), data.cachedBuiltAS->Address(),
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+
+        if(D3D12_Debug_RT_Auditing())
+        {
+          RDCLOG("Apply BLAS - Copying %s from %llx to %llx",
+                 ToStr(GetOriginalID(as->GetResourceID())).c_str(), data.cachedBuiltAS->Address(),
+                 as->GetVirtualAddress());
+        }
       }
 
       list->ResourceBarrier(1, &barrier);

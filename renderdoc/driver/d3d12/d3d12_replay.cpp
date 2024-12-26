@@ -29,7 +29,9 @@
 #include "driver/dxgi/dxgi_common.h"
 #include "driver/ihv/amd/amd_counters.h"
 #include "driver/ihv/amd/amd_rgp.h"
+#include "driver/ihv/nv/nv_aftermath.h"
 #include "driver/ihv/nv/nv_d3d12_counters.h"
+#include "driver/shaders/dxbc/dxbc_common.h"
 #include "maths/camera.h"
 #include "maths/formatpacking.h"
 #include "maths/matrix.h"
@@ -72,6 +74,8 @@ void D3D12Replay::Shutdown()
     m_ProxyResources[i]->Release();
   m_ProxyResources.clear();
 
+  DXBC::ResetSearchDirsCache();
+
   SAFE_DELETE(m_RGP);
 
   if(m_DevConfig)
@@ -79,6 +83,7 @@ void D3D12Replay::Shutdown()
     SAFE_RELEASE(m_DevConfig->debug);
     SAFE_RELEASE(m_DevConfig->devconfig);
     SAFE_RELEASE(m_DevConfig->devfactory);
+    SAFE_RELEASE(m_DevConfig->dred);
 
     m_DevConfig->sdkconfig->FreeUnusedSDKs();
     SAFE_RELEASE(m_DevConfig->sdkconfig);
@@ -129,10 +134,12 @@ void D3D12Replay::Initialise(IDXGIFactory1 *factory, D3D12DevConfiguration *conf
     {
       DXGI_ADAPTER_DESC desc = {};
       pDXGIAdapter->GetDesc(&desc);
+      LARGE_INTEGER version = {};
+      pDXGIAdapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &version);
 
       m_DriverInfo.vendor = GPUVendorFromPCIVendor(desc.VendorId);
 
-      rdcstr descString = GetDriverVersion(desc);
+      rdcstr descString = GetDriverVersion(desc, version);
       descString.resize(RDCMIN(descString.size(), ARRAY_COUNT(m_DriverInfo.version) - 1));
       memcpy(m_DriverInfo.version, descString.c_str(), descString.size());
 
@@ -822,19 +829,24 @@ void D3D12Replay::FillDescriptor(Descriptor &dst, const D3D12Descriptor *src)
 
         WrappedID3D12Resource *asRes = rm->GetCurrentAs<WrappedID3D12Resource>(asID);
 
-        // we *should* get an AS here
-        D3D12AccelerationStructure *as = NULL;
-        asRes->GetAccStructIfExist(dst.byteOffset, &as);
-
-        if(as)
+        if(asRes)
         {
-          dst.resource = rm->GetOriginalID(as->GetResourceID());
-          dst.byteOffset = 0;
-          dst.byteSize = as->Size();
+          // we *should* get an AS here
+          D3D12AccelerationStructure *as = NULL;
+          if(asRes->GetAccStructIfExist(dst.byteOffset, &as))
+          {
+            dst.resource = rm->GetOriginalID(as->GetResourceID());
+            dst.byteOffset = 0;
+            dst.byteSize = as->Size();
+          }
+          else
+          {
+            dst.resource = rm->GetOriginalID(asID);
+          }
         }
         else
         {
-          dst.resource = rm->GetOriginalID(asID);
+          dst.resource = ResourceId();
         }
       }
       else if(srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE1D)
@@ -1585,9 +1597,9 @@ void D3D12Replay::SavePipelineState(uint32_t eventId)
     {
       const D3D12Descriptor &desc = rs.rts[i];
 
+      state.outputMerger.renderTargets.push_back(Descriptor());
       if(desc.GetResResourceId() != ResourceId())
       {
-        state.outputMerger.renderTargets.push_back(Descriptor());
         FillDescriptor(state.outputMerger.renderTargets.back(), &desc);
       }
     }
@@ -2117,6 +2129,16 @@ rdcarray<DescriptorLogicalLocation> D3D12Replay::GetDescriptorLocations(
     {
       // can't set anything except the "bind number" which we just set as the offset.
       ret[dst].fixedBindNumber = descriptorId;
+      if(heap->HasNames())
+      {
+        rdcstr name = heap->GetNames()[descriptorId];
+        if(!name.empty())
+        {
+          ret[dst].logicalBindName = StringFormat::Fmt("%s[%u]", name.c_str(), descriptorId);
+          continue;
+        }
+      }
+
       if(sampler)
         ret[dst].logicalBindName = StringFormat::Fmt("SamplerDescriptorHeap[%u]", descriptorId);
       else
@@ -4630,6 +4652,9 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
   INVAPID3DDevice *nvapiDev = NULL;
   IAGSD3DDevice *agsDev = NULL;
 
+  if(!isProxy)
+    NVAftermath_Init();
+
   if(initParams.VendorExtensions == GPUVendor::nVidia)
   {
     nvapiDev = InitialiseNVAPIReplay();
@@ -4675,7 +4700,7 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
 
   bool shouldEnableDebugLayer = opts.apiValidation;
 
-  if(shouldEnableDebugLayer && !D3D12Core.empty() && D3D12SDKLayers.empty())
+  if(shouldEnableDebugLayer && !D3D12Core.empty() && D3D12SDKLayers.empty() && !config)
   {
     RDCWARN(
         "Not enabling D3D debug layers because we captured a D3D12Core.dll but not a matching "
@@ -4690,9 +4715,15 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
     if(!debugLayerEnabled && !isProxy)
     {
       RDCLOG(
-          "Enabling the D3D debug layers failed, "
-          "ensure you have the windows SDK or windows feature needed.");
+          "Enabling the D3D debug layers failed, ensure you have the windows SDK or windows "
+          "feature needed or if using a locally distributed D3D12 dll ensure you have "
+          "D3D12SDKLayers.dll available next to it.");
     }
+  }
+
+  if(EnableDRED(config, NULL))
+  {
+    RDCLOG("DRED enabled");
   }
 
   ID3D12Device *dev = NULL;
@@ -4757,6 +4788,8 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
           "support nvapi extensions");
     }
   }
+
+  NVAftermath_EnableD3D12(dev);
 
   WrappedID3D12Device *wrappedDev = new WrappedID3D12Device(dev, initParams, debugLayerEnabled);
   wrappedDev->SetInitParams(initParams, ver, opts, nvapiDev, agsDev);

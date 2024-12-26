@@ -114,6 +114,8 @@ struct DescSetLayout
     {
       if(variableSize)
         return varDescriptorSize;
+      if(layoutDescType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+        return 1;
       return descriptorCount;
     }
   };
@@ -238,6 +240,8 @@ struct VulkanCreationInfo
     ShaderReflection *refl = NULL;
     SPIRVPatchData *patchData = NULL;
 
+    VkPipelineShaderStageCreateFlags flags;
+
     rdcarray<SpecConstant> specialization;
 
     // VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
@@ -287,6 +291,9 @@ struct VulkanCreationInfo
     rdcarray<VkFormat> colorFormats;
     VkFormat depthFormat;
     VkFormat stencilFormat;
+
+    // VkRenderingAttachmentLocationInfoKHR and VkRenderingInputAttachmentIndexInfoKHR
+    DynamicRenderingLocalRead dynamicRenderingLocalRead;
 
     // a variant of the pipeline that uses subpass 0, used for when we are replaying in isolation.
     // See loadRPs in the RenderPass info

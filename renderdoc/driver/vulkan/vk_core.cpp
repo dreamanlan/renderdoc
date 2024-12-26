@@ -27,6 +27,7 @@
 #include <algorithm>
 #include "core/settings.h"
 #include "driver/ihv/amd/amd_rgp.h"
+#include "driver/ihv/nv/nv_aftermath.h"
 #include "driver/shaders/spirv/spirv_compile.h"
 #include "jpeg-compressor/jpge.h"
 #include "maths/formatpacking.h"
@@ -44,9 +45,6 @@ RDOC_EXTERN_CONFIG(bool, Vulkan_Debug_VerboseCommandRecording);
 RDOC_DEBUG_CONFIG(bool, Vulkan_Debug_SingleSubmitFlushing, false,
                   "Every command buffer is submitted and fully flushed to the GPU, to narrow down "
                   "the source of problems.");
-
-RDOC_DEBUG_CONFIG(bool, Vulkan_Experimental_EnableRTSupport, false,
-                  "Enable experimental Vulkan RT support");
 
 uint64_t VkInitParams::GetSerialiseSize()
 {
@@ -1491,6 +1489,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_KHR_DYNAMIC_RENDERING_SPEC_VERSION,
     },
     {
+        VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME,
+        VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_SPEC_VERSION,
+    },
+    {
         VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,
         VK_KHR_EXTERNAL_FENCE_SPEC_VERSION,
     },
@@ -2060,10 +2062,6 @@ VkResult WrappedVulkan::FilterDeviceExtensionProperties(VkPhysicalDevice physDev
 
       if(!strcmp(ext.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME))
       {
-        // remove unconditionally if the option isn't on
-        if(!Vulkan_Experimental_EnableRTSupport())
-          return true;
-
         // require GPDP2
         if(instDevInfo->ext_KHR_get_physical_device_properties2)
         {
@@ -2091,25 +2089,8 @@ VkResult WrappedVulkan::FilterDeviceExtensionProperties(VkPhysicalDevice physDev
         return true;
       }
 
-      // remove unconditionally if the option isn't on
-      if(!strcmp(ext.extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME))
-      {
-        if(!Vulkan_Experimental_EnableRTSupport())
-          return true;
-      }
-
-      if(!strcmp(ext.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
-      {
-        if(!Vulkan_Experimental_EnableRTSupport())
-          return true;
-      }
-
       if(!strcmp(ext.extensionName, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME))
       {
-        // remove unconditionally if the option isn't on
-        if(!Vulkan_Experimental_EnableRTSupport())
-          return true;
-
         // require GPDP2
         if(instDevInfo->ext_KHR_get_physical_device_properties2)
         {
@@ -3372,6 +3353,10 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
       {
         VkDebugUtilsObjectNameInfoEXT name = {VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
         name.pObjectName = it->second.c_str();
+
+        if(!GetResourceManager()->HasCurrentResource(it->first))
+          continue;
+
         WrappedVkRes *res = GetResourceManager()->GetCurrentResource(it->first);
 
         if(res)
@@ -3740,10 +3725,21 @@ void WrappedVulkan::ApplyInitialContents()
       for(uint32_t q = 0; q < r.queryCount; q++)
       {
         // Timestamps are easy - we can do these without needing to render
-        if(m_CreationInfo.m_QueryPool[GetResID(r.pool)].queryType == VK_QUERY_TYPE_TIMESTAMP)
+        VkQueryType queryType = m_CreationInfo.m_QueryPool[GetResID(r.pool)].queryType;
+        if(queryType == VK_QUERY_TYPE_TIMESTAMP)
         {
           ObjDisp(cmd)->CmdWriteTimestamp(Unwrap(cmd), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                           Unwrap(r.pool), r.firstQuery + q);
+        }
+        else if(queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ||
+                queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ||
+                queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR)
+        {
+          /*
+          ObjDisp(cmd)->CmdWriteAccelerationStructuresPropertiesKHR(
+              Unwrap(commandBuffer), 1, UnwrapPtr(m_DummyQueryAS), CreateInfo.queryType,
+              Unwrap(pool), i);
+              */
         }
         else
         {
@@ -4230,6 +4226,10 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
     case VulkanChunk::vkCmdBeginRendering:
       return Serialise_vkCmdBeginRendering(ser, VK_NULL_HANDLE, NULL);
     case VulkanChunk::vkCmdEndRendering: return Serialise_vkCmdEndRendering(ser, VK_NULL_HANDLE);
+    case VulkanChunk::vkCmdSetRenderingAttachmentLocationsKHR:
+      return Serialise_vkCmdSetRenderingAttachmentLocationsKHR(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdSetRenderingInputAttachmentIndicesKHR:
+      return Serialise_vkCmdSetRenderingInputAttachmentIndicesKHR(ser, VK_NULL_HANDLE, NULL);
 
     case VulkanChunk::vkCmdSetFragmentShadingRateKHR:
       return Serialise_vkCmdSetFragmentShadingRateKHR(ser, VK_NULL_HANDLE, NULL, NULL);
@@ -4911,6 +4911,8 @@ void WrappedVulkan::CheckErrorVkResult(const char *file, int line, VkResult vkr)
     SET_ERROR_RESULT(m_FatalError, ResultCode::DeviceLost,
                      "Logging device lost fatal error at %s:%d: %s", file, line, ToStr(vkr).c_str());
     m_FailedReplayResult = m_FatalError;
+
+    NVAftermath_DumpCrash();
   }
   else if(vkr == VK_ERROR_OUT_OF_HOST_MEMORY || vkr == VK_ERROR_OUT_OF_DEVICE_MEMORY)
   {
@@ -5335,6 +5337,21 @@ ResourceId WrappedVulkan::GetPartialCommandBuffer()
     return ResourceId();
 
   return m_Partial.partialStack.back().cmdId;
+}
+
+void WrappedVulkan::AddForcedReference(VkResourceRecord *record)
+{
+  {
+    SCOPED_LOCK(m_ForcedReferencesLock);
+    m_ForcedReferences.push_back(record);
+  }
+
+  // in case we're currently capturing, immediately consider the resource as referenced. If we're
+  // not capturing this will naturally be cleared before the frame capture starts and we don't have
+  // to consider races as this is internally locked. If we're racing with a frame capture starting
+  // we will either add this redundantly (after clear but before forced references are added) or as
+  // required (after references are cleared and after forced references are added)
+  GetResourceManager()->MarkResourceFrameReferenced(record->GetResourceID(), eFrameRef_Read);
 }
 
 void WrappedVulkan::AddAction(const ActionDescription &a)
@@ -6006,7 +6023,7 @@ void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &act
         VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_QUEUE_FAMILY_IGNORED,
         VK_QUEUE_FAMILY_IGNORED,
-        Unwrap(m_IndirectBuffer.buf),
+        m_IndirectBuffer.UnwrappedBuffer(),
         m_IndirectBufferSize,
         m_IndirectBufferSize,
     };
@@ -6015,8 +6032,8 @@ void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &act
     DoPipelineBarrier(cmd, 1, &bufBarrier);
 
     // initialise to 0 so all other draws don't draw anything
-    ObjDisp(cmd)->CmdFillBuffer(Unwrap(cmd), Unwrap(m_IndirectBuffer.buf), m_IndirectBufferSize,
-                                m_IndirectBufferSize, 0);
+    ObjDisp(cmd)->CmdFillBuffer(Unwrap(cmd), m_IndirectBuffer.UnwrappedBuffer(),
+                                m_IndirectBufferSize, m_IndirectBufferSize, 0);
 
     // wait for fill to complete before update
     bufBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -6025,7 +6042,7 @@ void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &act
     DoPipelineBarrier(cmd, 1, &bufBarrier);
 
     // upload the parameters for the draw we want
-    ObjDisp(cmd)->CmdUpdateBuffer(Unwrap(cmd), Unwrap(m_IndirectBuffer.buf),
+    ObjDisp(cmd)->CmdUpdateBuffer(Unwrap(cmd), m_IndirectBuffer.UnwrappedBuffer(),
                                   m_IndirectBufferSize + params.size() * action.drawIndex,
                                   params.size(), params.data());
 
@@ -6036,16 +6053,17 @@ void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &act
     DoPipelineBarrier(cmd, 1, &bufBarrier);
 
     if(action.flags & ActionFlags::MeshDispatch)
-      ObjDisp(cmd)->CmdDrawMeshTasksIndirectEXT(Unwrap(cmd), Unwrap(m_IndirectBuffer.buf),
+      ObjDisp(cmd)->CmdDrawMeshTasksIndirectEXT(Unwrap(cmd), m_IndirectBuffer.UnwrappedBuffer(),
                                                 m_IndirectBufferSize, action.drawIndex + 1,
                                                 (uint32_t)params.size());
     else if(action.flags & ActionFlags::Indexed)
-      ObjDisp(cmd)->CmdDrawIndexedIndirect(Unwrap(cmd), Unwrap(m_IndirectBuffer.buf),
+      ObjDisp(cmd)->CmdDrawIndexedIndirect(Unwrap(cmd), m_IndirectBuffer.UnwrappedBuffer(),
                                            m_IndirectBufferSize, action.drawIndex + 1,
                                            (uint32_t)params.size());
     else
-      ObjDisp(cmd)->CmdDrawIndirect(Unwrap(cmd), Unwrap(m_IndirectBuffer.buf), m_IndirectBufferSize,
-                                    action.drawIndex + 1, (uint32_t)params.size());
+      ObjDisp(cmd)->CmdDrawIndirect(Unwrap(cmd), m_IndirectBuffer.UnwrappedBuffer(),
+                                    m_IndirectBufferSize, action.drawIndex + 1,
+                                    (uint32_t)params.size());
 
     VkMarkerRegion::End(cmd);
   }

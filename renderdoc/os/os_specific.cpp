@@ -199,6 +199,26 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
     FileIO::GetLibraryFilename(libPath);
     CHECK_FALSE(libPath.empty());
   }
+  SECTION("OpenTransientFileHandle")
+  {
+    rdcstr filename = FileIO::GetTempFolderFilename() + "/rdcunittestfile";
+    INFO(filename);
+    FILE *f = FileIO::OpenTransientFileHandle(filename, FileIO::OverwriteBinary);
+    CHECK(f);
+
+    uint32_t magic = 0xdeadbeef;
+    FileIO::fwrite(&magic, sizeof(uint32_t), 1, f);
+
+    uint32_t readback = 0;
+    FileIO::fseek64(f, 0, SEEK_SET);
+
+    FileIO::fread(&readback, sizeof(uint32_t), 1, f);
+
+    CHECK(magic == readback);
+
+    FileIO::fclose(f);
+    CHECK_FALSE(FileIO::exists(filename));
+  }
   SECTION("Environment Variables")
   {
     rdcstr var = Process::GetEnvVariable("TMP");

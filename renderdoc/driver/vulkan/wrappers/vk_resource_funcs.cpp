@@ -506,6 +506,30 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   VkMemoryAllocateFlagsInfo *memFlags = (VkMemoryAllocateFlagsInfo *)FindNextStruct(
       &unwrapped, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
 
+  static VkMemoryAllocateFlagsInfo rtForcedFlags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+
+  // massive wart and oversight in RT APIs. ASs are bound to buffers which are then bound to memory.
+  // Buffers are not required to be BDA, but we need them to be BDA capture/replay'd in order to
+  // capture/replay the AS itself. However, we have no way of knowing which memory such a buffer
+  // will be bound against since there's no requirement for the buffer to be marked as BDA. This
+  // means that when RT is enabled ALL MEMORY IN THE ENTIRE PROGRAM must be marked as BDA just in
+  // case.
+  if(IsCaptureMode(m_State) && AccelerationStructures())
+  {
+    // force BDA flag when creating, by adding the struct if needed
+    if(memFlags)
+    {
+      memFlags->flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    }
+    else
+    {
+      rtForcedFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT |
+                            VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+      rtForcedFlags.pNext = unwrapped.pNext;
+      unwrapped.pNext = &rtForcedFlags;
+    }
+  }
+
   // since the application must specify VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT itself, we can
   // assume the struct is present and just add the capture-replay flag to allow us to specify the
   // address on replay. We ensured the physical device can support this feature (and it was enabled)
@@ -664,6 +688,22 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
 
       memFlags = (VkMemoryAllocateFlagsInfo *)FindNextStruct(
           &serialisedInfo, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
+
+      // see above for this gross workaround we have to do
+      if(AccelerationStructures())
+      {
+        if(memFlags)
+        {
+          memFlags->flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        }
+        else
+        {
+          // if we don't have memFlags here we also filled out rtForcedFlags above
+          memFlags = &rtForcedFlags;
+          rtForcedFlags.pNext = serialisedInfo.pNext;
+          serialisedInfo.pNext = &rtForcedFlags;
+        }
+      }
 
       if(memFlags && (memFlags->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT))
       {
@@ -1510,9 +1550,8 @@ VkResult WrappedVulkan::vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkD
     // if the buffer was force-referenced, do the same with the memory
     if(IsForcedReference(record))
     {
-      // in case we're currently capturing, immediately consider the buffer and backing memory as
-      // read-before-write referenced
-      GetResourceManager()->MarkResourceFrameReferenced(record->GetResourceID(), eFrameRef_Read);
+      // AddForcedReference will also call MarkResourceFrameReferenced() on the buffer in case
+      // we're currently capturing, do the same with the memory with the correct semantics.
       GetResourceManager()->MarkMemoryFrameReferenced(id, memoryOffset, record->memSize,
                                                       eFrameRef_ReadBeforeWrite);
 
@@ -1819,12 +1858,16 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
       };
 
       VkResourceRecord *record = GetResourceManager()->AddResourceRecord(*pBuffer);
-      record->memSize = pCreateInfo->size;
+      record->memSize = serialisedCreateInfo.size;
+
+      // If we're using this buffer for AS storage we need to enable BDA
+      if(serialisedCreateInfo.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
+        serialisedCreateInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
       // if we're using VK_[KHR|EXT]_buffer_device_address, we fetch the device address that's been
       // allocated and insert it into the next chain and patch the flags so that it replays
       // naturally.
-      if((pCreateInfo->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0)
+      if((serialisedCreateInfo.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0)
       {
         VkBufferDeviceAddressInfo getInfo = {
             VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
@@ -1912,10 +1955,16 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
         ObjDisp(device)->GetBufferMemoryRequirements(Unwrap(device), Unwrap(*pBuffer),
                                                      &record->resInfo->memreqs);
 
-        // initialise the sparse page table
         if(isSparse)
+        {
+          // initialise the sparse page table
           record->resInfo->sparseTable.Initialise(pCreateInfo->size,
                                                   record->resInfo->memreqs.alignment & 0xFFFFFFFFU);
+
+          // Track the buffer address.  We only do this here for sparse buffers as they aren't
+          // bound against a single allocation
+          TrackBufferAddress(device, *pBuffer);
+        }
 
         // for external buffers, try creating a non-external version and take the worst case of
         // memory requirements, in case the non-external one (as we will replay it) needs more
@@ -3014,9 +3063,8 @@ VkResult WrappedVulkan::vkBindBufferMemory2(VkDevice device, uint32_t bindInfoCo
       // if the buffer was force-referenced, do the same with the memory
       if(IsForcedReference(bufrecord))
       {
-        // in case we're currently capturing, immediately consider the buffer and backing memory as
-        // read-before-write referenced
-        GetResourceManager()->MarkResourceFrameReferenced(bufrecord->GetResourceID(), eFrameRef_Read);
+        // AddForcedReference will also call MarkResourceFrameReferenced() on the buffer in case
+        // we're currently capturing, do the same with the memory with the correct semantics.
         GetResourceManager()->MarkMemoryFrameReferenced(
             GetResID(pBindInfos[i].memory), pBindInfos[i].memoryOffset, bufrecord->memSize,
             eFrameRef_ReadBeforeWrite);
@@ -3403,6 +3451,9 @@ VkResult WrappedVulkan::vkCreateAccelerationStructureKHR(
         // reference them.  We force ref generics too as they could bottom or top level so we
         // conservatively assume they are bottom
         AddForcedReference(record);
+
+        // in case we're currently capturing, immediately consider the AS as referenced
+        GetResourceManager()->MarkResourceFrameReferenced(record->GetResourceID(), eFrameRef_Read);
       }
     }
     else

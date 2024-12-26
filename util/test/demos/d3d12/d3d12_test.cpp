@@ -814,7 +814,7 @@ void D3D12GraphicsTest::Present()
     m_GPUSyncCounter++;
     queue->Signal(m_GPUSyncFence, m_GPUSyncCounter);
 
-    pendingCommandBuffers.push_back(std::make_pair(cmd, m_GPUSyncFence));
+    pendingCommandBuffers.push_back(std::make_pair(cmd, m_GPUSyncCounter));
   }
 
   for(auto it = pendingCommandBuffers.begin(); it != pendingCommandBuffers.end();)
@@ -1332,9 +1332,11 @@ COM_SMARTPTR(IDxcOperationResult);
 COM_SMARTPTR(IDxcBlob);
 
 ID3DBlobPtr D3D12GraphicsTest::Compile(std::string src, std::string entry, std::string profile,
-                                       bool skipoptimise)
+                                       uint32_t compileOptions)
 {
   ID3DBlobPtr blob = NULL;
+  bool skipoptimise = ((compileOptions & CompileOptionFlags::SkipOptimise) != 0);
+  bool enable16BitTypes = ((compileOptions & CompileOptionFlags::Enable16BitTypes) != 0);
 
   if(profile[3] >= '6')
   {
@@ -1388,6 +1390,10 @@ ID3DBlobPtr D3D12GraphicsTest::Compile(std::string src, std::string entry, std::
       argStorage.push_back(L"-O1");
     }
     argStorage.push_back(L"-Zi");
+    if(enable16BitTypes)
+      argStorage.push_back(L"-enable-16bit-types");
+
+    // Must be the final option
     argStorage.push_back(L"-Qembed_debug");
 
     for(size_t i = 0; i < argStorage.size(); i++)

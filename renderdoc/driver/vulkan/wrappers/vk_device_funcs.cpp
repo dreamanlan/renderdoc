@@ -30,6 +30,7 @@
 #include "../vk_shader_cache.h"
 #include "api/replay/version.h"
 #include "core/settings.h"
+#include "driver/ihv/nv/nv_aftermath.h"
 #include "strings/string_utils.h"
 
 RDOC_CONFIG(
@@ -3093,6 +3094,14 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(dynamicRenderingLocalRead);
+      }
+      END_PHYS_EXT_CHECK();
+
       BEGIN_PHYS_EXT_CHECK(VkPhysicalDevice4444FormatsFeaturesEXT,
                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT);
       {
@@ -3355,6 +3364,19 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         VkPhysicalDeviceProperties2 availPropsBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         availPropsBase.pNext = &rayProps;
         ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), &availPropsBase);
+
+        if(ext->rayTracingPipeline && !avail.rayTracingPipelineShaderGroupHandleCaptureReplay)
+        {
+          SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                           "Capture requires rayTracingPipeline support, which is available, but "
+                           "rayTracingPipelineShaderGroupHandleCaptureReplay support is not "
+                           "available which is required to replay\n"
+                           "\n%s",
+                           GetPhysDeviceCompatString(false, false).c_str());
+          return false;
+        }
+        if(ext->rayTracingPipeline)
+          ext->rayTracingPipelineShaderGroupHandleCaptureReplay = VK_TRUE;
       }
       END_PHYS_EXT_CHECK();
     }
@@ -3912,6 +3934,9 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         physDevs[i] = Unwrap(m_PhysicalDevices[GetPhysicalDeviceIndexFromHandle(physDevs[i])]);
     }
 
+    NVAftermath_Init();
+    NVAftermath_EnableVK(supportedExtensions, Extensions, &createInfo.pNext);
+
     vkr = GetDeviceDispatchTable(NULL)->CreateDevice(Unwrap(physicalDevice), &createInfo, NULL,
                                                      &device);
 
@@ -4048,6 +4073,11 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     {
       uint32_t qidx = createInfo.pQueueCreateInfos[i].queueFamilyIndex;
       m_ExternalQueues.resize(RDCMAX((uint32_t)m_ExternalQueues.size(), qidx + 1));
+
+      // Resize also the image barriers, as ImageBarrierSequence::SetMaxQueueFamilyIndex
+      // just sets the static MaxQueueFamilyIndex
+      m_setupImageBarriers.ResizeForMaxQueueFamilyIndex(qidx);
+      m_cleanupImageBarriers.ResizeForMaxQueueFamilyIndex(qidx);
 
       ImageBarrierSequence::SetMaxQueueFamilyIndex(qidx);
 
@@ -4412,6 +4442,8 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
   {
     accFeatures->accelerationStructureCaptureReplay = VK_TRUE;
     m_AccelerationStructures = true;
+
+    RDCLOG("Acceleration structures enabled, ALL MEMORY WILL BE MARKED AS BDA");
   }
 
   VkPhysicalDeviceRayTracingPipelineFeaturesKHR *rtpFeatures =
@@ -4535,6 +4567,11 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     {
       uint32_t qidx = createInfo.pQueueCreateInfos[i].queueFamilyIndex;
       m_ExternalQueues.resize(RDCMAX((uint32_t)m_ExternalQueues.size(), qidx + 1));
+
+      // Resize also the image barriers, as ImageBarrierSequence::SetMaxQueueFamilyIndex
+      // just sets the static MaxQueueFamilyIndex
+      m_setupImageBarriers.ResizeForMaxQueueFamilyIndex(qidx);
+      m_cleanupImageBarriers.ResizeForMaxQueueFamilyIndex(qidx);
 
       ImageBarrierSequence::SetMaxQueueFamilyIndex(qidx);
 

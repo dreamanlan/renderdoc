@@ -1021,6 +1021,17 @@ bucket when the pixel values are divided between ``minval`` and ``maxval``.
   virtual ShaderDebugTrace *DebugThread(const rdcfixedarray<uint32_t, 3> &groupid,
                                         const rdcfixedarray<uint32_t, 3> &threadid) = 0;
 
+  DOCUMENT(R"(Retrieve a debugging trace from running a mesh shader.
+
+:param Tuple[int,int,int] groupid: A list containing the 3D workgroup index.
+:param Tuple[int,int,int] threadid: A list containing the 3D thread index within the workgroup.
+:return: The resulting trace resulting from debugging. Destroy with
+  :meth:`FreeTrace`.
+:rtype: ShaderDebugTrace
+)");
+  virtual ShaderDebugTrace *DebugMeshThread(const rdcfixedarray<uint32_t, 3> &groupid,
+                                            const rdcfixedarray<uint32_t, 3> &threadid) = 0;
+
   DOCUMENT(R"(Continue a shader's debugging with a given shader debugger instance. This will run an
 implementation defined number of steps and then return those steps in a list. This may be a fixed
 number of steps or it may run for a fixed length of time and return as many steps as can be
@@ -1211,6 +1222,7 @@ The details of the types of messages that can be received are listed under
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value when a long blocking message is coming through, e.g. a capture copy. Can be ``None`` if no
   progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 :return: The message that was received.
 :rtype: TargetControlMessage
 )");
@@ -1311,6 +1323,7 @@ separate thread.
   fail.
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value for the resolver process. Can be ``None`` if no progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 :return: The result of the operation.
 :rtype: ResultDetails
 )");
@@ -1442,6 +1455,7 @@ the capture must be available on the machine where the replay happens.
 :param str filename: The path to the file on the local system.
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value for the copy. Can be ``None`` if no progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 :return: The path on the remote system where the capture was saved temporarily.
 :rtype: str
 )");
@@ -1455,6 +1469,7 @@ This function will block until the copy is fully complete, or an error has occur
 :param str localpath: The local path where the file should be saved.
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value for the copy. Can be ``None`` if no progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 )");
   virtual void CopyCaptureFromRemote(const rdcstr &remotepath, const rdcstr &localpath,
                                      RENDERDOC_ProgressCallback progress) = 0;
@@ -1477,6 +1492,7 @@ or an error has occurred.
 :param ReplayOptions opts: The options controlling how the capture should be replayed.
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value for the opening. Can be ``None`` if no progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 :return: A tuple containing the status of opening the capture, whether success or failure, and the
   resulting :class:`ReplayController` handle if successful.
 :rtype: Tuple[ResultDetails,ReplayController]
@@ -1519,6 +1535,7 @@ empty or unrecognised.
 :param str filetype: The format of the given file.
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value if an import step occurs. Can be ``None`` if no progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 :return: The result of the operation.
 :rtype: ResultDetails
 )");
@@ -1535,6 +1552,7 @@ For the :paramref:`OpenBuffer.filetype` parameter, see :meth:`OpenFile`.
 :param str filetype: The format of the given file.
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value if an import step occurs. Can be ``None`` if no progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 :return: The result of the operation.
 :rtype: ResultDetails
 )");
@@ -1568,6 +1586,7 @@ representation back to native RDC.
   again. If ``None`` then structured data will be fetched if not already present and used.
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value for the conversion. Can be ``None`` if no progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 :return: The result of the operation.
 :rtype: ResultDetails
 )");
@@ -1655,6 +1674,7 @@ by the :class:`ReplayController`.
 :param ReplayOptions opts: The options controlling how the capture should be replayed.
 :param ProgressCallback progress: A callback that will be repeatedly called with an updated progress
   value for the opening. Can be ``None`` if no progress is desired.
+  Callback function signature must match :func:`ProgressCallback`.
 :return: A tuple containing the status of opening the capture, whether success or failure, and the
   resulting :class:`ReplayController` handle if successful.
 :rtype: Tuple[ResultDetails,ReplayController]
@@ -1934,8 +1954,10 @@ This function will block until a remote connection tells the server to shut down
 :param int port: The port to listen on, or ``0`` to listen on the default port.
 :param KillCallback killReplay: A callback that returns a ``bool`` indicating if the server should
   be shut down or not.
+  Callback function signature must match :func:`KillCallback`.
 :param PreviewWindowCallback previewWindow: A callback that returns information for a preview window
   when the server wants to display some preview of the ongoing replay.
+  Callback function signature must match :func:`PreviewWindowCallback`.
 )");
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_BecomeRemoteServer(
     const rdcstr &listenhost, uint16_t port, RENDERDOC_KillCallback killReplay,

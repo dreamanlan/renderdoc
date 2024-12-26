@@ -41,7 +41,7 @@ void FetchConstantBufferData(WrappedID3D12Device *device, const DXIL::Program *p
 class D3D12APIWrapper : public DebugAPIWrapper
 {
 public:
-  D3D12APIWrapper(WrappedID3D12Device *device, const DXBC::DXBCContainer *dxbcContainer,
+  D3D12APIWrapper(WrappedID3D12Device *device, const DXIL::Program &dxilProgram,
                   GlobalState &globalState, uint32_t eventId);
   ~D3D12APIWrapper();
 
@@ -60,14 +60,13 @@ public:
   ShaderVariable GetSampleInfo(DXIL::ResourceClass resClass, const DXDebug::BindingSlot &slot,
                                const DXBC::ShaderType shaderType, const char *opString);
   ShaderVariable GetRenderTargetSampleInfo(const DXBC::ShaderType shaderType, const char *opString);
-  bool IsResourceBound(DXIL::ResourceClass resClass, const DXDebug::BindingSlot &slot);
+  ResourceReferenceInfo GetResourceReferenceInfo(const DXDebug::BindingSlot &slot);
+  ShaderDirectAccess GetShaderDirectAccess(DescriptorCategory category,
+                                           const DXDebug::BindingSlot &slot);
 
 private:
-  bool IsSRVBound(const BindingSlot &slot);
-  bool IsUAVBound(const BindingSlot &slot);
-
   WrappedID3D12Device *m_Device;
-  const DXBC::DXBCContainer *m_DXBC;
+  const DXIL::EntryPointInterface *m_EntryPointInterface;
   GlobalState &m_GlobalState;
   DXBC::ShaderType m_ShaderType;
   const uint32_t m_EventId;

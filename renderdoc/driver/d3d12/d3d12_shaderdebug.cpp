@@ -276,6 +276,10 @@ bool D3D12ShaderDebug::CalculateSampleGather(
   };
 
   cbufferData.debugSampleRetType = retTypes[resourceData.retType];
+  if(cbufferData.debugSampleRetType == 0)
+  {
+    RDCERR("Unsupported return type %d in sample operation", resourceData.retType);
+  }
 
   cbufferData.debugSampleGatherChannel = (int)gatherChannel;
   cbufferData.debugSampleSampleIndex = multisampleIndex;
@@ -321,6 +325,13 @@ bool D3D12ShaderDebug::CalculateSampleGather(
        sampleOp == DEBUG_SAMPLE_TEX_GATHER4_CMP || sampleOp == DEBUG_SAMPLE_TEX_GATHER4_PO_CMP)
       samp.ptr += sizeof(D3D12Descriptor);
 
+    if((sampleOp == DEBUG_SAMPLE_TEX_SAMPLE_BIAS || sampleOp == DEBUG_SAMPLE_TEX_SAMPLE_CMP_BIAS) &&
+       samplerData.bias != 0.0f)
+    {
+      D3D12_SAMPLER_DESC2 desc = descriptor.GetSampler();
+      desc.MipLODBias = RDCCLAMP(desc.MipLODBias + samplerData.bias, -15.99f, 15.99f);
+      descriptor.Init(&desc);
+    }
     descriptor.Create(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, device, samp);
   }
 
@@ -419,11 +430,63 @@ bool D3D12ShaderDebug::CalculateSampleGather(
 }
 
 D3D12Descriptor D3D12ShaderDebug::FindDescriptor(WrappedID3D12Device *device,
+                                                 const DXDebug::HeapDescriptorType heapType,
+                                                 uint32_t descriptorIndex)
+{
+  RDCASSERT(heapType != HeapDescriptorType::NoHeap);
+
+  const D3D12RenderState &rs = device->GetQueue()->GetCommandData()->m_RenderState;
+  D3D12ResourceManager *rm = device->GetResourceManager();
+  // Fetch the correct heap sampler and resource descriptor heaps
+  WrappedID3D12DescriptorHeap *descHeap = NULL;
+
+  rdcarray<ResourceId> descHeaps = rs.heaps;
+  for(ResourceId heapId : descHeaps)
+  {
+    WrappedID3D12DescriptorHeap *pD3D12Heap = rm->GetCurrentAs<WrappedID3D12DescriptorHeap>(heapId);
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = pD3D12Heap->GetDesc();
+    if(heapDesc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+    {
+      if((heapType == HeapDescriptorType::Sampler) && (descHeap == NULL))
+        descHeap = pD3D12Heap;
+    }
+    else
+    {
+      RDCASSERT(heapDesc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      if((heapType == HeapDescriptorType::CBV_SRV_UAV) && (descHeap == NULL))
+        descHeap = pD3D12Heap;
+    }
+  }
+
+  if(descHeap == NULL)
+  {
+    RDCERR("Couldn't find descriptor heap type %u", heapType);
+    return D3D12Descriptor();
+  }
+
+  D3D12Descriptor *desc = (D3D12Descriptor *)descHeap->GetCPUDescriptorHandleForHeapStart().ptr;
+  if(descriptorIndex >= descHeap->GetNumDescriptors())
+  {
+    RDCERR("Descriptor index %u out of bounds Max:%u", descriptorIndex,
+           descHeap->GetNumDescriptors());
+    return D3D12Descriptor();
+  }
+
+  desc += descriptorIndex;
+  return *desc;
+}
+
+D3D12Descriptor D3D12ShaderDebug::FindDescriptor(WrappedID3D12Device *device,
                                                  D3D12_DESCRIPTOR_RANGE_TYPE descType,
                                                  const BindingSlot &slot,
                                                  const DXBC::ShaderType shaderType)
 {
   D3D12Descriptor descriptor;
+
+  if(slot.heapType != DXDebug::HeapDescriptorType::NoHeap)
+  {
+    return FindDescriptor(device, slot.heapType, slot.descriptorIndex);
+  }
 
   const D3D12RenderState &rs = device->GetQueue()->GetCommandData()->m_RenderState;
   D3D12ResourceManager *rm = device->GetResourceManager();
@@ -2195,6 +2258,7 @@ ShaderDebugTrace *D3D12Replay::DebugVertex(uint32_t eventId, uint32_t vertid, ui
       }
     }
     ret->inputs = {activeState.m_Input};
+    ret->constantBlocks = globalState.constantBlocks;
     delete[] instData;
   }
 
@@ -2290,9 +2354,10 @@ ShaderDebugTrace *D3D12Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t
   else
     DXILDebug::GetInterpolationModeForInputParams(inputSig, dxbc->GetDXILByteCode(), interpModes);
 
+  std::map<ShaderBuiltin, rdcstr> usedInputs;    // only used for DXIL
   DXDebug::GatherPSInputDataForInitialValues(inputSig, prevDxbc->GetReflection()->OutputSig,
                                              interpModes, initialValues, floatInputs, inputVarNames,
-                                             extractHlsl, structureStride);
+                                             extractHlsl, structureStride, usedInputs);
 
   uint32_t overdrawLevels = 100;    // maximum number of overdraw levels
 
@@ -2459,18 +2524,17 @@ struct PSInitialData
   // The semantics that RenderDoc requires in the shader
   bool inputHas_SV_Position = false;
   bool inputHas_SV_PrimitiveID = false;
-  bool inputHas_SV_SampleIndex = false;
+  // SV_Coverage, SV_IsFrontFace, SV_SampleIndex : are not in the input structure, see
+  // GatherPSInputDataForInitialValues
   bool inputHas_SV_Coverage = false;
   bool inputHas_SV_IsFrontFace = false;
+  bool inputHas_SV_SampleIndex = false;
 
   // DXC compiler errors if a semantic input is declared in multiple places
   if(dxbc->GetDXILByteCode())
   {
-    inputHas_SV_Position = extractHlsl.contains(": SV_Position");
-    inputHas_SV_PrimitiveID = extractHlsl.contains(": SV_PrimitiveID");
-    inputHas_SV_SampleIndex = extractHlsl.contains(": SV_SampleIndex");
-    inputHas_SV_Coverage = extractHlsl.contains(": SV_Coverage");
-    inputHas_SV_IsFrontFace = extractHlsl.contains(": SV_IsFrontFace");
+    inputHas_SV_Position = usedInputs.count(ShaderBuiltin::Position) > 0;
+    inputHas_SV_PrimitiveID = usedInputs.count(ShaderBuiltin::PrimitiveIndex) > 0;
   }
 
   extractHlsl += "void ExtractInputsPS(PSInput IN";
@@ -2489,15 +2553,9 @@ struct PSInitialData
 
   // Only used for DXIL shaders: copy any SV inputs we need from the input structure
   if(inputHas_SV_Position)
-    extractHlsl += "  float4 debug_pixelPos = IN.input_SV_Position;\n";
+    extractHlsl += "  float4 debug_pixelPos = IN." + usedInputs[ShaderBuiltin::Position] + ";\n";
   if(usePrimitiveID && inputHas_SV_PrimitiveID)
-    extractHlsl += "  uint prim = IN.input_SV_PrimitiveID;\n";
-  if(inputHas_SV_SampleIndex)
-    extractHlsl += "  uint sample = IN.input_SV_SampleIndex;\n";
-  if(inputHas_SV_Coverage)
-    extractHlsl += "  uint covge = IN.input_SV_Coverage;\n";
-  if(inputHas_SV_IsFrontFace)
-    extractHlsl += "  bool fface = IN.input_SV_IsFrontFace;\n";
+    extractHlsl += "  uint prim = IN." + usedInputs[ShaderBuiltin::PrimitiveIndex] + ";\n";
 
   extractHlsl += "  uint idx = " + ToStr(overdrawLevels) + ";\n";
   extractHlsl += StringFormat::Fmt(
@@ -2607,8 +2665,26 @@ struct PSInitialData
   }
   else
   {
-    if(m_pDevice->GetShaderCache()->GetShaderBlob(extractHlsl.c_str(), "ExtractInputsPS", flags, {},
-                                                  "ps_6_0", &psBlob) != "")
+    // get the profile and shader compile flags from the vertex shader
+    rdcstr compSig = dxbc->GetDXILByteCode()->GetCompilerSig();
+    const uint32_t smMajor = dxbc->m_Version.Major;
+    const uint32_t smMinor = dxbc->m_Version.Minor;
+    if(smMajor < 6)
+    {
+      RDCERR("Invalid vertex shader SM %d.%d expect SM6.0+", smMajor, smMinor);
+      return new ShaderDebugTrace;
+    }
+    const char *profile = StringFormat::Fmt("ps_%u_%u", smMajor, smMinor).c_str();
+
+    ShaderCompileFlags compileFlags =
+        DXBC::EncodeFlags(m_pDevice->GetShaderCache()->GetCompileFlags(), profile);
+
+    const GlobalShaderFlags shaderFlags = dxbc->GetGlobalShaderFlags();
+    if(shaderFlags & GlobalShaderFlags::NativeLowPrecision)
+      compileFlags.flags.push_back({"@compile_option", "-enable-16bit-types"});
+
+    if(m_pDevice->GetShaderCache()->GetShaderBlob(extractHlsl.c_str(), "ExtractInputsPS",
+                                                  compileFlags, {}, profile, &psBlob) != "")
     {
       RDCERR("Failed to create shader to extract inputs");
       return new ShaderDebugTrace;
@@ -3078,23 +3154,50 @@ struct PSInitialData
     DXILDebug::GlobalState &globalState = debugger->GetGlobalState();
     DXILDebug::ThreadState &activeState = debugger->GetActiveLane();
     rdcarray<ShaderVariable> &ins = activeState.m_Input.members;
+    const rdcarray<DXIL::EntryPointInterface::Signature> &dxilInputs =
+        debugger->GetDXILEntryPointInputs();
 
     // Fetch constant buffer data from root signature
     DXILDebug::FetchConstantBufferData(m_pDevice, dxbc->GetDXILByteCode(), rs.graphics, refl,
                                        globalState, ret->sourceVars);
 
-    // TODO SAMPLE EVALUTE MASK
+    // TODO: SAMPLE EVALUTE MASK
     // globalState.sampleEvalRegisterMask = sampleEvalRegisterMask;
 
+    // The initial values are packed into register and elements
+    // DXIL Inputs are not packed and contain the register and element linkage
     rdcarray<DXILDebug::PSInputData> psInputDatas;
     for(int i = 0; i < initialValues.count(); i++)
     {
-      PSInputElement &elem = initialValues[i];
-      if(elem.reg >= 0)
-        psInputDatas.emplace_back(i, elem.numwords, elem.sysattribute, elem.included, data);
+      PSInputElement &inputElement = initialValues[i];
+      int packedRegister = inputElement.reg;
+      if(packedRegister >= 0)
+      {
+        int dxilInputIdx = -1;
+        int dxilArrayIdx = 0;
+        int packedElement = inputElement.elem;
+        int row = packedRegister;
+        // Find the DXIL Input index and element from that matches the register and element
+        for(int j = 0; j < dxilInputs.count(); ++j)
+        {
+          const DXIL::EntryPointInterface::Signature &dxilParam = dxilInputs[j];
+          if((dxilParam.startRow <= row) && (row < (int)(dxilParam.startRow + dxilParam.rows)) &&
+             (dxilParam.startCol == packedElement))
+          {
+            dxilInputIdx = j;
+            dxilArrayIdx = row - dxilParam.startRow;
+            break;
+          }
+        }
+        RDCASSERT(dxilInputIdx >= 0);
+        RDCASSERT(dxilArrayIdx >= 0);
 
-      if(elem.included)
-        data += elem.numwords;
+        psInputDatas.emplace_back(dxilInputIdx, dxilArrayIdx, inputElement.numwords,
+                                  inputElement.sysattribute, inputElement.included, data);
+      }
+
+      if(inputElement.included)
+        data += inputElement.numwords;
     }
 
     {
@@ -3110,26 +3213,31 @@ struct PSInitialData
         int32_t *rawout = NULL;
 
         ShaderVariable &invar = ins[psInput.input];
+        int outElement = 0;
 
         if(psInput.sysattribute == ShaderBuiltin::PrimitiveIndex)
         {
-          invar.value.u32v[0] = pHit->primitive;
+          invar.value.u32v[outElement] = pHit->primitive;
         }
         else if(psInput.sysattribute == ShaderBuiltin::MSAASampleIndex)
         {
-          invar.value.u32v[0] = pHit->sample;
+          invar.value.u32v[outElement] = pHit->sample;
         }
         else if(psInput.sysattribute == ShaderBuiltin::MSAACoverage)
         {
-          invar.value.u32v[0] = pHit->coverage;
+          invar.value.u32v[outElement] = pHit->coverage;
         }
         else if(psInput.sysattribute == ShaderBuiltin::IsFrontFace)
         {
-          invar.value.u32v[0] = pHit->isFrontFace ? ~0U : 0;
+          invar.value.u32v[outElement] = pHit->isFrontFace ? ~0U : 0;
         }
         else
         {
-          rawout = &invar.value.s32v[0];
+          if(invar.rows <= 1)
+            rawout = &invar.value.s32v[outElement];
+          else
+            rawout = &invar.members[psInput.array].value.s32v[outElement];
+
           memcpy(rawout, psInput.data, psInput.numwords * 4);
         }
       }
@@ -3144,7 +3252,7 @@ struct PSInitialData
       }
     }
 
-    // TODO UPDATE INPUTS FROM SAMPLE CACHE
+    // TODO: UPDATE INPUTS FROM SAMPLE CACHE
 #if 0
       for(const GlobalState::SampleEvalCacheKey &key : evalSampleCacheData)
       {
@@ -3338,8 +3446,6 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
         threadid[2] * threadDim[0] * threadDim[1] + threadid[1] * threadDim[0] + threadid[0], 0U,
         0U, 0U);
 
-    // TODO ADD ANY OTHER INPUTS
-
     // Fetch constant buffer data from root signature
     DXILDebug::FetchConstantBufferData(m_pDevice, dxbc->GetDXILByteCode(), rs.compute, refl,
                                        globalState, ret->sourceVars);
@@ -3352,6 +3458,14 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
   return ret;
 }
 
+ShaderDebugTrace *D3D12Replay::DebugMeshThread(uint32_t eventId,
+                                               const rdcfixedarray<uint32_t, 3> &groupid,
+                                               const rdcfixedarray<uint32_t, 3> &threadid)
+{
+  // Not implemented yet
+  return new ShaderDebugTrace;
+}
+
 rdcarray<ShaderDebugState> D3D12Replay::ContinueDebug(ShaderDebugger *debugger)
 {
   if(!debugger)
@@ -3360,7 +3474,7 @@ rdcarray<ShaderDebugState> D3D12Replay::ContinueDebug(ShaderDebugger *debugger)
   if(((DXBCContainerDebugger *)debugger)->isDXIL)
   {
     DXILDebug::Debugger *dxilDebugger = (DXILDebug::Debugger *)debugger;
-    DXILDebug::D3D12APIWrapper apiWrapper(m_pDevice, dxilDebugger->GetDXBCContainer(),
+    DXILDebug::D3D12APIWrapper apiWrapper(m_pDevice, dxilDebugger->GetProgram(),
                                           dxilDebugger->GetGlobalState(), dxilDebugger->GetEventId());
     D3D12MarkerRegion region(m_pDevice->GetQueue()->GetReal(), "ContinueDebug Simulation Loop");
     return dxilDebugger->ContinueDebug(&apiWrapper);

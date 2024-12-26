@@ -36,8 +36,7 @@
 
 RDOC_EXTERN_CONFIG(bool, Replay_Debug_SingleThreadedCompilation);
 
-RDOC_DEBUG_CONFIG(bool, D3D12_Experimental_EnableRTSupport, false,
-                  "Enable support for experimental DXR support");
+RDOC_EXTERN_CONFIG(bool, D3D12_Debug_RT_Auditing);
 
 static RDResult DeferredPipelineCompile(ID3D12Device *device,
                                         const D3D12_GRAPHICS_PIPELINE_STATE_DESC &Descriptor,
@@ -1322,6 +1321,18 @@ bool WrappedID3D12Device::Serialise_DynamicDescriptorWrite(SerialiserType &ser,
       // safe to pass an invalid heap type to Create() as these descriptors will by definition not
       // be undefined
       RDCASSERT(desc.GetType() != D3D12DescriptorType::Undefined);
+
+      // to remove any ray query work, force AS descriptors to NULL
+      if(D3D12_Debug_RT_Auditing() && desc.GetType() == D3D12DescriptorType::SRV)
+      {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = desc.GetSRV();
+        if(srvDesc.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+        {
+          srvDesc.RaytracingAccelerationStructure.Location = 0;
+          desc.Init(NULL, &srvDesc);
+        }
+      }
+
       desc.Create(D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES, this, *handle);
       handle->GetHeap()->MarkMutableIndex(handle->GetHeapIndex());
     }
@@ -2342,7 +2353,7 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
   }
 
   if(dolog)
-    RDCLOG("Checking feature support for %d", Feature);
+    RDCLOG("Checking feature support for %s", ToStr(Feature).c_str());
   HRESULT hr = m_pDevice->CheckFeatureSupport(Feature, pFeatureSupportData, FeatureSupportDataSize);
 
   if(FAILED(hr))
@@ -2380,24 +2391,6 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
 
     return S_OK;
   }
-  else if(Feature == D3D12_FEATURE_D3D12_OPTIONS5)
-  {
-    D3D12_FEATURE_DATA_D3D12_OPTIONS5 *opts =
-        (D3D12_FEATURE_DATA_D3D12_OPTIONS5 *)pFeatureSupportData;
-    if(FeatureSupportDataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
-      return E_INVALIDARG;
-
-    // don't support raytracing
-    if(!D3D12_Experimental_EnableRTSupport())
-    {
-      opts->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
-
-      if(dolog)
-        RDCLOG("Forcing no raytracing tier support");
-    }
-
-    return S_OK;
-  }
   else if(Feature == D3D12_FEATURE_D3D12_OPTIONS7)
   {
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 *opts =
@@ -2410,6 +2403,20 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
 
     if(dolog)
       RDCLOG("Forcing no sampler feedback tier support");
+
+    return S_OK;
+  }
+  else if(Feature == D3D12_FEATURE_D3D12_OPTIONS16)
+  {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 *opts =
+        (D3D12_FEATURE_DATA_D3D12_OPTIONS16 *)pFeatureSupportData;
+    if(FeatureSupportDataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS16))
+      return E_INVALIDARG;
+
+    opts->GPUUploadHeapSupported = FALSE;
+
+    if(dolog)
+      RDCLOG("Forcing no GPU upload heap support");
 
     return S_OK;
   }

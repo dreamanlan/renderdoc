@@ -81,6 +81,10 @@ void ClampPhysDevAPIVersion(VkPhysicalDeviceProperties *pProperties, VkPhysicalD
       pProperties->apiVersion = VK_API_VERSION_1_2;
     }
   }
+
+  // clamp to highest supported API version, currently vulkan 1.3, because loader no longer does this for us
+  if(pProperties->apiVersion > VK_API_VERSION_1_3)
+    pProperties->apiVersion = VK_API_VERSION_1_3;
 }
 
 void WrappedVulkan::vkGetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice,
@@ -799,6 +803,24 @@ void WrappedVulkan::vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice
           "VkPhysicalDeviceVulkan12Features::bufferDeviceAddressCaptureReplay is false, "
           "can't support capture of bufferDeviceAddress");
       vulkan12->bufferDeviceAddress = vulkan12->bufferDeviceAddressMultiDevice = VK_FALSE;
+    }
+  }
+
+  // Vulkan 1.2 also promoted the old core extension query. This would have been invalid to use
+  // before since we would have hidden the extension itself, but on vulkan 1.2 it is valid so we
+  // intercept it unconditionally
+  VkPhysicalDeviceBufferDeviceAddressFeatures *bda =
+      (VkPhysicalDeviceBufferDeviceAddressFeatures *)FindNextStruct(
+          pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES);
+
+  if(bda)
+  {
+    if(bda->bufferDeviceAddressCaptureReplay == VK_FALSE)
+    {
+      RDCWARN(
+          "VkPhysicalDeviceBufferDeviceAddressFeatures::bufferDeviceAddressCaptureReplay is false, "
+          "can't support capture of bufferDeviceAddress");
+      bda->bufferDeviceAddress = bda->bufferDeviceAddressMultiDevice = VK_FALSE;
     }
   }
 

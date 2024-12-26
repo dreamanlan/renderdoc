@@ -921,7 +921,8 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
     access.index = i;
     access.byteSize = bind.fixedBindSetOrSpace;
     access.byteOffset =
-        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset;
+        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset +
+        setLayoutInfos[bind.fixedBindSetOrSpace]->inlineByteSize;
     descriptorAccess.push_back(access);
   }
 
@@ -949,7 +950,8 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
     access.index = i;
     access.byteSize = bind.fixedBindSetOrSpace;
     access.byteOffset =
-        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset;
+        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset +
+        setLayoutInfos[bind.fixedBindSetOrSpace]->inlineByteSize;
     descriptorAccess.push_back(access);
   }
 
@@ -977,7 +979,8 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
     access.index = i;
     access.byteSize = bind.fixedBindSetOrSpace;
     access.byteOffset =
-        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset;
+        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset +
+        setLayoutInfos[bind.fixedBindSetOrSpace]->inlineByteSize;
     descriptorAccess.push_back(access);
   }
 }
@@ -1109,6 +1112,8 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     stencilFormat = VK_FORMAT_UNDEFINED;
   }
 
+  dynamicRenderingLocalRead.Init((const VkBaseInStructure *)pCreateInfo);
+
   RDCEraseEl(dynamicStates);
   if(pCreateInfo->pDynamicState)
   {
@@ -1153,6 +1158,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     shad.module = shadid;
     shad.entryPoint = pCreateInfo->pStages[i].pName;
     shad.stage = ShaderStage(stageIndex);
+    shad.flags = pCreateInfo->pStages[i].flags;
 
     ShaderModuleReflectionKey key(shad.stage, shad.entryPoint, ResourceId());
 
@@ -1645,6 +1651,8 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
         shadingRateCombiners[0] = pipeInfo.shadingRateCombiners[0];
         shadingRateCombiners[1] = pipeInfo.shadingRateCombiners[1];
 
+        dynamicRenderingLocalRead.CopyInputIndices(pipeInfo.dynamicRenderingLocalRead);
+
         flags |= pipeInfo.flags;
       }
 
@@ -1673,6 +1681,8 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
         colorFormats = pipeInfo.colorFormats;
         depthFormat = pipeInfo.depthFormat;
         stencilFormat = pipeInfo.stencilFormat;
+
+        dynamicRenderingLocalRead.CopyLocations(pipeInfo.dynamicRenderingLocalRead);
 
         flags |= pipeInfo.flags;
       }
@@ -1775,6 +1785,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
     shad.module = shadid;
     shad.entryPoint = pCreateInfo->stage.pName;
     shad.stage = ShaderStage::Compute;
+    shad.flags = pCreateInfo->stage.flags;
 
     ShaderModuleReflectionKey key(ShaderStage::Compute, shad.entryPoint, ResourceId());
 
@@ -2940,6 +2951,8 @@ void DescUpdateTemplate::Apply(const void *pData, DescUpdateTemplateApplication 
       void *dst = application.inlineData.data() + inlineOffset;
       memcpy(dst, src, inlineWrite.dataSize);
       inlineWrite.pData = dst;
+      inlineOffset += inlineWrite.dataSize;
+      inlineOffset = AlignUp4(inlineOffset);
 
       write.pNext = &inlineWrite;
       write.descriptorCount = entry.descriptorCount;

@@ -64,7 +64,7 @@ struct D3D12InitParams
   UINT SDKVersion = 0;
 
   // check if a frame capture section version is supported
-  static const uint64_t CurrentVersion = 0x12;
+  static const uint64_t CurrentVersion = 0x13;
 
   static bool IsSupportedVersion(uint64_t ver);
 };
@@ -549,6 +549,26 @@ class WrappedID3D12CommandQueue;
   template <typename SerialiserType>                         \
   bool CONCAT(Serialise_, func(SerialiserType &ser, __VA_ARGS__));
 
+template <typename DRED_NODE>
+inline void GetDREDContexts(const DRED_NODE *node, D3D12_DRED_BREADCRUMB_CONTEXT **contexts,
+                            UINT &numContexts);
+
+template <>
+inline void GetDREDContexts(const D3D12_AUTO_BREADCRUMB_NODE *node,
+                            D3D12_DRED_BREADCRUMB_CONTEXT **contexts, UINT &numContexts)
+{
+  *contexts = NULL;
+  numContexts = 0;
+}
+
+template <>
+inline void GetDREDContexts(const D3D12_AUTO_BREADCRUMB_NODE1 *node,
+                            D3D12_DRED_BREADCRUMB_CONTEXT **contexts, UINT &numContexts)
+{
+  *contexts = node->pBreadcrumbContexts;
+  numContexts = node->BreadcrumbContextsCount;
+}
+
 class WrappedID3D12Device : public IFrameCapturer, public ID3DDevice, public ID3D12Device14
 {
 private:
@@ -585,9 +605,10 @@ private:
   rdcarray<WrappedID3D12CommandQueue *> m_RefQueues;
   rdcarray<ID3D12Resource *> m_RefBuffers;
 
-  rdcarray<D3D12ResourceRecord *> m_ForcedReferences;
+  std::unordered_set<D3D12ResourceRecord *> m_ForcedReferences;
   Threading::CriticalSection m_ForcedReferencesLock;
   bool m_HaveSeenASBuild = false;
+  Intervals<ResourceId> m_ASDebugTracking;
 
   int64_t m_QueueCounter = 0;
 
@@ -597,7 +618,9 @@ private:
 
     {
       SCOPED_LOCK(m_ForcedReferencesLock);
-      ret = m_ForcedReferences;
+      ret.reserve(m_ForcedReferences.size());
+      for(auto it = m_ForcedReferences.begin(); it != m_ForcedReferences.end(); ++it)
+        ret.push_back(*it);
     }
 
     return ret;
@@ -614,6 +637,13 @@ private:
   ID3D12Fence *m_GPUSyncFence;
   HANDLE m_GPUSyncHandle;
   UINT64 m_GPUSyncCounter;
+
+  ID3D12Fence *m_OverlayFence = NULL;
+  UINT64 m_CurOverlay = 0;
+  HANDLE m_OverlaySyncHandle;
+  static const uint64_t MaxOverlayInFlight = 5;
+  ID3D12CommandAllocator *m_OverlayAllocs[MaxOverlayInFlight] = {};
+  ID3D12GraphicsCommandList *m_OverlayLists[MaxOverlayInFlight] = {};
 
   WrappedDownlevelDevice m_WrappedDownlevel;
   WrappedDRED m_DRED;
@@ -795,6 +825,49 @@ private:
   bool Serialise_CaptureScope(SerialiserType &ser);
   void EndCaptureFrame();
 
+  void DumpDREDPageFault(const D3D12_DRED_PAGE_FAULT_OUTPUT &DredPageFaultOutput);
+
+  template <typename DRED_NODE>
+  void DumpDRED(DRED_NODE *head)
+  {
+    uint32_t i = 0, count = 0;
+    while(head && i < 100)
+    {
+      D3D12_AUTO_BREADCRUMB_NODE *node = (D3D12_AUTO_BREADCRUMB_NODE *)head;
+
+      // stop if this is a terminal node
+      if(node == NULL || node->pLastBreadcrumbValue == NULL)
+        break;
+
+      count++;
+
+      // if this node is fully executed or not executed at all keep going to get the count, but don't process
+      if(*node->pLastBreadcrumbValue == node->BreadcrumbCount || *node->pLastBreadcrumbValue == 0)
+      {
+        head = head->pNext;
+        i++;
+        continue;
+      }
+
+      D3D12_DRED_BREADCRUMB_CONTEXT *contexts = NULL;
+      UINT numContexts = 0;
+
+      GetDREDContexts(head, &contexts, numContexts);
+
+      RDCLOG("DRED node %u:", i);
+
+      DumpDRED(node, contexts, numContexts);
+
+      head = head->pNext;
+      i++;
+    }
+
+    RDCLOG("%u DRED nodes found", count);
+  }
+
+  void DumpDRED(D3D12_AUTO_BREADCRUMB_NODE *head, D3D12_DRED_BREADCRUMB_CONTEXT *contexts,
+                UINT numContexts);
+
   bool m_debugLayerEnabled;
 
   static Threading::CriticalSection m_DeviceWrappersLock;
@@ -830,11 +903,7 @@ public:
   const D3D12_FEATURE_DATA_D3D12_OPTIONS16 &GetOpts16() { return m_D3D12Opts16; }
   void RemoveQueue(WrappedID3D12CommandQueue *queue);
 
-  void AddForcedReference(D3D12ResourceRecord *record)
-  {
-    SCOPED_LOCK(m_ForcedReferencesLock);
-    m_ForcedReferences.push_back(record);
-  }
+  void AddForcedReference(D3D12ResourceRecord *record);
 
   // only valid on replay
   const std::map<ResourceId, WrappedID3D12Resource *> &GetResourceList() { return *m_ResourceList; }
@@ -980,6 +1049,9 @@ public:
 
   ID3D12GraphicsCommandListX *GetNewList();
   ID3D12GraphicsCommandListX *GetInitialStateList();
+
+  ID3D12GraphicsCommandListX *StealNewList();
+  void ReturnStolenList(ID3D12GraphicsCommandListX *list);
 
   bool IsReadOnlyResource(ResourceId id) { return m_ModResources.find(id) == m_ModResources.end(); }
   void CloseInitialStateList();
@@ -1280,8 +1352,9 @@ public:
                                        const char *Path);
 
   IMPLEMENT_FUNCTION_THREAD_SERIALISED(void, CreateAS, ID3D12Resource *pResource,
-                                       UINT64 resourceOffset, UINT64 byteSize,
-                                       D3D12AccelerationStructure *as);
+                                       UINT64 resourceOffset,
+                                       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE type,
+                                       UINT64 byteSize, D3D12AccelerationStructure *as);
 
   // IHV APIs
   IMPLEMENT_FUNCTION_SERIALISED(void, SetShaderExtUAV, GPUVendor vendor, uint32_t reg,

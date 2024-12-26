@@ -27,6 +27,7 @@
 #include "core/settings.h"
 #include "driver/dx/official/d3dcompiler.h"
 #include "driver/dxgi/dxgi_common.h"
+#include "strings/string_utils.h"
 #include "d3d12_command_list.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_device.h"
@@ -36,15 +37,26 @@
 
 #include "data/hlsl/hlsl_cbuffers.h"
 
-RDOC_CONFIG(uint32_t, D3D12_Debug_RTIndirectEstimateOverride, 0,
-            "Override how many bytes are reserved for shader tables in each indirect ray dispatch");
-RDOC_CONFIG(uint32_t, D3D12_Debug_RTMaxVertexIncrement, 1000,
+RDOC_CONFIG(uint32_t, D3D12_Debug_RT_IndirectEstimateOverride, 0,
+            "Override how many bytes are reserved for shader tables in each indirect ray dispatch "
+            "(will be multiplied by MaxCommandCount)");
+RDOC_CONFIG(uint32_t, D3D12_Debug_RT_MaxVertexIncrement, 1000,
             "Amount to add to the API-provided max vertex when building a BLAS with an index "
             "buffer, to account for incorrectly set values by application.");
 RDOC_CONFIG(
-    uint32_t, D3D12_Debug_RTMaxVertexPercentIncrease, 10,
+    uint32_t, D3D12_Debug_RT_MaxVertexPercentIncrease, 10,
     "Percentage increase for the API-provided max vertex when building a BLAS with an index "
     "buffer, to account for incorrectly set values by application.");
+RDOC_CONFIG(uint32_t, D3D12_Debug_RT_ASCacheThreshold, 5000,
+            "How many milliseconds to wait before caching an AS to disk if it has been unmodified "
+            "for that long");
+RDOC_CONFIG(bool, D3D12_Debug_RT_Auditing, false, "Audit RT work during capture and replay.");
+
+// batch 50 at a time, if we have one check per frame this would cache 5000 BLASs in 100 frames
+// which is a reasonable background pace
+RDOC_CONFIG(uint32_t, D3D12_Debug_RT_ASCacheBatchSize, 50,
+            "The maximum number of ASs to cache to disk in a single batch (batch processing "
+            "happens at indeterminate intervals but no more than once per submission");
 
 void D3D12Descriptor::Init(const D3D12_SAMPLER_DESC2 *pDesc)
 {
@@ -689,6 +701,21 @@ D3D12Descriptor *DescriptorFromPortableHandle(D3D12ResourceManager *manager, Por
   return NULL;
 }
 
+static uint32_t GuessTablePatchRequirements(UINT MaxCommandCount)
+{
+  uint32_t patchDataSize = RDCMAX(64U, 20 * 1024 * 1024 * MaxCommandCount);
+
+  if(D3D12_Debug_RT_IndirectEstimateOverride() > 0)
+    patchDataSize = D3D12_Debug_RT_IndirectEstimateOverride() * MaxCommandCount;
+
+  return patchDataSize;
+}
+
+static UINT64 GetTableCount(D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE table)
+{
+  return table.StrideInBytes == 0 ? 1ULL : table.SizeInBytes / table.StrideInBytes;
+}
+
 // debugging logging for barriers
 #if 0
 #define BARRIER_DBG RDCLOG
@@ -700,86 +727,51 @@ D3D12Descriptor *DescriptorFromPortableHandle(D3D12ResourceManager *manager, Por
 
 D3D12RTManager::D3D12RTManager(WrappedID3D12Device *device,
                                D3D12GpuBufferAllocator &gpuBufferAllocator)
-    : m_wrappedDevice(device),
-      m_cmdList(NULL),
-      m_cmdAlloc(NULL),
-      m_cmdQueue(NULL),
-      m_gpuFence(NULL),
-      m_gpuSyncHandle(NULL),
-      m_gpuSyncCounter(0u),
-      m_GPUBufferAllocator(gpuBufferAllocator)
+    : m_wrappedDevice(device), m_GPUBufferAllocator(gpuBufferAllocator)
 {
 }
 
-void D3D12RTManager::CreateInternalResources()
+D3D12RTManager::~D3D12RTManager()
 {
-  if(m_wrappedDevice)
+  SAFE_RELEASE(ASSerialiseBuffer);
+  SAFE_RELEASE(m_accStructPatchInfo.m_rootSignature);
+  SAFE_RELEASE(m_accStructPatchInfo.m_pipeline);
+  SAFE_RELEASE(m_TLASCopyingData.ArgsBuffer);
+  SAFE_RELEASE(m_TLASCopyingData.PreparePipe);
+  SAFE_RELEASE(m_TLASCopyingData.CopyPipe);
+  SAFE_RELEASE(m_TLASCopyingData.RootSig);
+  SAFE_RELEASE(m_TLASCopyingData.IndirectSig);
+  SAFE_RELEASE(m_RayPatchingData.shaderTablePatchRootSig);
+  SAFE_RELEASE(m_RayPatchingData.shaderTablePatchPipe);
+  SAFE_RELEASE(m_RayPatchingData.shaderTableCopyPipe);
+  SAFE_RELEASE(m_RayPatchingData.indirectComSig);
+  SAFE_RELEASE(m_RayPatchingData.indirectPrepPipe);
+  SAFE_RELEASE(m_RayPatchingData.indirectPrepRootSig);
+  SAFE_RELEASE(m_TimerQueryHeap);
+
+  if(m_ASCacheThread)
   {
-    ID3D12Device *realDevice = m_wrappedDevice->GetReal();
-
-    if(realDevice)
-    {
-      HRESULT result = realDevice->CreateCommandAllocator(
-          D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void **)&m_cmdAlloc);
-
-      if(!SUCCEEDED(result))
-        RDCERR("D3D12 Command allocator creation failed with error %s", ToStr(result).c_str());
-
-      if(m_cmdAlloc != NULL)
-      {
-        ID3D12GraphicsCommandList *cmd = NULL;
-        result = realDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_cmdAlloc, NULL,
-                                               __uuidof(ID3D12GraphicsCommandList), (void **)(&cmd));
-
-        if(!SUCCEEDED(result))
-          RDCERR("D3D12 Command list creation failed with error %s", ToStr(result).c_str());
-
-        m_cmdList = (ID3D12GraphicsCommandListX *)cmd;
-        m_cmdList->Close();
-      }
-
-      D3D12_COMMAND_QUEUE_DESC cmdQueueDesc;
-      cmdQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-      cmdQueueDesc.NodeMask = 0;
-      cmdQueueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-      cmdQueueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-      result = realDevice->CreateCommandQueue(&cmdQueueDesc, __uuidof(ID3D12CommandQueue),
-                                              (void **)&m_cmdQueue);
-
-      if(!SUCCEEDED(result))
-        RDCERR("D3D12 Command queue creation failed with error %s", ToStr(result).c_str());
-
-      result = realDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
-                                       (void **)&m_gpuFence);
-
-      if(!SUCCEEDED(result))
-        RDCERR("D3D12 fence creation failed with error %s", ToStr(result).c_str());
-
-      m_gpuSyncHandle = ::CreateEvent(NULL, FALSE, FALSE, NULL);
-    }
-
-    m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::CustomHeapWithUavCpuAccess,
-                               D3D12GpuBufferHeapMemoryFlag::Default, 16, 256, &ASQueryBuffer);
+    Atomic::Dec32(&m_ASCacheThreadRunning);
+    // wake the thread so it can notice that the running flag is zero'd
+    m_ASCacheThreadSemaphore->Wake(1);
+    Threading::JoinThread(m_ASCacheThread);
+    Threading::CloseThread(m_ASCacheThread);
+    m_ASCacheThreadSemaphore->Destroy();
   }
-}
-
-void D3D12RTManager::SyncGpuForRtWork()
-{
-  m_gpuSyncCounter++;
-
-  HRESULT hr = m_cmdQueue->Signal(m_gpuFence, m_gpuSyncCounter);
-  if(!SUCCEEDED(hr))
-    RDCERR("Command queue fence signaling failed with error %s ", ToStr(hr).c_str());
-
-  hr = m_gpuFence->SetEventOnCompletion(m_gpuSyncCounter, m_gpuSyncHandle);
-  if(!SUCCEEDED(hr))
-    RDCERR("Fence completion event signaling failed with error %s ", ToStr(hr).c_str());
-
-  WaitForSingleObject(m_gpuSyncHandle, 10000);
 }
 
 void D3D12RTManager::InitInternalResources()
 {
+  m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::CustomHeapWithUavCpuAccess,
+                             D3D12GpuBufferHeapMemoryFlag::Default, 16, 256, &ASQueryBuffer);
+
+  if(D3D12_Debug_RT_Auditing())
+  {
+    m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::ReadBackHeap,
+                               D3D12GpuBufferHeapMemoryFlag::Default, 256, 256,
+                               &PostbuildReadbackBuffer);
+  }
+
   if(IsReplayMode(m_wrappedDevice->GetState()))
   {
     InitReplayBlasPatchingResources();
@@ -799,6 +791,444 @@ void D3D12RTManager::ResizeSerialisationBuffer(UINT64 size)
   }
 }
 
+void D3D12RTManager::Verify(PatchedRayDispatch &r)
+{
+  if(!r.resources.readbackBuffer)
+    return;
+
+  WrappedID3D12DescriptorHeap *sampHeap = NULL, *resHeap = NULL;
+  for(ResourceId heapId : r.heaps)
+  {
+    WrappedID3D12DescriptorHeap *heap =
+        (WrappedID3D12DescriptorHeap *)m_wrappedDevice->GetResourceManager()
+            ->GetCurrentAs<ID3D12DescriptorHeap>(heapId);
+
+    if(heap->GetDescriptors()->GetType() == D3D12DescriptorType::Sampler)
+      sampHeap = heap;
+    else
+      resHeap = heap;
+  }
+
+  byte *data = (byte *)r.resources.readbackBuffer->Map();
+
+  // simple case, single non-indirect dispatch
+  if(r.comSig == NULL)
+  {
+    VerifyDispatch(r.desc, data, data + r.resources.patchScratchBuffer->Size(), resHeap, sampHeap);
+    return;
+  }
+
+  // indirect dispatches need extra work (and extra verification!)
+
+  const uint32_t indirectPatchReservationSize = GuessTablePatchRequirements(r.MaxCommands);
+  const uint64_t applicationArgsSize = AlignUp16(r.MaxCommands * r.comSig->sig.ByteStride);
+  const uint64_t patchingArgsSize = AlignUp16(r.MaxCommands * 4 * AlignUp16(sizeof(PatchingExecute)));
+
+  byte *wrappedExecArgs = data + indirectPatchReservationSize * 2;
+  UINT *sourceCount = (UINT *)(wrappedExecArgs + applicationArgsSize);
+  byte *unwrappedExecArgs = ((byte *)sourceCount) + 4;
+  PatchingExecute *internalExecs = (PatchingExecute *)(unwrappedExecArgs + applicationArgsSize);
+  UINT *patchExecCount = (UINT *)(((byte *)internalExecs) + patchingArgsSize);
+
+  UINT cmdCount = *sourceCount;
+  RDCASSERT(cmdCount < r.MaxCommands, cmdCount, r.MaxCommands);
+  // if we didn't have a dynamic count this should be 0, revert to the fixed CPU-side count
+  if(!r.HasDynamicCount)
+  {
+    RDCASSERTEQUAL(cmdCount, 0);
+    cmdCount = r.MaxCommands;
+  }
+
+  byte *wrappedRecords = data;
+  byte *unwrappedRecords = wrappedRecords + indirectPatchReservationSize;
+
+  UINT internalExecsRequired = 0;
+
+  // this loop emulates/verifies RENDERDOC_PrepareRayIndirectExecuteCS
+  for(UINT cmd = 0; cmd < cmdCount; cmd++)
+  {
+    D3D12_DISPATCH_RAYS_DESC *wrappedDisp =
+        (D3D12_DISPATCH_RAYS_DESC *)(wrappedExecArgs + cmd * r.comSig->sig.ByteStride +
+                                     r.comSig->sig.PackedByteSize - sizeof(D3D12_DISPATCH_RAYS_DESC));
+    D3D12_DISPATCH_RAYS_DESC *unwrappedDisp =
+        (D3D12_DISPATCH_RAYS_DESC *)(unwrappedExecArgs + cmd * r.comSig->sig.ByteStride +
+                                     r.comSig->sig.PackedByteSize - sizeof(D3D12_DISPATCH_RAYS_DESC));
+
+    // sizes should have been propagated trivially
+    RDCASSERTEQUAL(wrappedDisp->Width, unwrappedDisp->Width);
+    RDCASSERTEQUAL(wrappedDisp->Height, unwrappedDisp->Height);
+    RDCASSERTEQUAL(wrappedDisp->Depth, unwrappedDisp->Depth);
+
+    uint64_t offset = 0;
+
+    // raygen is required. Check it w as placed correctly
+    RDCASSERT(wrappedDisp->RayGenerationShaderRecord.SizeInBytes);
+    RDCASSERTEQUAL(unwrappedDisp->RayGenerationShaderRecord.StartAddress,
+                   r.resources.patchScratchBuffer->Address() + offset);
+    RDCASSERTEQUAL(wrappedDisp->RayGenerationShaderRecord.SizeInBytes,
+                   unwrappedDisp->RayGenerationShaderRecord.SizeInBytes);
+    offset += AlignUp(wrappedDisp->RayGenerationShaderRecord.SizeInBytes, 256ULL);
+
+    // also check the internal indirect patch was properly configured
+    RDCASSERTEQUAL(internalExecs[internalExecsRequired].sourceData,
+                   wrappedDisp->RayGenerationShaderRecord.StartAddress);
+    RDCASSERTEQUAL(internalExecs[internalExecsRequired].destData,
+                   unwrappedDisp->RayGenerationShaderRecord.StartAddress);
+    RDCASSERTEQUAL(internalExecs[internalExecsRequired].shaderrecord_count, 1);
+    RDCASSERTEQUAL(internalExecs[internalExecsRequired].shaderrecord_stride,
+                   unwrappedDisp->RayGenerationShaderRecord.SizeInBytes);
+    RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.x, 1);
+    RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.y, 1);
+    RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.z, 1);
+
+    internalExecsRequired++;
+
+    // for each optional table check its placement as well and the corresponding indirect patch
+
+    if(wrappedDisp->MissShaderTable.SizeInBytes)
+    {
+      if(unwrappedDisp->HitGroupTable.StrideInBytes == 0)
+        unwrappedDisp->HitGroupTable.StrideInBytes = unwrappedDisp->HitGroupTable.SizeInBytes;
+
+      RDCASSERTEQUAL(unwrappedDisp->MissShaderTable.StartAddress,
+                     r.resources.patchScratchBuffer->Address() + offset);
+      RDCASSERTEQUAL(wrappedDisp->MissShaderTable.SizeInBytes,
+                     unwrappedDisp->MissShaderTable.SizeInBytes);
+      RDCASSERTEQUAL(wrappedDisp->MissShaderTable.StrideInBytes,
+                     unwrappedDisp->MissShaderTable.StrideInBytes);
+      offset += AlignUp(wrappedDisp->MissShaderTable.SizeInBytes, 256ULL);
+
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].sourceData,
+                     wrappedDisp->MissShaderTable.StartAddress);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].destData,
+                     unwrappedDisp->MissShaderTable.StartAddress);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].shaderrecord_count,
+                     GetTableCount(wrappedDisp->MissShaderTable));
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].shaderrecord_stride,
+                     unwrappedDisp->MissShaderTable.StrideInBytes);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.x,
+                     AlignUp(internalExecs[internalExecsRequired].shaderrecord_count,
+                             (uint32_t)RECORD_PATCH_THREADS) /
+                         RECORD_PATCH_THREADS);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.y, 1);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.z, 1);
+
+      internalExecsRequired++;
+    }
+
+    if(wrappedDisp->HitGroupTable.SizeInBytes)
+    {
+      if(wrappedDisp->HitGroupTable.StrideInBytes == 0)
+        wrappedDisp->HitGroupTable.StrideInBytes = wrappedDisp->HitGroupTable.SizeInBytes;
+
+      RDCASSERTEQUAL(unwrappedDisp->HitGroupTable.StartAddress,
+                     r.resources.patchScratchBuffer->Address() + offset);
+      RDCASSERTEQUAL(wrappedDisp->HitGroupTable.SizeInBytes,
+                     unwrappedDisp->HitGroupTable.SizeInBytes);
+      RDCASSERTEQUAL(wrappedDisp->HitGroupTable.StrideInBytes,
+                     unwrappedDisp->HitGroupTable.StrideInBytes);
+      offset += AlignUp(wrappedDisp->HitGroupTable.SizeInBytes, 256ULL);
+
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].sourceData,
+                     wrappedDisp->HitGroupTable.StartAddress);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].destData,
+                     unwrappedDisp->HitGroupTable.StartAddress);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].shaderrecord_count,
+                     GetTableCount(wrappedDisp->HitGroupTable));
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].shaderrecord_stride,
+                     unwrappedDisp->HitGroupTable.StrideInBytes);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.x,
+                     AlignUp(internalExecs[internalExecsRequired].shaderrecord_count,
+                             (uint32_t)RECORD_PATCH_THREADS) /
+                         RECORD_PATCH_THREADS);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.y, 1);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.z, 1);
+
+      internalExecsRequired++;
+    }
+
+    if(wrappedDisp->CallableShaderTable.SizeInBytes)
+    {
+      if(wrappedDisp->CallableShaderTable.StrideInBytes == 0)
+        wrappedDisp->CallableShaderTable.StrideInBytes = wrappedDisp->CallableShaderTable.SizeInBytes;
+
+      RDCASSERTEQUAL(unwrappedDisp->CallableShaderTable.StartAddress,
+                     r.resources.patchScratchBuffer->Address() + offset);
+      RDCASSERTEQUAL(wrappedDisp->CallableShaderTable.SizeInBytes,
+                     unwrappedDisp->CallableShaderTable.SizeInBytes);
+      RDCASSERTEQUAL(wrappedDisp->CallableShaderTable.StrideInBytes,
+                     unwrappedDisp->CallableShaderTable.StrideInBytes);
+      offset += AlignUp(wrappedDisp->CallableShaderTable.SizeInBytes, 256ULL);
+
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].sourceData,
+                     wrappedDisp->CallableShaderTable.StartAddress);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].destData,
+                     unwrappedDisp->CallableShaderTable.StartAddress);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].shaderrecord_count,
+                     GetTableCount(wrappedDisp->CallableShaderTable));
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].shaderrecord_stride,
+                     unwrappedDisp->CallableShaderTable.StrideInBytes);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.x,
+                     AlignUp(internalExecs[internalExecsRequired].shaderrecord_count,
+                             (uint32_t)RECORD_PATCH_THREADS) /
+                         RECORD_PATCH_THREADS);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.y, 1);
+      RDCASSERTEQUAL(internalExecs[internalExecsRequired].dispatchDim.z, 1);
+
+      internalExecsRequired++;
+    }
+
+    RDCASSERTMSG("Indirect reservation size too small", offset < indirectPatchReservationSize,
+                 offset, indirectPatchReservationSize);
+
+    VerifyDispatch(*unwrappedDisp, wrappedRecords, unwrappedRecords, resHeap, sampHeap);
+
+    wrappedRecords += offset;
+    unwrappedRecords += offset;
+  }
+
+  RDCASSERTEQUAL(internalExecsRequired, *patchExecCount);
+
+  r.resources.readbackBuffer->Unmap();
+}
+
+void D3D12RTManager::VerifyDispatch(D3D12_DISPATCH_RAYS_DESC desc, byte *wrappedRecords,
+                                    byte *unwrappedRecords, WrappedID3D12DescriptorHeap *resHeap,
+                                    WrappedID3D12DescriptorHeap *sampHeap)
+{
+  // raygen is not optional
+  RDCASSERT(desc.RayGenerationShaderRecord.SizeInBytes >= D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+  RDCASSERT(desc.RayGenerationShaderRecord.StartAddress);
+  if(desc.RayGenerationShaderRecord.StartAddress)
+  {
+    VerifyRecord(desc.RayGenerationShaderRecord.SizeInBytes, wrappedRecords, unwrappedRecords,
+                 resHeap, sampHeap);
+  }
+
+  wrappedRecords += AlignUp(desc.RayGenerationShaderRecord.SizeInBytes, 256ULL);
+  unwrappedRecords += AlignUp(desc.RayGenerationShaderRecord.SizeInBytes, 256ULL);
+
+  if(desc.MissShaderTable.StartAddress)
+  {
+    if(desc.MissShaderTable.StrideInBytes == 0)
+      desc.MissShaderTable.StrideInBytes = desc.MissShaderTable.SizeInBytes;
+    for(UINT64 i = 0; i < desc.MissShaderTable.SizeInBytes / desc.MissShaderTable.StrideInBytes; i++)
+      VerifyRecord(desc.MissShaderTable.StrideInBytes,
+                   wrappedRecords + desc.MissShaderTable.StrideInBytes * i,
+                   unwrappedRecords + desc.MissShaderTable.StrideInBytes * i, resHeap, sampHeap);
+  }
+
+  wrappedRecords += AlignUp(desc.MissShaderTable.SizeInBytes, 256ULL);
+  unwrappedRecords += AlignUp(desc.MissShaderTable.SizeInBytes, 256ULL);
+
+  if(desc.HitGroupTable.StartAddress)
+  {
+    if(desc.HitGroupTable.StrideInBytes == 0)
+      desc.HitGroupTable.StrideInBytes = desc.HitGroupTable.SizeInBytes;
+    for(UINT64 i = 0; i < desc.HitGroupTable.SizeInBytes / desc.HitGroupTable.StrideInBytes; i++)
+      VerifyRecord(desc.HitGroupTable.StrideInBytes,
+                   wrappedRecords + desc.HitGroupTable.StrideInBytes * i,
+                   unwrappedRecords + desc.HitGroupTable.StrideInBytes * i, resHeap, sampHeap);
+  }
+
+  wrappedRecords += AlignUp(desc.HitGroupTable.SizeInBytes, 256ULL);
+  unwrappedRecords += AlignUp(desc.HitGroupTable.SizeInBytes, 256ULL);
+
+  if(desc.CallableShaderTable.StartAddress)
+  {
+    if(desc.CallableShaderTable.StrideInBytes == 0)
+      desc.CallableShaderTable.StrideInBytes = desc.CallableShaderTable.SizeInBytes;
+    for(UINT64 i = 0;
+        i < desc.CallableShaderTable.SizeInBytes / desc.CallableShaderTable.StrideInBytes; i++)
+      VerifyRecord(desc.CallableShaderTable.StrideInBytes,
+                   wrappedRecords + desc.CallableShaderTable.StrideInBytes * i,
+                   unwrappedRecords + desc.CallableShaderTable.StrideInBytes * i, resHeap, sampHeap);
+  }
+
+  wrappedRecords += AlignUp(desc.CallableShaderTable.SizeInBytes, 256ULL);
+  unwrappedRecords += AlignUp(desc.CallableShaderTable.SizeInBytes, 256ULL);
+}
+
+void D3D12RTManager::VerifyRecord(const uint64_t recordSize, byte *wrappedRecord,
+                                  byte *unwrappedRef, WrappedID3D12DescriptorHeap *resHeap,
+                                  WrappedID3D12DescriptorHeap *sampHeap)
+{
+  bytebuf record;
+
+  record.resize((size_t)recordSize);
+  memcpy(record.data(), wrappedRecord, (size_t)recordSize);
+
+  struct ShaderIdentifier
+  {
+    ResourceId id;      // the object which has the actual identifier in its ownExports array
+    uint32_t index;     // the index in the object's ownExports array
+    uint32_t pad[5];    // padding up to D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES
+  };
+
+  ShaderIdentifier *ident = (ShaderIdentifier *)wrappedRecord;
+
+  WrappedID3D12StateObject *obj =
+      m_wrappedDevice->GetResourceManager()->GetLiveAs<WrappedID3D12StateObject>(ident->id);
+
+  uint16_t localIdx = 0xffff;
+
+  if(obj)
+  {
+    memcpy(record.data(), obj->exports->ownExports[ident->index].real,
+           D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+    localIdx = obj->exports->ownExports[ident->index].localRootSigIndex;
+  }
+  else
+  {
+    // we should not get NULL objects back for records with data
+    RDCASSERT(ident->id == ResourceId());
+    memset(record.data(), 0, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES);
+  }
+
+  // copy remaining data - it will be overwritten below by an VA/handle unwraps, otherwise it could
+  // be constant data or just padding
+  memcpy(record.data() + D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES,
+         wrappedRecord + D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES,
+         size_t(recordSize - D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES));
+
+  if(localIdx != 0xffff)
+  {
+    rdcarray<uint32_t> &rootConfig = m_UniqueLocalRootSigs[localIdx];
+
+    for(uint32_t offs : rootConfig)
+    {
+      bool isVA = (offs & 0x80000000U) != 0;
+      offs &= ~0x80000000U;
+
+      if(isVA)
+      {
+        D3D12_GPU_VIRTUAL_ADDRESS *va = (uint64_t *)(wrappedRecord + offs);
+
+        ResourceId id;
+        uint64_t resoffs;
+        m_wrappedDevice->GetResIDFromOrigAddr(*va, id, resoffs);
+
+        D3D12_GPU_VIRTUAL_ADDRESS unwrappedVA = 0;
+        if(*va == 0)
+        {
+        }
+        else if(id == ResourceId())
+        {
+          RDCWARN("Invalid VA %llx, setting to 0", *va);
+        }
+        else
+        {
+          ID3D12Resource *res = m_wrappedDevice->GetResourceManager()->GetLiveAs<ID3D12Resource>(id);
+
+          unwrappedVA = res->GetGPUVirtualAddress() + resoffs;
+        }
+
+        memcpy(record.data() + offs, &unwrappedVA, sizeof(unwrappedVA));
+      }
+      else
+      {
+        uint64_t wrappedHandle = *(uint64_t *)(wrappedRecord + offs);
+
+        D3D12_GPU_DESCRIPTOR_HANDLE unwrappedHandle = {};
+
+        if(resHeap && wrappedHandle >= resHeap->GetOriginalGPUBase() &&
+           wrappedHandle < resHeap->GetOriginalGPUBase() +
+                               resHeap->GetNumDescriptors() * sizeof(D3D12Descriptor))
+        {
+          uint32_t idx =
+              uint32_t((wrappedHandle - resHeap->GetOriginalGPUBase()) / sizeof(D3D12Descriptor));
+          unwrappedHandle = resHeap->GetGPU(idx);
+        }
+        else if(sampHeap && wrappedHandle >= sampHeap->GetOriginalGPUBase() &&
+                wrappedHandle < +sampHeap->GetOriginalGPUBase() +
+                                    sampHeap->GetNumDescriptors() * sizeof(D3D12Descriptor))
+        {
+          uint32_t idx =
+              uint32_t((wrappedHandle - sampHeap->GetOriginalGPUBase()) / sizeof(D3D12Descriptor));
+          unwrappedHandle = sampHeap->GetGPU(idx);
+        }
+        else
+        {
+          RDCWARN("Invalid descriptor, setting to 0");
+        }
+
+        memcpy(record.data() + offs, &unwrappedHandle, sizeof(unwrappedHandle));
+      }
+    }
+  }
+
+  RDCASSERT(memcmp(record.data(), unwrappedRef, record.size()) == 0);
+}
+
+uint32_t D3D12RTManager::GetFreeQuery()
+{
+  SCOPED_LOCK(m_TimerStatsLock);
+  if(m_TimerQueryHeap == NULL)
+  {
+    D3D12_QUERY_HEAP_DESC timerQueryDesc;
+    // allow for up to 50 dispatches per frame, 500 AS builds, and assume 5 frames before we see the results
+    timerQueryDesc.Count = (50 + 500) * 5 * 2;
+    timerQueryDesc.NodeMask = 1;
+    timerQueryDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    HRESULT hr = m_wrappedDevice->GetReal()->CreateQueryHeap(
+        &timerQueryDesc, __uuidof(ID3D12QueryHeap), (void **)&m_TimerQueryHeap);
+    CHECK_HR(m_wrappedDevice, hr);
+    if(FAILED(hr))
+      RDCERR("Failed to create timer query heap HRESULT: %s", ToStr(hr).c_str());
+
+    m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::ReadBackHeap,
+                               D3D12GpuBufferHeapMemoryFlag::Default,
+                               timerQueryDesc.Count * sizeof(UINT64), 64, &m_TimerReadbackBuffer);
+
+    if(m_TimerReadbackBuffer && m_TimerQueryHeap)
+    {
+      m_Timestamps = (uint64_t *)m_TimerReadbackBuffer->Map();
+      for(uint32_t i = 0; i < timerQueryDesc.Count; i += 2)
+        m_FreeQueries.push_back(i);
+    }
+
+    m_wrappedDevice->GetQueue()->GetTimestampFrequency(&m_TimerFrequency);
+  }
+
+  if(!m_FreeQueries.empty())
+    return m_FreeQueries.takeAt(m_FreeQueries.size() - 1);
+  return ~0U;
+}
+
+void D3D12RTManager::AddDispatchTimer(uint32_t q)
+{
+  // could track this maybe, for now drop it on the floor
+  if(q == ~0U)
+    return;
+
+  uint64_t *timestamps = m_Timestamps + q;
+
+  {
+    SCOPED_LOCK(m_TimerStatsLock);
+    m_AccumulatedStats.dispatches++;
+    m_AccumulatedStats.totalDispatchesMS +=
+        ((timestamps[1] - timestamps[0]) / double(m_TimerFrequency)) * 1024.0;
+    m_FreeQueries.push_back(q);
+  }
+}
+
+void D3D12RTManager::AddBuildTimer(uint32_t q, uint64_t size)
+{
+  if(q == ~0U)
+    return;
+
+  uint64_t *timestamps = m_Timestamps + q;
+
+  {
+    SCOPED_LOCK(m_TimerStatsLock);
+    m_AccumulatedStats.builds++;
+    m_AccumulatedStats.buildBytes += size;
+    m_AccumulatedStats.totalBuildMS +=
+        ((timestamps[1] - timestamps[0]) / double(m_TimerFrequency)) * 1024.0;
+    m_FreeQueries.push_back(q);
+  }
+}
+
 void D3D12RTManager::AddPendingASBuilds(ID3D12Fence *fence, UINT64 waitValue,
                                         const rdcarray<std::function<bool()>> &callbacks)
 {
@@ -810,6 +1240,298 @@ void D3D12RTManager::AddPendingASBuilds(ID3D12Fence *fence, UINT64 waitValue,
   }
 }
 
+void D3D12RTManager::TickASManagement()
+{
+  CheckPendingASBuilds();
+  CheckASCaching();
+}
+
+FILE *OpenCacheFile()
+{
+  rdcstr filename = StringFormat::Fmt(
+      "%s/rdoc_as_%llu_%llu.bin", get_dirname(RenderDoc::Inst().GetCaptureFileTemplate()).c_str(),
+      Timing::GetTick(), Threading::GetCurrentID());
+  FILE *file = FileIO::OpenTransientFileHandle(filename, FileIO::OverwriteBinary);
+  if(!file)
+  {
+    FileIO::CreateParentDirectory(filename);
+    file = FileIO::OpenTransientFileHandle(filename, FileIO::OverwriteBinary);
+  }
+
+  return file;
+}
+
+DiskCachedAS D3D12RTManager::AllocDiskCache(uint64_t byteSize)
+{
+  DiskCachedAS ret;
+  ret.size = byteSize;
+
+  uint64_t blocksNeeded = AlignUp(byteSize, DiskCacheFile::blockSize) / DiskCacheFile::blockSize;
+
+  if(blocksNeeded >= DiskCacheFile::blocksInFile)
+    RDCWARN("disk cache sized insufficiently for allocation %llu, allocating dedicated file",
+            byteSize);
+
+  if(blocksNeeded < DiskCacheFile::blocksInFile)
+  {
+    SCOPED_LOCK(m_DiskCacheLock);
+
+    for(size_t i = 0; i < m_DiskCache.size(); i++)
+    {
+      DiskCacheFile &diskCache = m_DiskCache[i];
+
+      uint64_t firstBlock = ~0U;
+      uint64_t blocksFree = 0;
+      for(uint64_t b = 0; b < (uint64_t)ARRAY_COUNT(DiskCacheFile::blocksUsed); b++)
+      {
+        if(b + blocksNeeded > ARRAY_COUNT(DiskCacheFile::blocksUsed))
+          break;
+
+        if(diskCache.blocksUsed[b])
+        {
+          blocksFree = 0;
+          firstBlock = ~0U;
+        }
+        else
+        {
+          blocksFree++;
+          if(firstBlock == ~0U)
+            firstBlock = b;
+
+          if(blocksFree == blocksNeeded)
+            break;
+        }
+      }
+
+      if(blocksFree == blocksNeeded)
+      {
+        ret.fileIndex = i;
+        ret.offset = firstBlock * DiskCacheFile::blockSize;
+        memset(&m_DiskCache[i].blocksUsed[firstBlock], 1, size_t(blocksNeeded * sizeof(bool)));
+        return ret;
+      }
+    }
+  }
+
+  // if this was oversized it will allow silent writing off the end by the user
+  {
+    SCOPED_LOCK(m_DiskCacheLock);
+    FILE *f = OpenCacheFile();
+    DiskCacheFile cache;
+    cache.file = f;
+
+    // if this was an outsized file, only reset the first N blocks for our tracking. The file will
+    // be larger forever, but that's fine
+    if(blocksNeeded > DiskCacheFile::blocksInFile)
+      blocksNeeded = DiskCacheFile::blocksInFile;
+
+    memset(cache.blocksUsed, 1, size_t(blocksNeeded * sizeof(bool)));
+
+    {
+      SCOPED_LOCK(m_DiskCacheLock);
+      ret.fileIndex = m_DiskCache.size();
+      m_DiskCache.push_back(cache);
+    }
+
+    return ret;
+  }
+}
+
+void D3D12RTManager::ReleaseDiskCache(DiskCachedAS diskCache)
+{
+  uint64_t blocksNeeded =
+      AlignUp(diskCache.size, DiskCacheFile::blockSize) / DiskCacheFile::blockSize;
+  uint64_t blockOffset = diskCache.offset / DiskCacheFile::blockSize;
+
+  // if this was an outsized file, only reset the first N blocks for our tracking. The file will be
+  // larger forever, but that's fine
+  if(blocksNeeded > DiskCacheFile::blocksInFile)
+    blocksNeeded = DiskCacheFile::blocksInFile;
+
+  if(diskCache.fileIndex >= m_DiskCache.size())
+  {
+    RDCERR("Invalid disk cache file %zu vs %zu", diskCache.fileIndex, m_DiskCache.size());
+    return;
+  }
+
+  memset(&m_DiskCache[diskCache.fileIndex].blocksUsed[blockOffset], 0,
+         size_t(blocksNeeded * sizeof(bool)));
+}
+
+void D3D12RTManager::FillDiskCache(DiskCachedAS diskCache, void *data)
+{
+  FileIO::fseek64(m_DiskCache[diskCache.fileIndex].file, diskCache.offset, SEEK_SET);
+
+  StreamWriter writer(m_DiskCache[diskCache.fileIndex].file, Ownership::Nothing);
+  // de-interleave positions in geoms here if their stride is greater than vertex format to save space?
+  writer.Write(data, diskCache.size);
+}
+
+void D3D12RTManager::PushDiskCacheTask(std::function<void()> task)
+{
+  {
+    SCOPED_LOCK(m_ASCacheThreadLock);
+
+    // create thread lazily if we need it and it's not already here
+    if(!m_ASCacheThread)
+    {
+      m_ASCacheThreadRunning = 1;
+      m_ASCacheThreadSemaphore = Threading::Semaphore::Create();
+
+      m_ASCacheThread = Threading::CreateThread([this]() {
+        // loop until we shut down
+        while(Atomic::CmpExch32(&m_ASCacheThreadRunning, 1, 1) == 1)
+        {
+          // wait until there's a work item (may be multiple, we process one per loop and may not
+          // actually block here if there's more work waiting)
+          m_ASCacheThreadSemaphore->WaitForWake();
+
+          // grab a task
+          std::function<void()> task;
+          {
+            SCOPED_LOCK(m_ASCacheThreadLock);
+            if(!m_ASCacheTasks.empty())
+            {
+              task = m_ASCacheTasks.front();
+              m_ASCacheTasks.erase(0);
+
+              // consider ourselves active as soon as we have the task before releasing the lock so
+              // there is no period where both the queue is empty and we're not active, but a task is in flight
+              Atomic::Inc32(&m_ASCacheThreadActive);
+            }
+          }
+
+          // run it if we got one
+          if(task)
+          {
+            task();
+            Atomic::Dec32(&m_ASCacheThreadActive);
+          }
+        }
+      });
+    }
+
+    // push a task
+    m_ASCacheTasks.push_back(task);
+  }
+
+  // wake the thread to do one bit of work
+  m_ASCacheThreadSemaphore->Wake(1);
+}
+
+void D3D12RTManager::FlushDiskCacheThread()
+{
+  if(!m_ASCacheThread)
+    return;
+
+  m_ASCacheThreadSemaphore->Wake(1);
+
+  // just spin until the thread is done
+  while(true)
+  {
+    SCOPED_LOCK(m_ASCacheThreadLock);
+    // there may be a task running on the thread even if the queue is empty, ensure the active flag is not set
+    if(m_ASCacheTasks.empty() && Atomic::CmpExch32(&m_ASCacheThreadActive, 0, 0) == 0)
+      return;
+  }
+}
+
+void D3D12RTManager::CheckASCaching()
+{
+  double now = m_Timestamp.GetMilliseconds();
+
+  SCOPED_LOCK(m_ASBuildDataLock);
+
+  const uint32_t ageThreshold = D3D12_Debug_RT_ASCacheThreshold();
+  const size_t maxCacheBatch = D3D12_Debug_RT_ASCacheBatchSize();
+
+  // see if any AS builds are finished and old enough that we should flush them to disk.
+  // to avoid doing too much work at a time we do these in batches of up to N. They're pushed in
+  // order so the first one is oldest. We don't care too much about completion (there may be a
+  // slight gap between record/create and submission, but that will be dominated by the time
+  // between submission and it being old enough) but we don't want an AS which is built but never
+  // submitted or destroyed and stays potential forever to block caching, so we skip over any such
+  // ASs and start from the first old-enough AS.
+  size_t first = ~0U;
+  for(size_t i = 0; i < m_InMemASBuildDatas.size(); i++)
+  {
+    ASBuildData *buildData = m_InMemASBuildDatas[i];
+
+    uint32_t age = uint32_t(now - buildData->timestamp);
+
+    // if we encounter one that is too young, bail out as all later ones will be too young as well
+    if(age < ageThreshold)
+      break;
+
+    // skip any that are somehow old enough but not complete
+    if(!buildData->IsWorkComplete())
+      continue;
+
+    // this build is both complete and old enough, store
+    first = i;
+  }
+
+  // if we didn't find one at all, stop now.
+  if(first == ~0U)
+    return;
+
+  // the build data at [first] is both old enough to be cached and complete! we take a few more -
+  // up to a small batch at a time.
+  size_t last;
+  for(last = first; last < m_InMemASBuildDatas.size() && last < first + maxCacheBatch; last++)
+  {
+    ASBuildData *buildData = m_InMemASBuildDatas[last];
+
+    uint32_t age = uint32_t(now - buildData->timestamp);
+
+    // as soon as we find a build which is either too new or not complete, we're finished.
+    if(age < ageThreshold || !buildData->IsWorkComplete())
+    {
+      // decrement last now so that it is inclusive of the range. We know [first] will have passed
+      // because it can only have gotten older
+      last--;
+      break;
+    }
+  }
+
+  // if the whole list was old then last could be pointing off the end
+  if(last == m_InMemASBuildDatas.size())
+    last--;
+
+  // whether there were more to batch or not, last is the last element (and may be equal to first)
+
+  for(size_t i = first; i <= last; i++)
+  {
+    ASBuildData *buildData = m_InMemASBuildDatas[i];
+
+    // grab parameters for the task
+    D3D12GpuBuffer *buf = buildData->buffer;
+
+    // immediately update the build data as if the cache has completed. We flush the thread
+    DiskCachedAS diskCache = buildData->diskCache = AllocDiskCache(buildData->buffer->Size());
+    buildData->buffer = NULL;
+
+    if(D3D12_Debug_RT_Auditing())
+    {
+      RDCDEBUG("Flushing AS build data of size %llu to disk", buf->Size());
+    }
+
+    PushDiskCacheTask([this, diskCache, buf]() {
+      // de-interleave positions in geoms here if their stride is greater than vertex format to save space?
+
+      FillDiskCache(diskCache, buf->Map());
+
+      buf->Unmap();
+      buf->Release();
+    });
+
+    m_DiskCachedASBuildDatas.push_back(buildData);
+  }
+
+  // remove the build datas that we've processed
+  m_InMemASBuildDatas.erase(first, last - first + 1);
+}
+
 void D3D12RTManager::CheckPendingASBuilds()
 {
   std::map<ID3D12Fence *, UINT64> fenceValues;
@@ -818,8 +1540,10 @@ void D3D12RTManager::CheckPendingASBuilds()
   if(m_PendingASBuilds.empty())
     return;
 
-  for(PendingASBuild &build : m_PendingASBuilds)
+  for(size_t i = 0; i < m_PendingASBuilds.size(); i++)
   {
+    PendingASBuild &build = m_PendingASBuilds[i];
+
     // first time we see each fence, get the completed value
     if(fenceValues[build.fence] == 0)
       fenceValues[build.fence] = build.fence->GetCompletedValue();
@@ -829,11 +1553,72 @@ void D3D12RTManager::CheckPendingASBuilds()
     {
       SAFE_RELEASE(build.fence);
       build.callback();
+
+      // swap with last if this isn't already last - we don't need to keep order
+      if(i < m_PendingASBuilds.size() - 1)
+        std::swap(build, m_PendingASBuilds.back());
+      m_PendingASBuilds.pop_back();
+    }
+  }
+}
+
+void D3D12RTManager::GatherRTStatistics(ASStats &blasAges, ASStats &tlasAges,
+                                        RTGPUPatchingStats &gpuStats)
+{
+  double now = m_Timestamp.GetMilliseconds();
+
+  gpuStats = m_AccumulatedStats;
+  m_AccumulatedStats = {};
+
+  SCOPED_LOCK(m_ASBuildDataLock);
+
+  blasAges.bucket[0].msThreshold = tlasAges.bucket[0].msThreshold = 50;
+  blasAges.bucket[1].msThreshold = tlasAges.bucket[1].msThreshold = 250;
+  blasAges.bucket[2].msThreshold = tlasAges.bucket[2].msThreshold = 2000;
+  blasAges.bucket[3].msThreshold = tlasAges.bucket[3].msThreshold = ~0U;
+
+  for(ASBuildData *buildData : m_DiskCachedASBuildDatas)
+  {
+    if(buildData && buildData->diskCache.Valid())
+    {
+      ASStats &ages = buildData->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
+                          ? tlasAges
+                          : blasAges;
+
+      ages.diskBytes += buildData->diskCache.size;
+      ages.diskCached++;
     }
   }
 
-  // remove any builds that completed
-  m_PendingASBuilds.removeIf([](const PendingASBuild &build) { return build.fence == NULL; });
+  for(ASBuildData *buildData : m_InMemASBuildDatas)
+  {
+    if(buildData)
+    {
+      uint32_t age = uint32_t(now - buildData->timestamp);
+
+      ASStats &ages = buildData->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
+                          ? tlasAges
+                          : blasAges;
+
+      // should never encounter this
+      if(buildData->diskCache.Valid())
+        continue;
+
+      uint64_t size = buildData->buffer ? buildData->buffer->Size() : 0;
+
+      ages.overheadBytes += buildData->bytesOverhead;
+
+      for(size_t i = 0; i < ARRAY_COUNT(tlasAges.bucket); i++)
+      {
+        if(age <= ages.bucket[i].msThreshold)
+        {
+          ages.bucket[i].count++;
+          ages.bucket[i].bytes += size;
+          break;
+        }
+      }
+    }
+  }
 }
 
 PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *unwrappedCmd,
@@ -843,8 +1628,16 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
   PatchedRayDispatch ret = {};
 
   ret.desc = desc;
+  ret.heaps = heaps;
 
   D3D12MarkerRegion region(unwrappedCmd, "PatchRayDispatch");
+
+  ret.resources.query = GetFreeQuery();
+
+  if(ret.resources.query != ~0U)
+  {
+    unwrappedCmd->EndQuery(m_TimerQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, ret.resources.query);
+  }
 
   PrepareRayDispatchBuffer(NULL);
 
@@ -856,15 +1649,19 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
 
   const uint32_t raygenOffs = patchDataSize;
   patchDataSize = (uint32_t)desc.RayGenerationShaderRecord.SizeInBytes;
-  patchDataSize = AlignUp(patchDataSize, (uint32_t)D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
+  patchDataSize = AlignUp(patchDataSize, 256U);
 
   const uint32_t missOffs = patchDataSize;
   patchDataSize += (uint32_t)desc.MissShaderTable.SizeInBytes;
-  patchDataSize = AlignUp(patchDataSize, (uint32_t)D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
+  patchDataSize = AlignUp(patchDataSize, 256U);
 
   const uint32_t hitOffs = patchDataSize;
   patchDataSize += (uint32_t)desc.HitGroupTable.SizeInBytes;
-  patchDataSize = AlignUp(patchDataSize, (uint32_t)D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
+  patchDataSize = AlignUp(patchDataSize, 256U);
+
+  // use 256 to match the indirect patching in raytracing.hlsl
+  RDCCOMPILE_ASSERT(256U >= D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT,
+                    "expect 256 to satisfy shader table alignment");
 
   const uint32_t callOffs = patchDataSize;
   patchDataSize += (uint32_t)desc.CallableShaderTable.SizeInBytes;
@@ -872,6 +1669,16 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
   m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::DefaultHeapWithUav,
                              D3D12GpuBufferHeapMemoryFlag::Default, patchDataSize,
                              D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, &scratchBuffer);
+
+  ret.resources.readbackBuffer = NULL;
+
+  if(IsReplayMode(m_wrappedDevice->GetState()) && D3D12_Debug_RT_Auditing())
+  {
+    m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::ReadBackHeap,
+                               D3D12GpuBufferHeapMemoryFlag::Default, patchDataSize * 2,
+                               D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT,
+                               &ret.resources.readbackBuffer);
+  }
 
   RDCCOMPILE_ASSERT(WRAPPED_DESCRIPTOR_STRIDE == sizeof(D3D12Descriptor),
                     "Shader descriptor stride is wrong");
@@ -904,8 +1711,8 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
 
   // set up general patching data - lookup buffers and so on
 
-  unwrappedCmd->SetPipelineState(m_RayPatchingData.descPatchPipe);
-  unwrappedCmd->SetComputeRootSignature(m_RayPatchingData.descPatchRootSig);
+  unwrappedCmd->SetPipelineState(m_RayPatchingData.shaderTablePatchPipe);
+  unwrappedCmd->SetComputeRootSignature(m_RayPatchingData.shaderTablePatchRootSig);
   unwrappedCmd->SetComputeRoot32BitConstants((UINT)D3D12PatchRayDispatchParam::GeneralCB,
                                              sizeof(cbufferData) / sizeof(uint32_t), &cbufferData, 0);
   unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::StateObjectData,
@@ -928,6 +1735,15 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
                                                sizeof(recordInfo) / sizeof(uint32_t), &recordInfo, 0);
     unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::SourceBuffer,
                                                    ret.desc.RayGenerationShaderRecord.StartAddress);
+
+    if(ret.resources.readbackBuffer)
+    {
+      CopyFromVA(unwrappedCmd, ret.resources.readbackBuffer->Resource(),
+                 ret.resources.readbackBuffer->Offset() + raygenOffs,
+                 ret.desc.RayGenerationShaderRecord.StartAddress,
+                 desc.RayGenerationShaderRecord.SizeInBytes);
+    }
+
     ret.desc.RayGenerationShaderRecord.StartAddress = scratchBuffer->Address() + raygenOffs;
     unwrappedCmd->SetComputeRootUnorderedAccessView((UINT)D3D12PatchRayDispatchParam::DestBuffer,
                                                     ret.desc.RayGenerationShaderRecord.StartAddress);
@@ -945,6 +1761,14 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
                                                sizeof(recordInfo) / sizeof(uint32_t), &recordInfo, 0);
     unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::SourceBuffer,
                                                    ret.desc.MissShaderTable.StartAddress);
+
+    if(ret.resources.readbackBuffer)
+    {
+      CopyFromVA(unwrappedCmd, ret.resources.readbackBuffer->Resource(),
+                 ret.resources.readbackBuffer->Offset() + missOffs,
+                 ret.desc.MissShaderTable.StartAddress, desc.MissShaderTable.SizeInBytes);
+    }
+
     ret.desc.MissShaderTable.StartAddress = scratchBuffer->Address() + missOffs;
     unwrappedCmd->SetComputeRootUnorderedAccessView((UINT)D3D12PatchRayDispatchParam::DestBuffer,
                                                     ret.desc.MissShaderTable.StartAddress);
@@ -964,6 +1788,14 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
                                                sizeof(recordInfo) / sizeof(uint32_t), &recordInfo, 0);
     unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::SourceBuffer,
                                                    ret.desc.HitGroupTable.StartAddress);
+
+    if(ret.resources.readbackBuffer)
+    {
+      CopyFromVA(unwrappedCmd, ret.resources.readbackBuffer->Resource(),
+                 ret.resources.readbackBuffer->Offset() + hitOffs,
+                 ret.desc.HitGroupTable.StartAddress, desc.HitGroupTable.SizeInBytes);
+    }
+
     ret.desc.HitGroupTable.StartAddress = scratchBuffer->Address() + hitOffs;
     unwrappedCmd->SetComputeRootUnorderedAccessView((UINT)D3D12PatchRayDispatchParam::DestBuffer,
                                                     ret.desc.HitGroupTable.StartAddress);
@@ -984,6 +1816,14 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
                                                sizeof(recordInfo) / sizeof(uint32_t), &recordInfo, 0);
     unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::SourceBuffer,
                                                    ret.desc.CallableShaderTable.StartAddress);
+
+    if(ret.resources.readbackBuffer)
+    {
+      CopyFromVA(unwrappedCmd, ret.resources.readbackBuffer->Resource(),
+                 ret.resources.readbackBuffer->Offset() + callOffs,
+                 ret.desc.CallableShaderTable.StartAddress, desc.CallableShaderTable.SizeInBytes);
+    }
+
     ret.desc.CallableShaderTable.StartAddress = scratchBuffer->Address() + callOffs;
     unwrappedCmd->SetComputeRootUnorderedAccessView((UINT)D3D12PatchRayDispatchParam::DestBuffer,
                                                     ret.desc.CallableShaderTable.StartAddress);
@@ -996,8 +1836,16 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   barrier.Transition.pResource = scratchBuffer->Resource();
   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  barrier.Transition.StateAfter =
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE;
   unwrappedCmd->ResourceBarrier(1, &barrier);
+
+  if(ret.resources.readbackBuffer)
+  {
+    unwrappedCmd->CopyBufferRegion(ret.resources.readbackBuffer->Resource(),
+                                   ret.resources.readbackBuffer->Offset() + patchDataSize,
+                                   scratchBuffer->Resource(), scratchBuffer->Offset(), patchDataSize);
+  }
 
   // we have our own ref, the patch data has its ref too that will be held while the list is
   // submittable. Each submission will also get a ref to keep this referenced lookup buffer alive until then
@@ -1010,12 +1858,21 @@ PatchedRayDispatch D3D12RTManager::PatchRayDispatch(ID3D12GraphicsCommandList4 *
 
   ret.resources.argumentBuffer = NULL;
 
+  if(ret.resources.query != ~0U)
+  {
+    unwrappedCmd->EndQuery(m_TimerQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, ret.resources.query + 1);
+    unwrappedCmd->ResolveQueryData(
+        m_TimerQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, ret.resources.query, 2,
+        m_TimerReadbackBuffer->Resource(),
+        m_TimerReadbackBuffer->Offset() + sizeof(uint64_t) * ret.resources.query);
+  }
+
   return ret;
 }
 
 PatchedRayDispatch D3D12RTManager::PatchIndirectRayDispatch(
     ID3D12GraphicsCommandList *unwrappedCmd, rdcarray<ResourceId> heaps,
-    ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount, ID3D12Resource *pArgumentBuffer,
+    ID3D12CommandSignature *pCommandSignature, UINT &MaxCommandCount, ID3D12Resource *pArgumentBuffer,
     UINT64 ArgumentBufferOffset, ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset)
 {
   PatchedRayDispatch ret = {};
@@ -1029,14 +1886,9 @@ PatchedRayDispatch D3D12RTManager::PatchIndirectRayDispatch(
   // :( some games have fixed sizes, so any other estimate could fail.
   // games without fixed sizes would be reasonably served by 3 or 4 multiplied by the number of BLAS
   // in the largest TLAS, multiplied by the largest local root signature size.
-  uint32_t patchDataSize = 20 * 1024 * 1024 * MaxCommandCount;
-
-  if(D3D12_Debug_RTIndirectEstimateOverride() > 0)
-    patchDataSize = RDCMAX(patchDataSize, D3D12_Debug_RTIndirectEstimateOverride());
-
-  m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::DefaultHeapWithUav,
-                             D3D12GpuBufferHeapMemoryFlag::Default, patchDataSize,
-                             D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, &scratchBuffer);
+  //
+  // minimum of 64 bytes to account for MaxCommandCount so that we don't allocate 0-sized buffers
+  uint32_t patchDataSize = GuessTablePatchRequirements(MaxCommandCount);
 
   WrappedID3D12CommandSignature *comSig = (WrappedID3D12CommandSignature *)pCommandSignature;
 
@@ -1048,13 +1900,55 @@ PatchedRayDispatch D3D12RTManager::PatchIndirectRayDispatch(
   uint64_t applicationArgsSize = AlignUp16(MaxCommandCount * comSig->sig.ByteStride);
   uint64_t patchingArgsSize = AlignUp16(MaxCommandCount * 4 * AlignUp16(sizeof(PatchingExecute)));
 
-  m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::DefaultHeapWithUav,
-                             D3D12GpuBufferHeapMemoryFlag::Default,
-                             applicationArgsSize + patchingArgsSize + 4,
-                             D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, &argsBuffer);
+  ret.MaxCommands = MaxCommandCount;
+  ret.comSig = comSig;
+  ret.HasDynamicCount = pCountBuffer != NULL;
+
+  uint64_t totalArgsSize =
+      // unwrapped exec args
+      applicationArgsSize +
+      // unwrapping internal exec
+      patchingArgsSize +
+      // count
+      4;
+  uint64_t totalScratchSize = patchDataSize;
+
+  uint64_t auditCopyArgsOffset = totalArgsSize;
 
   RDCCOMPILE_ASSERT(WRAPPED_DESCRIPTOR_STRIDE == sizeof(D3D12Descriptor),
                     "Shader descriptor stride is wrong");
+
+  ret.resources.readbackBuffer = NULL;
+
+  if(IsReplayMode(m_wrappedDevice->GetState()) && D3D12_Debug_RT_Auditing())
+  {
+    m_GPUBufferAllocator.Alloc(
+        D3D12GpuBufferHeapType::ReadBackHeap, D3D12GpuBufferHeapMemoryFlag::Default,
+        // unpatched records
+        patchDataSize +
+            // patched records
+            patchDataSize +
+            // app exec args + optional count
+            (applicationArgsSize + 4) +
+            // patched exec args + internal args + count
+            applicationArgsSize + patchingArgsSize + 4,
+        D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, &ret.resources.readbackBuffer);
+
+    // double the args we need internally to make room for a second internal indirect dispatch to
+    // copy the unwrapped arguments
+    totalArgsSize *= 2;
+
+    // we can't write directly to our readback buffer with our indirect copy, need to copy into scratch first
+    totalScratchSize *= 2;
+  }
+
+  m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::DefaultHeapWithUav,
+                             D3D12GpuBufferHeapMemoryFlag::Default, totalScratchSize,
+                             D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, &scratchBuffer);
+
+  m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::DefaultHeapWithUav,
+                             D3D12GpuBufferHeapMemoryFlag::Default, totalArgsSize,
+                             D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT, &argsBuffer);
 
   RayDispatchPatchCB cbufferData = {};
 
@@ -1088,7 +1982,18 @@ PatchedRayDispatch D3D12RTManager::PatchIndirectRayDispatch(
   prepInfo.commandSigSize = comSig->sig.PackedByteSize;
   prepInfo.commandSigStride = comSig->sig.ByteStride;
   prepInfo.maxCommandCount = MaxCommandCount;
-  prepInfo.scratchBuffer = scratchBuffer->Address();
+  prepInfo.destBuffer = scratchBuffer->Address();
+  prepInfo.destBufferEnd = scratchBuffer->Address() + patchDataSize;
+
+  if(pCountBuffer == NULL)
+    prepInfo.maxCommandCount |= 0x80000000U;
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = Unwrap(pArgumentBuffer);
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  unwrappedCmd->ResourceBarrier(1, &barrier);
 
   // set up general patching data - lookup buffers and so on
 
@@ -1115,16 +2020,41 @@ PatchedRayDispatch D3D12RTManager::PatchIndirectRayDispatch(
   // patching the actual arguments buffer we'll return
   unwrappedCmd->Dispatch(1, 1, 1);
 
+  // if we're reading back, do another dispatch to write args which just purely copy
+  if(ret.resources.readbackBuffer)
+  {
+    prepInfo.destBuffer = scratchBuffer->Address() + patchDataSize;
+    prepInfo.destBufferEnd = scratchBuffer->Address() + patchDataSize * 2;
+    unwrappedCmd->SetComputeRoot32BitConstants((UINT)D3D12IndirectPrepParam::GeneralCB,
+                                               sizeof(prepInfo) / sizeof(uint32_t), &prepInfo, 0);
+
+    // unused, we don't need this but it keeps the shader the same
+    unwrappedCmd->SetComputeRootUnorderedAccessView((UINT)D3D12IndirectPrepParam::PatchedExecuteArgs,
+                                                    argsBuffer->Address() + auditCopyArgsOffset);
+    // this will be the arguments for our internal copy-dispatch
+    unwrappedCmd->SetComputeRootUnorderedAccessView(
+        (UINT)D3D12IndirectPrepParam::InternalExecuteArgs,
+        argsBuffer->Address() + auditCopyArgsOffset + applicationArgsSize);
+    unwrappedCmd->SetComputeRootUnorderedAccessView(
+        (UINT)D3D12IndirectPrepParam::InternalExecuteCount,
+        argsBuffer->Address() + auditCopyArgsOffset + applicationArgsSize + patchingArgsSize);
+
+    unwrappedCmd->Dispatch(1, 1, 1);
+  }
+
+  barrier.Transition.pResource = Unwrap(pArgumentBuffer);
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+  unwrappedCmd->ResourceBarrier(1, &barrier);
+
   // this is ready for the application to use (once we patch the things it refers to), and for us to use below
-  D3D12_RESOURCE_BARRIER barrier = {};
-  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   barrier.Transition.pResource = argsBuffer->Resource();
   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
   unwrappedCmd->ResourceBarrier(1, &barrier);
 
-  unwrappedCmd->SetPipelineState(m_RayPatchingData.descPatchPipe);
-  unwrappedCmd->SetComputeRootSignature(m_RayPatchingData.descPatchRootSig);
+  unwrappedCmd->SetPipelineState(m_RayPatchingData.shaderTablePatchPipe);
+  unwrappedCmd->SetComputeRootSignature(m_RayPatchingData.shaderTablePatchRootSig);
   unwrappedCmd->SetComputeRoot32BitConstants((UINT)D3D12PatchRayDispatchParam::GeneralCB,
                                              sizeof(cbufferData) / sizeof(uint32_t), &cbufferData, 0);
   unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::StateObjectData,
@@ -1154,8 +2084,97 @@ PatchedRayDispatch D3D12RTManager::PatchIndirectRayDispatch(
   // scratch buffer has now been patched and is ready to use as well
   barrier.Transition.pResource = scratchBuffer->Resource();
   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  barrier.Transition.StateAfter =
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_COPY_SOURCE;
   unwrappedCmd->ResourceBarrier(1, &barrier);
+
+  if(ret.resources.readbackBuffer)
+  {
+    barrier.Transition.pResource = Unwrap(pArgumentBuffer);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    unwrappedCmd->ResourceBarrier(1, &barrier);
+
+    uint64_t offset = 0;
+
+    unwrappedCmd->SetPipelineState(m_RayPatchingData.shaderTableCopyPipe);
+    unwrappedCmd->SetComputeRootSignature(m_RayPatchingData.shaderTablePatchRootSig);
+    unwrappedCmd->SetComputeRoot32BitConstants((UINT)D3D12PatchRayDispatchParam::GeneralCB,
+                                               sizeof(cbufferData) / sizeof(uint32_t), &cbufferData,
+                                               0);
+    unwrappedCmd->SetComputeRootShaderResourceView(
+        (UINT)D3D12PatchRayDispatchParam::StateObjectData, m_LookupAddrs[0]);
+    unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::RecordData,
+                                                   m_LookupAddrs[1]);
+    unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::RootSigData,
+                                                   m_LookupAddrs[2]);
+    unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::AddrPatchData,
+                                                   m_LookupAddrs[3]);
+
+    // these will be overwritten by the execute indirect, but set them to something to be safe
+    unwrappedCmd->SetComputeRoot32BitConstants((UINT)D3D12PatchRayDispatchParam::RecordCB,
+                                               sizeof(recordInfo) / sizeof(uint32_t), &recordInfo, 0);
+    unwrappedCmd->SetComputeRootShaderResourceView((UINT)D3D12PatchRayDispatchParam::SourceBuffer,
+                                                   m_LookupAddrs[0]);
+    unwrappedCmd->SetComputeRootUnorderedAccessView((UINT)D3D12PatchRayDispatchParam::DestBuffer,
+                                                    scratchBuffer->Address());
+
+    unwrappedCmd->ExecuteIndirect(
+        m_RayPatchingData.indirectComSig, MaxCommandCount * 4, argsBuffer->Resource(),
+        argsBuffer->Offset() + auditCopyArgsOffset + applicationArgsSize, argsBuffer->Resource(),
+        argsBuffer->Offset() + auditCopyArgsOffset + applicationArgsSize + patchingArgsSize);
+
+    // unpatched data
+    unwrappedCmd->CopyBufferRegion(
+        ret.resources.readbackBuffer->Resource(), ret.resources.readbackBuffer->Offset() + offset,
+        scratchBuffer->Resource(), scratchBuffer->Offset() + patchDataSize, patchDataSize);
+    offset += patchDataSize;
+
+    // patched data
+    unwrappedCmd->CopyBufferRegion(
+        ret.resources.readbackBuffer->Resource(), ret.resources.readbackBuffer->Offset() + offset,
+        scratchBuffer->Resource(), scratchBuffer->Offset(), patchDataSize);
+    offset += patchDataSize;
+
+    // unpatched execute args
+    unwrappedCmd->CopyBufferRegion(ret.resources.readbackBuffer->Resource(),
+                                   ret.resources.readbackBuffer->Offset() + patchDataSize * 2,
+                                   Unwrap(pArgumentBuffer), ArgumentBufferOffset,
+                                   applicationArgsSize);
+    offset += applicationArgsSize;
+
+    // source count
+    if(pCountBuffer)
+    {
+      unwrappedCmd->CopyBufferRegion(ret.resources.readbackBuffer->Resource(),
+                                     ret.resources.readbackBuffer->Offset() + offset,
+                                     Unwrap(pCountBuffer), CountBufferOffset, applicationArgsSize);
+    }
+    offset += 4;
+
+    barrier.Transition.pResource = argsBuffer->Resource();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    unwrappedCmd->ResourceBarrier(1, &barrier);
+
+    // patched execute args, our internal executes, count
+    unwrappedCmd->CopyBufferRegion(
+        ret.resources.readbackBuffer->Resource(), ret.resources.readbackBuffer->Offset() + offset,
+        argsBuffer->Resource(), argsBuffer->Offset(), applicationArgsSize + patchingArgsSize + 4);
+    offset += applicationArgsSize + patchingArgsSize + 4;
+
+    RDCASSERTEQUAL(offset, ret.resources.readbackBuffer->Size());
+
+    barrier.Transition.pResource = argsBuffer->Resource();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    unwrappedCmd->ResourceBarrier(1, &barrier);
+
+    barrier.Transition.pResource = Unwrap(pArgumentBuffer);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    unwrappedCmd->ResourceBarrier(1, &barrier);
+  }
 
   // we have our own ref, the patch data has its ref too that will be held while the list is
   // submittable. Each submission will also get a ref to keep this referenced lookup buffer alive until then
@@ -1166,6 +2185,14 @@ PatchedRayDispatch D3D12RTManager::PatchIndirectRayDispatch(
   // but it takes the ref we had when we created it.
   ret.resources.patchScratchBuffer = scratchBuffer;
   ret.resources.argumentBuffer = argsBuffer;
+
+  // TODO: Verify for indirect executes
+
+  if(IsReplayMode(m_wrappedDevice->GetState()) && D3D12_Debug_RT_Auditing())
+  {
+    // only one execute is allowed per command signature, if it's ray tracing and we're auditing then turn it off
+    MaxCommandCount = 0;
+  }
 
   return ret;
 }
@@ -1281,6 +2308,14 @@ ASBuildData *D3D12RTManager::CopyBuildInputs(
   ret->Type = inputs.Type;
   ret->Flags = inputs.Flags;
   ret->timestamp = m_Timestamp.GetMilliseconds();
+  ret->rtManager = this;
+
+  ret->query = GetFreeQuery();
+
+  if(ret->query != ~0U)
+  {
+    unwrappedCmd->EndQuery(m_TimerQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, ret->query);
+  }
 
   if(inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)
   {
@@ -1410,8 +2445,8 @@ ASBuildData *D3D12RTManager::CopyBuildInputs(
           uint32_t untrustedVertexCount = desc.Triangles.VertexCount;
           uint32_t estimatedVertexCount =
               untrustedVertexCount +
-              (untrustedVertexCount / 100) * D3D12_Debug_RTMaxVertexPercentIncrease() +
-              D3D12_Debug_RTMaxVertexIncrement();
+              (untrustedVertexCount / 100) * D3D12_Debug_RT_MaxVertexPercentIncrease() +
+              D3D12_Debug_RT_MaxVertexIncrement();
 
           RDCASSERT(vbSize >= desc.Triangles.VertexBuffer.StrideInBytes * untrustedVertexCount);
 
@@ -1529,8 +2564,8 @@ ASBuildData *D3D12RTManager::CopyBuildInputs(
           uint32_t untrustedVertexCount = desc.Triangles.VertexCount;
           uint32_t estimatedVertexCount =
               untrustedVertexCount +
-              (untrustedVertexCount / 100) * D3D12_Debug_RTMaxVertexPercentIncrease() +
-              D3D12_Debug_RTMaxVertexIncrement();
+              (untrustedVertexCount / 100) * D3D12_Debug_RT_MaxVertexPercentIncrease() +
+              D3D12_Debug_RT_MaxVertexIncrement();
 
           vbSize = RDCMIN(vbSize, desc.Triangles.VertexBuffer.StrideInBytes * estimatedVertexCount);
 
@@ -1564,6 +2599,22 @@ ASBuildData *D3D12RTManager::CopyBuildInputs(
   D3D12_RESOURCE_BARRIER barrier = {};
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   unwrappedCmd->ResourceBarrier(1, &barrier);
+
+  // only bother tracking build data with a buffer attached, as without the buffer there is nothing
+  // to cache and we don't care too much about missing stats for empty/degenerate ASs
+  if(ret->buffer)
+  {
+    SCOPED_LOCK(m_ASBuildDataLock);
+    m_InMemASBuildDatas.push_back(ret);
+  }
+
+  if(ret->query != ~0U)
+  {
+    unwrappedCmd->EndQuery(m_TimerQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, ret->query + 1);
+    unwrappedCmd->ResolveQueryData(m_TimerQueryHeap, D3D12_QUERY_TYPE_TIMESTAMP, ret->query, 2,
+                                   m_TimerReadbackBuffer->Resource(),
+                                   m_TimerReadbackBuffer->Offset() + sizeof(uint64_t) * ret->query);
+  }
 
   return ret;
 }
@@ -1749,7 +2800,7 @@ void D3D12RTManager::InitRayDispatchPatchingResources()
   {
     HRESULT result = m_wrappedDevice->GetReal()->CreateRootSignature(
         0, rootSig.data(), rootSig.size(), __uuidof(ID3D12RootSignature),
-        (void **)&m_RayPatchingData.descPatchRootSig);
+        (void **)&m_RayPatchingData.shaderTablePatchRootSig);
 
     if(!SUCCEEDED(result))
       RDCERR("Unable to create root signature for dispatch patching");
@@ -1757,7 +2808,7 @@ void D3D12RTManager::InitRayDispatchPatchingResources()
     // PipelineState
     ID3DBlob *shader = NULL;
     rdcstr hlsl = GetEmbeddedResource(raytracing_hlsl);
-    shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_PatchRayDispatchCS",
+    shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_PatchShaderTableCS",
                                D3DCOMPILE_WARNINGS_ARE_ERRORS, {}, "cs_5_0", &shader);
 
     if(shader)
@@ -1767,17 +2818,48 @@ void D3D12RTManager::InitRayDispatchPatchingResources()
       pipeline.NodeMask = 0;
       pipeline.CS = {(void *)shader->GetBufferPointer(), shader->GetBufferSize()};
       pipeline.CachedPSO = {NULL, 0};
-      pipeline.pRootSignature = m_RayPatchingData.descPatchRootSig;
+      pipeline.pRootSignature = m_RayPatchingData.shaderTablePatchRootSig;
 
       result = m_wrappedDevice->GetReal()->CreateComputePipelineState(
-          &pipeline, __uuidof(ID3D12PipelineState), (void **)&m_RayPatchingData.descPatchPipe);
+          &pipeline, __uuidof(ID3D12PipelineState), (void **)&m_RayPatchingData.shaderTablePatchPipe);
 
       if(!SUCCEEDED(result))
         RDCERR("Unable to create pipeline for dispatch patching");
+
+      if(m_RayPatchingData.shaderTablePatchPipe)
+        m_RayPatchingData.shaderTablePatchPipe->SetName(L"RENDERDOC_PatchShaderTableCS");
     }
     else
     {
-      RDCERR("Failed to get shader for dispatch patching");
+      RDCERR("Failed to get shader for record patching in dispatch");
+    }
+
+    SAFE_RELEASE(shader);
+
+    shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_CopyShaderTableCS",
+                               D3DCOMPILE_WARNINGS_ARE_ERRORS, {}, "cs_5_0", &shader);
+
+    if(shader)
+    {
+      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline;
+      pipeline.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+      pipeline.NodeMask = 0;
+      pipeline.CS = {(void *)shader->GetBufferPointer(), shader->GetBufferSize()};
+      pipeline.CachedPSO = {NULL, 0};
+      pipeline.pRootSignature = m_RayPatchingData.shaderTablePatchRootSig;
+
+      result = m_wrappedDevice->GetReal()->CreateComputePipelineState(
+          &pipeline, __uuidof(ID3D12PipelineState), (void **)&m_RayPatchingData.shaderTableCopyPipe);
+
+      if(!SUCCEEDED(result))
+        RDCERR("Unable to create pipeline for dispatch patching");
+
+      if(m_RayPatchingData.shaderTableCopyPipe)
+        m_RayPatchingData.shaderTableCopyPipe->SetName(L"RENDERDOC_CopyShaderTableCS");
+    }
+    else
+    {
+      RDCERR("Failed to get shader for record copying in indirect auditing");
     }
 
     SAFE_RELEASE(shader);
@@ -1885,6 +2967,9 @@ void D3D12RTManager::InitRayDispatchPatchingResources()
       result = m_wrappedDevice->GetReal()->CreateComputePipelineState(
           &pipeline, __uuidof(ID3D12PipelineState), (void **)&m_RayPatchingData.indirectPrepPipe);
 
+      if(m_RayPatchingData.indirectPrepPipe)
+        m_RayPatchingData.indirectPrepPipe->SetName(L"RENDERDOC_PrepareRayIndirectExecuteCS");
+
       if(!SUCCEEDED(result))
         RDCERR("Unable to create pipeline for indirect execute patching");
     }
@@ -1928,7 +3013,7 @@ void D3D12RTManager::InitRayDispatchPatchingResources()
     desc.pArgumentDescs = args;
 
     HRESULT hr = m_wrappedDevice->GetReal()->CreateCommandSignature(
-        &desc, m_RayPatchingData.descPatchRootSig, __uuidof(ID3D12CommandSignature),
+        &desc, m_RayPatchingData.shaderTablePatchRootSig, __uuidof(ID3D12CommandSignature),
         (void **)&m_RayPatchingData.indirectComSig);
 
     if(!SUCCEEDED(hr))
@@ -2023,6 +3108,9 @@ void D3D12RTManager::InitTLASInstanceCopyingResources()
       result = m_wrappedDevice->GetReal()->CreateComputePipelineState(
           &pipeline, __uuidof(ID3D12PipelineState), (void **)&m_TLASCopyingData.PreparePipe);
 
+      if(m_TLASCopyingData.PreparePipe)
+        m_TLASCopyingData.PreparePipe->SetName(L"RENDERDOC_PrepareTLASCopyIndirectExecuteCS");
+
       if(!SUCCEEDED(result))
         RDCERR("Unable to create pipeline for TLAS instance copying");
     }
@@ -2047,6 +3135,9 @@ void D3D12RTManager::InitTLASInstanceCopyingResources()
 
       result = m_wrappedDevice->GetReal()->CreateComputePipelineState(
           &pipeline, __uuidof(ID3D12PipelineState), (void **)&m_TLASCopyingData.CopyPipe);
+
+      if(m_TLASCopyingData.CopyPipe)
+        m_TLASCopyingData.CopyPipe->SetName(L"RENDERDOC_CopyBLASInstanceCS");
 
       if(!SUCCEEDED(result))
         RDCERR("Unable to create pipeline for TLAS instance copying");
@@ -2153,6 +3244,9 @@ void D3D12RTManager::InitReplayBlasPatchingResources()
 
         result = m_wrappedDevice->GetReal()->CreateComputePipelineState(
             &pipeline, __uuidof(ID3D12PipelineState), (void **)&m_accStructPatchInfo.m_pipeline);
+
+        if(m_accStructPatchInfo.m_pipeline)
+          m_accStructPatchInfo.m_pipeline->SetName(L"RENDERDOC_PatchAccStructAddressCS");
 
         if(!SUCCEEDED(result))
           RDCERR("Unable to create pipeline for patching the BLAS");
@@ -2285,7 +3379,7 @@ bool D3D12GpuBufferAllocator::D3D12GpuBufferResource::ReleaseGpuBufferResource(
 
 D3D12GpuBufferAllocator::D3D12GpuBufferResource::D3D12GpuBufferResource(ID3D12Resource *resource,
                                                                         D3D12_HEAP_TYPE heapType)
-    : m_resource(resource), m_heapType(heapType)
+    : m_resource(resource), m_heapType(heapType), m_subRanges(), m_lastFree(m_subRanges.begin())
 
 {
   if(m_resource)
@@ -2293,6 +3387,7 @@ D3D12GpuBufferAllocator::D3D12GpuBufferResource::D3D12GpuBufferResource(ID3D12Re
     m_resDesc = m_resource->GetDesc();
     m_resourceGpuAddressRange.start = resource->GetGPUVirtualAddress();
     m_resourceGpuAddressRange.realEnd = m_resourceGpuAddressRange.start + m_resDesc.Width;
+    m_bytesFree = m_resDesc.Width;
   }
 }
 
@@ -2312,6 +3407,9 @@ bool D3D12GpuBufferAllocator::D3D12GpuBufferPool::Alloc(WrappedID3D12Device *wra
     D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = 0;
     for(D3D12GpuBufferResource *bufferRes : m_bufferResourceList)
     {
+      if(size > bufferRes->m_bytesFree)
+        continue;
+
       if(bufferRes->SubAlloc(size, alignment, gpuAddress))
       {
         *gpuBuffer = new D3D12GpuBuffer(allocator, m_bufferPoolHeapType,
@@ -2342,10 +3440,13 @@ bool D3D12GpuBufferAllocator::D3D12GpuBufferPool::Alloc(WrappedID3D12Device *wra
            wrappedDevice, m_bufferPoolHeapType, size, &newBufferResource))
     {
       m_bufferResourceList.push_back(newBufferResource);
-      *gpuBuffer = new D3D12GpuBuffer(
-          allocator, m_bufferPoolHeapType, D3D12GpuBufferHeapMemoryFlag::Dedicated, size,
-          D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
-          newBufferResource->Resource()->GetGPUVirtualAddress(), newBufferResource->Resource());
+      D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = 0;
+      if(newBufferResource->SubAlloc(size, alignment, gpuAddress))
+      {
+        *gpuBuffer = new D3D12GpuBuffer(
+            allocator, m_bufferPoolHeapType, D3D12GpuBufferHeapMemoryFlag::Dedicated, size,
+            D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, gpuAddress, newBufferResource->Resource());
+      }
       return true;
     }
   }
@@ -2371,7 +3472,7 @@ void D3D12GpuBufferAllocator::D3D12GpuBufferPool::Free(const D3D12GpuBuffer &gpu
       {
         if(bufferRes->SubAllocationInRange(gpuBuffer.Address()))
         {
-          if(!bufferRes->Free(gpuBuffer.Address()))
+          if(!bufferRes->Free(gpuBuffer.Address(), gpuBuffer.Size(), gpuBuffer.Alignment()))
           {
             RDCERR("Invalid address when freeing buffer");
           }
@@ -2394,6 +3495,13 @@ bool D3D12GpuBufferAllocator::Alloc(D3D12GpuBufferHeapType heapType,
                                     D3D12GpuBufferHeapMemoryFlag heapMem, uint64_t size,
                                     uint64_t alignment, D3D12GpuBuffer **gpuBuffer)
 {
+  if(size == 0)
+  {
+    RDCERR("Can't allocate 0-byte buffer");
+    *gpuBuffer = NULL;
+    return false;
+  }
+
   SCOPED_LOCK(m_bufferAllocLock);
   bool success = false;
   if(heapType < D3D12GpuBufferHeapType::Count && heapType != D3D12GpuBufferHeapType::UnInitialized)
@@ -2862,6 +3970,13 @@ rdcarray<ResourceId> D3D12ResourceManager::InitialContentResources()
     if(aData.buildData && bData.buildData)
       return aData.buildData->Type > bData.buildData->Type;
 
+    // serialise ASs first to allow reallocation.
+    // since the enum is serialised we couldn't change the order so we do this by hand
+    int aASSort = aData.resourceType == Resource_AccelerationStructure ? 0 : 1;
+    int bASSort = bData.resourceType == Resource_AccelerationStructure ? 0 : 1;
+    if(aASSort != bASSort)
+      return aASSort < bASSort;
+
     return aData.resourceType < bData.resourceType;
   });
   return resources;
@@ -2883,6 +3998,12 @@ void D3D12GpuBuffer::Release()
   }
 }
 
+void ASBuildData::MarkWorkComplete()
+{
+  complete = true;
+  rtManager->AddBuildTimer(query, buffer ? buffer->Size() : 0);
+}
+
 void ASBuildData::AddRef()
 {
   InterlockedIncrement(&m_RefCount);
@@ -2893,59 +4014,16 @@ void ASBuildData::Release()
   unsigned int ret = InterlockedDecrement(&m_RefCount);
   if(ret == 0)
   {
-    {
-#if ENABLED(RDOC_DEVEL)
-      SCOPED_WRITELOCK(dataslock);
-      datas.removeOne(this);
-#endif
-    }
+    if(rtManager)
+      rtManager->RemoveASBuildData(this);
 
     SAFE_RELEASE(buffer);
 
+    if(diskCache.size && rtManager)
+    {
+      rtManager->ReleaseDiskCache(diskCache);
+    }
+
     delete this;
   }
-}
-
-#if ENABLED(RDOC_DEVEL)
-Threading::RWLock ASBuildData::dataslock;
-rdcarray<ASBuildData *> ASBuildData::datas;
-#endif
-
-void ASBuildData::GatherASAgeStatistics(D3D12ResourceManager *rm, double now, ASStats &blasAges,
-                                        ASStats &tlasAges)
-{
-#if ENABLED(RDOC_DEVEL)
-  SCOPED_READLOCK(dataslock);
-
-  blasAges.bucket[0].msThreshold = tlasAges.bucket[0].msThreshold = 50;
-  blasAges.bucket[1].msThreshold = tlasAges.bucket[1].msThreshold = 500;
-  blasAges.bucket[2].msThreshold = tlasAges.bucket[2].msThreshold = 5000;
-  blasAges.bucket[3].msThreshold = tlasAges.bucket[3].msThreshold = ~0U;
-
-  for(ASBuildData *buildData : datas)
-  {
-    if(buildData)
-    {
-      uint32_t age = uint32_t(now - buildData->timestamp);
-
-      ASStats &ages = buildData->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
-                          ? tlasAges
-                          : blasAges;
-
-      uint64_t size = buildData->buffer ? buildData->buffer->Size() : 0;
-
-      ages.overheadBytes += buildData->bytesOverhead;
-
-      for(size_t i = 0; i < ARRAY_COUNT(tlasAges.bucket); i++)
-      {
-        if(age <= ages.bucket[i].msThreshold)
-        {
-          ages.bucket[i].count++;
-          ages.bucket[i].bytes += size;
-          break;
-        }
-      }
-    }
-  }
-#endif
 }

@@ -137,7 +137,7 @@ bool D3D12ShaderDebug::CalculateMathIntrinsic(bool dxil, WrappedID3D12Device *de
   {
     ID3D12CommandList *l = cmdList;
     device->GetQueue()->ExecuteCommandLists(1, &l);
-    device->GPUSync();
+    device->InternalQueueWaitForIdle();
   }
 
   D3D12_RANGE range = {0, sizeof(Vec4f) * 6};
@@ -382,7 +382,7 @@ bool D3D12ShaderDebug::CalculateSampleGather(
   {
     ID3D12CommandList *l = cmdList;
     device->GetQueue()->ExecuteCommandLists(1, &l);
-    device->GPUSync();
+    device->InternalQueueWaitForIdle();
   }
 
   rs = prevState;
@@ -2900,7 +2900,7 @@ struct PSInitialData
   {
     ID3D12CommandList *l = cmdList;
     m_pDevice->GetQueue()->ExecuteCommandLists(1, &l);
-    m_pDevice->GPUSync();
+    m_pDevice->InternalQueueWaitForIdle();
   }
 
   {
@@ -3081,19 +3081,19 @@ struct PSInitialData
 
           if(initialValues[i].sysattribute == ShaderBuiltin::PrimitiveIndex)
           {
-            invar.value.u32v[0] = pHit->primitive;
+            invar.value.u32v[initialValues[i].elem] = pHit->primitive;
           }
           else if(initialValues[i].sysattribute == ShaderBuiltin::MSAASampleIndex)
           {
-            invar.value.u32v[0] = pHit->sample;
+            invar.value.u32v[initialValues[i].elem] = pHit->sample;
           }
           else if(initialValues[i].sysattribute == ShaderBuiltin::MSAACoverage)
           {
-            invar.value.u32v[0] = pHit->coverage;
+            invar.value.u32v[initialValues[i].elem] = pHit->coverage;
           }
           else if(initialValues[i].sysattribute == ShaderBuiltin::IsFrontFace)
           {
-            invar.value.u32v[0] = pHit->isFrontFace ? ~0U : 0;
+            invar.value.u32v[initialValues[i].elem] = pHit->isFrontFace ? ~0U : 0;
           }
           else
           {

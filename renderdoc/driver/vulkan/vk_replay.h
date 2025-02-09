@@ -369,7 +369,6 @@ public:
   void DestroyOutputWindow(uint64_t id);
   bool CheckResizeOutputWindow(uint64_t id);
   void GetOutputWindowDimensions(uint64_t id, int32_t &w, int32_t &h);
-  void SetOutputWindowDimensions(uint64_t id, int32_t w, int32_t h);
   void GetOutputWindowData(uint64_t id, bytebuf &retData);
   void ClearOutputWindowColor(uint64_t id, FloatVector col);
   void ClearOutputWindowDepth(uint64_t id, float depth, uint8_t stencil);
@@ -550,9 +549,8 @@ private:
 
     VkSurfaceKHR surface;
     VkSwapchainKHR swap;
-    uint32_t numImgs;
-    VkImage colimg[8];
-    VkImageMemoryBarrier colBarrier[8];
+    rdcarray<VkImage> colimg;
+    rdcarray<VkImageMemoryBarrier> colBarrier;
 
     VkImage bb;
     VkImageView bbview;

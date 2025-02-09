@@ -189,22 +189,30 @@ struct MemoryTracking
 {
   void AllocateMemoryForType(const DXIL::Type *type, Id allocId, bool global, ShaderVariable &var);
 
-  struct Alloc
+  // Represents actual memory allocations (think of it like a memory heap)
+  struct Allocation
   {
+    // the allocated memory
     void *backingMemory;
-    size_t size;
+    uint64_t size;
     bool global;
   };
 
-  struct AllocPointer
+  // Represents pointers within a Allocation memory allocation (heap)
+  struct Pointer
   {
+    // the Allocation that owns the memory pointed to
     Id baseMemoryId;
-    void *backingMemory;
-    size_t size;
+    // the memory pointer which will be within the Allocation backing memory
+    void *memory;
+    // size of the data the pointer
+    uint64_t size;
   };
 
-  std::map<Id, Alloc> m_Allocs;
-  std::map<Id, AllocPointer> m_AllocPointers;
+  // Memory allocations with backing memory (heaps)
+  std::map<Id, Allocation> m_Allocations;
+  // Pointers within a Allocation memory allocation, the allocated memory will be in m_Allocations
+  std::map<Id, Pointer> m_Pointers;
 };
 
 struct ThreadState
@@ -251,7 +259,7 @@ struct ThreadState
   bool GetPhiVariable(const Id &id, DXIL::Operation opCode, DXIL::DXOp dxOpCode,
                       ShaderVariable &var) const;
   bool GetVariableHelper(DXIL::Operation op, DXIL::DXOp dxOpCode, ShaderVariable &var) const;
-  void UpdateBackingMemoryFromVariable(void *ptr, size_t &allocSize, const ShaderVariable &var);
+  void UpdateBackingMemoryFromVariable(void *ptr, uint64_t &allocSize, const ShaderVariable &var);
   void UpdateMemoryVariableFromBackingMemory(Id memoryId, const void *ptr);
 
   void PerformGPUResourceOp(const rdcarray<ThreadState> &workgroups, DXIL::Operation opCode,
@@ -326,9 +334,7 @@ struct ThreadState
   // The current and previous function basic block index
   uint32_t m_Block = ~0U;
   uint32_t m_PreviousBlock = ~0U;
-  // A global logical instruction index (bit like a PC) not the instruction index within a function
-  uint32_t m_GlobalInstructionIdx = ~0U;
-  // The PC of the active instruction that was or will be executed on the current simulation step
+  // The global PC of the active instruction that was or will be executed on the current simulation step
   uint32_t m_ActiveGlobalInstructionIdx = ~0U;
 
   // SSA Ids guaranteed to be greater than 0 and less than this value
@@ -538,9 +544,7 @@ private:
   ScopedDebugData *AddScopedDebugData(const DXIL::Metadata *scopeMD);
   ScopedDebugData *FindScopedDebugData(const DXIL::Metadata *md) const;
   const TypeData &AddDebugType(const DXIL::Metadata *typeMD);
-  void AddLocalVariable(const DXIL::Metadata *localVariableMD, uint32_t instructionIndex,
-                        bool isDeclare, int32_t byteOffset, uint32_t countBytes, Id debugSSAId,
-                        const rdcstr &debugVarSSAName);
+  void AddLocalVariable(const DXIL::SourceMappingInfo &srcMapping, uint32_t instructionIndex);
   void ParseDebugData();
 
   rdcarray<ThreadState> m_Workgroups;

@@ -45,8 +45,6 @@ struct StructFormatData
 
   // does this contain a member annotated with [[single]] ?
   bool singleMember = false;
-
-  bool signedEnum = false;
 };
 
 GraphicsAPI BufferFormatter::m_API;
@@ -1042,7 +1040,9 @@ ParsedFormat BufferFormatter::ParseFormatString(const QString &formatString, uin
           }
 
           cur->structDef.type.matrixByteStride = VarTypeByteSize(tmp.type.baseType);
-          cur->signedEnum = (VarTypeCompType(tmp.type.baseType) == CompType::SInt);
+          cur->structDef.type.flags = (VarTypeCompType(tmp.type.baseType) == CompType::SInt)
+                                          ? ShaderVariableFlags::SignedEnum
+                                          : ShaderVariableFlags::NoFlags;
         }
 
         continue;
@@ -1065,7 +1065,7 @@ ParsedFormat BufferFormatter::ParseFormatString(const QString &formatString, uin
       QString valueNum = enumMatch.captured(2);
 
       bool ok = false;
-      if(cur->signedEnum)
+      if(cur->structDef.type.flags & ShaderVariableFlags::SignedEnum)
       {
         int64_t val = valueNum.toLongLong(&ok, 0);
 
@@ -1224,6 +1224,7 @@ ParsedFormat BufferFormatter::ParseFormatString(const QString &formatString, uin
     bool isPadding = false;
     bool isPointer = false;
 
+    uint32_t specifiedOffset = ~0U;
     if(structMatch.hasMatch() && structelems.contains(structMatch.captured(1)))
     {
       StructFormatData &structContext = structelems[structMatch.captured(1)];
@@ -1257,7 +1258,6 @@ ParsedFormat BufferFormatter::ParseFormatString(const QString &formatString, uin
       if(varName.isEmpty())
         varName = lit("data");
 
-      uint32_t specifiedOffset = ~0U;
       for(const Annotation &annot : annotations)
       {
         if(annot.name == lit("offset") || annot.name == lit("byte_offset"))
@@ -1446,9 +1446,16 @@ ParsedFormat BufferFormatter::ParseFormatString(const QString &formatString, uin
           break;
         }
 
+        if(bitfieldCurPos != ~0U)
+          cur->offset += (bitfieldCurPos + 7) / 8;
+
         // all packing rules align structs in the same way as arrays. We already calculated this
         // when calculating the struct's alignment which will be padded to 16B for non-tight arrays
         cur->offset = AlignUp(cur->offset, structContext.alignment);
+
+        // reset any bitfield packing to start at 0 at the new location
+        if(bitfieldCurPos != ~0U)
+          bitfieldCurPos = 0;
 
         if(specifiedOffset != ~0U)
         {
@@ -1834,19 +1841,7 @@ ParsedFormat BufferFormatter::ParseFormatString(const QString &formatString, uin
             break;
           }
 
-          uint32_t specifiedOffset = annot.param.toUInt();
-
-          if(specifiedOffset < cur->offset)
-          {
-            reportError(tr("Specified byte offset %1 overlaps with previous data.\n"
-                           "This value must be at byte offset %2 at minimum.")
-                            .arg(specifiedOffset)
-                            .arg(cur->offset));
-            success = false;
-            break;
-          }
-
-          cur->offset = specifiedOffset;
+          specifiedOffset = annot.param.toUInt();
         }
         else if(annot.name == lit("pad") || annot.name == lit("padding"))
         {
@@ -2100,6 +2095,28 @@ ParsedFormat BufferFormatter::ParseFormatString(const QString &formatString, uin
           cur->offset = AlignUp(cur->offset, 16U);
         }
       }
+    }
+
+    if(specifiedOffset != ~0U)
+    {
+      if(specifiedOffset < cur->offset)
+      {
+        reportError(tr("Specified byte offset %1 overlaps with previous data.\n"
+                       "This value must be at byte offset %2 at minimum.")
+                        .arg(specifiedOffset)
+                        .arg(cur->offset));
+        success = false;
+        break;
+      }
+
+      // if we're bitfield packing and we just specified an offset based padding, reset current position
+      if(bitfieldCurPos != ~0U && specifiedOffset > cur->offset)
+      {
+        el.bitFieldOffset = bitfieldCurPos = 0;
+        bitfieldCurPos += el.bitFieldSize;
+      }
+
+      cur->offset = specifiedOffset;
     }
 
     el.byteOffset = cur->offset;
@@ -2743,6 +2760,8 @@ QString BufferFormatter::DeclareStruct(Packing::Rules pack, ResourceId shader,
   ret += innerSkippedPrefixString;
 
   uint32_t offset = 0;
+  uint32_t bitfieldOffset = 0;
+  uint32_t bitfieldAdvance = 0;
 
   uint32_t structAlignment = 1;
 
@@ -2751,6 +2770,18 @@ QString BufferFormatter::DeclareStruct(Packing::Rules pack, ResourceId shader,
     const uint32_t alignment = GetAlignment(pack, members[i]);
     const uint32_t vecsize = GetVarStraddleSize(members[i]);
     structAlignment = std::max(structAlignment, alignment);
+
+    // resolve any bitfield here before calculating offset padding
+    if(members[i].bitFieldSize == 0 && bitfieldOffset > 0)
+    {
+      uint32_t bytesUsed = bitfieldOffset / 8;
+
+      // align to the advance (the underlying type's size, e.g. uint or ulong)
+      bytesUsed = AlignUp(bytesUsed, bitfieldAdvance);
+      offset += bytesUsed;
+
+      bitfieldOffset = bitfieldAdvance = 0;
+    }
 
     offset = AlignUp(offset, alignment);
 
@@ -2768,16 +2799,34 @@ QString BufferFormatter::DeclareStruct(Packing::Rules pack, ResourceId shader,
       offset = AlignUp(offset, 16U);
     }
 
-    // if this variable is placed later, add an offset annotation
-    if(offset < members[i].byteOffset)
-      ret += lit("    [[offset(%1)]]\n").arg(members[i].byteOffset);
-    else if(offset > members[i].byteOffset)
-      qCritical() << "Unexpected offset overlap at" << QString(members[i].name) << "in"
-                  << QString(name);
+    // if we're bitfield packing, collate all bits together (with padding as needed) without
+    // updating offset yet and allow 'overlaps' at the byte offset level
+    if(members[i].bitFieldSize != 0)
+    {
+      // declare empty bits if needed
+      if(bitfieldOffset < members[i].bitFieldOffset)
+      {
+        ret += lit("    uint : %1;\n").arg(members[i].bitFieldOffset - bitfieldOffset);
+      }
 
-    offset = members[i].byteOffset;
+      bitfieldOffset = members[i].bitFieldOffset;
+      bitfieldOffset += members[i].bitFieldSize;
 
-    offset += GetVarAdvance(pack, members[i]);
+      bitfieldAdvance = qMax(bitfieldAdvance, GetVarAdvance(pack, members[i]));
+    }
+    else
+    {
+      // if this variable is placed later, add an offset annotation
+      if(offset < members[i].byteOffset)
+        ret += lit("    [[offset(%1)]]\n").arg(members[i].byteOffset);
+      else if(offset > members[i].byteOffset)
+        qCritical() << "Unexpected offset overlap at" << QString(members[i].name) << "in"
+                    << QString(name);
+
+      offset = members[i].byteOffset;
+
+      offset += GetVarAdvance(pack, members[i]);
+    }
 
     QString arraySize;
     if(members[i].type.elements > 1)
@@ -2795,17 +2844,43 @@ QString BufferFormatter::DeclareStruct(Packing::Rules pack, ResourceId shader,
       const ShaderConstantType &pointeeType =
           PointerTypeRegistry::GetTypeDescriptor(shader, members[i].type.pointerTypeID);
 
-      varTypeName = MakeIdentifierName(pointeeType.name);
-
-      if(!declaredStructs.contains(varTypeName))
+      // don't declare pointer structs for plain scalar pointers (float *foo type)
+      if(pointeeType.name.empty() && pointeeType.members.size() == 1)
       {
-        declaredStructs.push_back(varTypeName);
-        declarations += DeclareStruct(pack, shader, declaredStructs, anonStructs, varTypeName,
-                                      pointeeType.members, pointeeType.arrayByteStride, QString()) +
-                        lit("\n");
+        varTypeName = pointeeType.members[0].type.name;
+      }
+      else
+      {
+        varTypeName = MakeIdentifierName(pointeeType.name);
+
+        if(!declaredStructs.contains(varTypeName))
+        {
+          declaredStructs.push_back(varTypeName);
+          declarations += DeclareStruct(pack, shader, declaredStructs, anonStructs, varTypeName,
+                                        pointeeType.members, pointeeType.arrayByteStride, QString()) +
+                          lit("\n");
+        }
       }
 
       varTypeName += lit("*");
+    }
+    else if(members[i].type.baseType == VarType::Enum)
+    {
+      if(!declaredStructs.contains(varTypeName))
+      {
+        declaredStructs.push_back(varTypeName);
+
+        const bool signedEnum = bool(members[i].type.flags & ShaderVariableFlags::SignedEnum);
+        VarType enumType = signedEnum ? VarType::SInt : VarType::UInt;
+        if(members[i].type.arrayByteStride == 1)
+          enumType = signedEnum ? VarType::SByte : VarType::UByte;
+        else if(members[i].type.arrayByteStride == 2)
+          enumType = signedEnum ? VarType::SShort : VarType::UShort;
+        else if(members[i].type.arrayByteStride == 8)
+          enumType = signedEnum ? VarType::SLong : VarType::ULong;
+
+        declarations += DeclareEnum(varTypeName, members[i].type.members, enumType) + lit("\n");
+      }
     }
     else if(members[i].type.baseType == VarType::Struct)
     {
@@ -2842,6 +2917,23 @@ QString BufferFormatter::DeclareStruct(Packing::Rules pack, ResourceId shader,
     if(varName.isEmpty())
       varName = QFormatStr("_child%1").arg(i);
 
+    if(members[i].type.flags & ShaderVariableFlags::RGBDisplay)
+      varTypeName = lit("[[rgb]] ") + varTypeName;
+    if(members[i].type.flags & ShaderVariableFlags::SNorm)
+      varTypeName = lit("[[snorm]] ") + varTypeName;
+    if(members[i].type.flags & ShaderVariableFlags::UNorm)
+      varTypeName = lit("[[unorm]] ") + varTypeName;
+    if(members[i].type.flags & ShaderVariableFlags::R10G10B10A2)
+      varTypeName = lit("[[packed(r10g10b10a2)]] ") + varTypeName;
+    if(members[i].type.flags & ShaderVariableFlags::R11G11B10)
+      varTypeName = lit("[[packed(r11g11b10)]] ") + varTypeName;
+    // don't print the [[hex]] for pointer types
+    if(members[i].type.pointerTypeID == ~0U &&
+       (members[i].type.flags & ShaderVariableFlags::HexDisplay))
+      varTypeName = lit("[[hex]] ") + varTypeName;
+    if(members[i].type.flags & ShaderVariableFlags::BinaryDisplay)
+      varTypeName = lit("[[bin]] ") + varTypeName;
+
     if(members[i].type.rows > 1)
     {
       if(members[i].type.RowMajor())
@@ -2870,7 +2962,7 @@ QString BufferFormatter::DeclareStruct(Packing::Rules pack, ResourceId shader,
       bitfieldSize = QFormatStr(" : %1").arg(members[i].bitFieldSize);
 
     // don't declare outer struct for scalar-wrapped structs (generated by 'float *foo' type declarations)
-    if(!name.isEmpty() && members.size() == 1)
+    if(!name.isEmpty() || members.size() != 1)
       ret += lit("    ");
     ret += QFormatStr("%1 %2%3%4;\n").arg(varTypeName).arg(varName).arg(arraySize).arg(bitfieldSize);
   }
@@ -2896,6 +2988,26 @@ QString BufferFormatter::DeclareStruct(Packing::Rules pack, ResourceId shader,
     ret += lit("}\n");
 
   return declarations + ret;
+}
+
+QString BufferFormatter::DeclareEnum(const QString &name, const rdcarray<ShaderConstant> &members,
+                                     VarType baseType)
+{
+  QString ret;
+
+  const bool signedEnum = VarTypeCompType(baseType) == CompType::SInt;
+
+  ShaderVariable tmp;
+  tmp.columns = 1;
+
+  ret += QFormatStr("enum %1 : %2\n{\n").arg(name).arg(ToQStr(baseType));
+  for(const ShaderConstant &c : members)
+  {
+    tmp.value.u64v[0] = c.defaultValue;
+    ret += QFormatStr("    %1 = %2,\n").arg(c.name).arg(RowString(tmp, 0, baseType));
+  }
+  ret += lit("}\n");
+  return ret;
 }
 
 QString BufferFormatter::DeclareStruct(Packing::Rules pack, ResourceId shader, const QString &name,
@@ -3876,7 +3988,79 @@ QString RowTypeString(const ShaderVariable &v)
 
 #include "3rdparty/catch/catch.hpp"
 
-TEST_CASE("round-trip via format", "[formatter]")
+TEST_CASE("Round-trip struct declarations", "[formatter]")
+{
+  BufferFormatter::Init(GraphicsAPI::Vulkan);
+
+  QString fmt;
+
+  // things not tested here:
+  // comments, spacing, etc for obvious reasons
+  // [[pad]] because it's eliminated entirely and will not round-trip
+  // packing rules, they are tested below
+  // aliased typenames like float32_t or int16_t
+
+  fmt = lit(R"(#pack(structured)
+
+struct ptr_struct
+{
+    [[snorm]] byte4 a;
+    [[unorm]] byte4 a;
+    [[packed(r11g11b10)]] float3 b;
+    [[packed(r10g10b10a2)]] uint4 c;
+}
+
+struct nested
+{
+    float x[4];
+    [[hex]] uint y;
+    [[bin]] uint z;
+    [[row_major]] float3x4 w;
+    [[rgb]] float4 col;
+    [[offset(128)]]
+    int* p;
+    ptr_struct* q;
+}
+
+enum MyEnum : uint
+{
+    A = 1,
+    B = 2,
+    C = 10,
+    D = 10,
+}
+
+struct root
+{
+    float a;
+    int b;
+    uint c;
+    int d;
+    double e;
+    short f;
+    byte g;
+    float3 h;
+    float2x2 i;
+    int3x4 j;
+    uint k : 5;
+    uint l : 6;
+    uint : 3;
+    uint m : 7;
+    nested n;
+    MyEnum o;
+}
+)");
+
+  ParsedFormat parsed = BufferFormatter::ParseFormatString(fmt, 0, true);
+  CHECK(parsed.errors.isEmpty());
+  QString regenerated =
+      BufferFormatter::DeclareStruct(parsed.packing, ResourceId(), parsed.fixed.type.name,
+                                     parsed.fixed.type.members, parsed.fixed.type.arrayByteStride);
+
+  CHECK((fmt == regenerated));
+}
+
+TEST_CASE("Packing rules respected when round-tripping", "[formatter]")
 {
   BufferFormatter::Init(GraphicsAPI::Vulkan);
 
@@ -5153,6 +5337,86 @@ uint inthird : 14;
     CHECK(parsed.fixed.type.members[3].byteOffset == 8);
     CHECK(parsed.fixed.type.members[3].bitFieldOffset == 0);
     CHECK(parsed.fixed.type.members[3].bitFieldSize == 14);
+
+    // check that offsets are correctly processed after a bitfield that might have left some pending space
+    def = R"(
+uint a : 16;
+uint b : 14;
+
+[[offset(12)]]
+uint c;
+)";
+    parsed = BufferFormatter::ParseFormatString(def, 0, true);
+
+    CHECK(parsed.errors.isEmpty());
+    REQUIRE(parsed.fixed.type.members.size() == 3);
+    CHECK(parsed.fixed.type.arrayByteStride == 16);
+    CHECK(parsed.fixed.type.members[0].name == "a");
+    CHECK(parsed.fixed.type.members[0].byteOffset == 0);
+    CHECK(parsed.fixed.type.members[0].bitFieldOffset == 0);
+    CHECK(parsed.fixed.type.members[0].bitFieldSize == 16);
+    CHECK(parsed.fixed.type.members[1].name == "b");
+    CHECK(parsed.fixed.type.members[1].byteOffset == 0);
+    CHECK(parsed.fixed.type.members[1].bitFieldOffset == 16);
+    CHECK(parsed.fixed.type.members[1].bitFieldSize == 14);
+    CHECK(parsed.fixed.type.members[2].name == "c");
+    CHECK(parsed.fixed.type.members[2].byteOffset == 12);
+    CHECK(parsed.fixed.type.members[2].bitFieldOffset == 0);
+    CHECK(parsed.fixed.type.members[2].bitFieldSize == 0);
+
+    // check that an offset mid-bitfield is properly respected
+    def = R"(
+uint a : 13;
+[[offset(8)]]
+uint b : 14;
+)";
+    parsed = BufferFormatter::ParseFormatString(def, 0, true);
+
+    CHECK(parsed.errors.isEmpty());
+    REQUIRE(parsed.fixed.type.members.size() == 2);
+    CHECK(parsed.fixed.type.arrayByteStride == 12);
+    CHECK(parsed.fixed.type.members[0].name == "a");
+    CHECK(parsed.fixed.type.members[0].byteOffset == 0);
+    CHECK(parsed.fixed.type.members[0].bitFieldOffset == 0);
+    CHECK(parsed.fixed.type.members[0].bitFieldSize == 13);
+    CHECK(parsed.fixed.type.members[1].name == "b");
+    CHECK(parsed.fixed.type.members[1].byteOffset == 8);
+    CHECK(parsed.fixed.type.members[1].bitFieldOffset == 0);
+    CHECK(parsed.fixed.type.members[1].bitFieldSize == 14);
+
+    // check that non-bitfield values after bitfields have the right offset calculated
+    def = R"(
+struct str
+{
+  int x;
+};
+
+uint a : 13;
+uint b;
+uint c : 14;
+str d;
+)";
+    parsed = BufferFormatter::ParseFormatString(def, 0, true);
+
+    CHECK(parsed.errors.isEmpty());
+    REQUIRE(parsed.fixed.type.members.size() == 4);
+    CHECK(parsed.fixed.type.arrayByteStride == 16);
+    CHECK(parsed.fixed.type.members[0].name == "a");
+    CHECK(parsed.fixed.type.members[0].byteOffset == 0);
+    CHECK(parsed.fixed.type.members[0].bitFieldOffset == 0);
+    CHECK(parsed.fixed.type.members[0].bitFieldSize == 13);
+    CHECK(parsed.fixed.type.members[1].name == "b");
+    CHECK(parsed.fixed.type.members[1].byteOffset == 4);
+    CHECK(parsed.fixed.type.members[1].bitFieldOffset == 0);
+    CHECK(parsed.fixed.type.members[1].bitFieldSize == 0);
+    CHECK(parsed.fixed.type.members[2].name == "c");
+    CHECK(parsed.fixed.type.members[2].byteOffset == 8);
+    CHECK(parsed.fixed.type.members[2].bitFieldOffset == 0);
+    CHECK(parsed.fixed.type.members[2].bitFieldSize == 14);
+    CHECK(parsed.fixed.type.members[3].name == "d");
+    CHECK(parsed.fixed.type.members[3].byteOffset == 12);
+    CHECK(parsed.fixed.type.members[3].bitFieldOffset == 0);
+    CHECK(parsed.fixed.type.members[3].bitFieldSize == 0);
   };
 
   SECTION("pointers")

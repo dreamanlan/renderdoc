@@ -32,15 +32,14 @@ RDOC_CONFIG(bool, D3D12_DXILShaderDebugger_Logging, false,
             "Debug logging for the DXIL shader debugger");
 
 // TODO: Remove asserts using ^
-// TODO: Support global shared memory pointers created as Constants using getElementPtr inside the constant
+// TODO: Extend support for Compound Constants: arithmetic, logical ops
 // TODO: re-implement callstacks using scopes and inlined at metadata
 // TODO: Assert m_Block in ThreadState is correct per instruction
 // TODO: Automatically execute phi instructions after a branch
 // TODO: Support MSAA
 // TODO: Support UAVs with counter
-// TODO: Extend support for Compound Constants: Vector, GetElementPtr
-// TODO: Extend debug data parsing for DW_TAG_array_type for the base element type
-// TODO: Extend debug data parsing:  N-dimensional arrays, mapping covers whole sub-array
+// TODO: Extend debug data parsing: DW_TAG_array_type for the base element type
+// TODO: Extend debug data parsing: N-dimensional arrays, mapping covers whole sub-array
 
 // Notes:
 //   The phi node capture variables are not shown in the UI
@@ -48,7 +47,7 @@ RDOC_CONFIG(bool, D3D12_DXILShaderDebugger_Logging, false,
 //   Does it make sense to use ShaderVariable GPU pointers
 //   ExtractVal: only handles one index
 //   ComputeDXILTypeByteSize does not consider byte alignment
-//   GetElementPtr: only handles a two indexes
+//   GetElementPtr: only handles two indexes
 //   Sample*: Argument 10 which is called Clamp is not used
 //   ShuffleVector: mask entries might be undef meaning "don't care"
 
@@ -93,6 +92,36 @@ inline bool RDCISNORMAL(double input)
 
 using namespace DXIL;
 using namespace DXDebug;
+
+const uint32_t POINTER_MAGIC = 0xBEAFDEAF;
+
+static void EncodePointer(DXILDebug::Id ptrId, uint64_t offset, uint64_t size, ShaderVariable &var)
+{
+  var.type = VarType::GPUPointer;
+  var.value.u32v[0] = ptrId;
+  var.value.u32v[1] = POINTER_MAGIC;
+  var.value.u64v[1] = offset;
+  var.value.u64v[2] = size;
+}
+
+static bool DecodePointer(DXILDebug::Id &ptrId, uint64_t &offset, uint64_t &size,
+                          const ShaderVariable &var)
+{
+  if(var.type != VarType::GPUPointer)
+  {
+    RDCERR("Calling DecodePointer on non-pointer type %s", ToStr(var.type).c_str());
+    return false;
+  }
+  if(var.value.u32v[1] != POINTER_MAGIC)
+  {
+    RDCERR("Calling DecodePointer on non encoded pointer type %u", var.value.u32v[1]);
+    return false;
+  }
+  ptrId = var.value.u32v[0];
+  offset = var.value.u64v[1];
+  size = var.value.u64v[2];
+  return true;
+}
 
 static bool OperationFlushing(const Operation op, DXOp dxOpCode)
 {
@@ -848,13 +877,98 @@ static bool ConvertDXILConstantToShaderVariable(const Constant *constant, Shader
         const rdcarray<DXIL::Value *> &members = constant->getMembers();
         value = members[0];
       }
-      if(constant->op == Operation::GetElementPtr)
+      if(constant->op == Operation::NoOp)
       {
-        RDCLOG("Unsupported Constant Op %s", ToStr(constant->op).c_str());
+        RDCASSERT(ConvertDXILValueToShaderValue(value, var.type, 0, var.value));
         return true;
       }
-      RDCASSERT(ConvertDXILValueToShaderValue(value, var.type, 0, var.value));
-      return true;
+      else if(constant->op == Operation::GetElementPtr)
+      {
+        const rdcarray<DXIL::Value *> &members = constant->getMembers();
+        RDCASSERT(members.size() >= 3, members.size());
+        value = members[0];
+        const GlobalVar *gv = cast<GlobalVar>(value);
+        if(!gv)
+        {
+          RDCERR("Constant GetElementPtr first member is not a GlobalVar");
+          return false;
+        }
+        const DXIL::Type *elementType = gv->type;
+        if(elementType->type != Type::TypeKind::Pointer)
+        {
+          RDCERR("Constant GetElementPtr global variable is not a Pointer");
+          return false;
+        }
+        elementType = elementType->inner;
+        VarType baseType = ConvertDXILTypeToVarType(elementType);
+        uint32_t elementSize = GetElementByteSize(baseType);
+        uint32_t countElems = RDCMAX(1U, elementType->elemCount);
+        uint64_t size = countElems * GetElementByteSize(baseType);
+
+        DXILDebug::Id ptrId = gv->ssaId;
+        // members[1..] : indices 1...N
+        rdcarray<uint64_t> indexes;
+        indexes.reserve(members.size() - 1);
+        for(uint32_t a = 1; a < members.size(); ++a)
+        {
+          value = members[a];
+          VarType argType = ConvertDXILTypeToVarType(value->type);
+          ShaderValue argValue;
+          memset(&argValue, 0, sizeof(argValue));
+          RDCASSERT(ConvertDXILValueToShaderValue(value, argType, 0, argValue));
+          indexes.push_back(argValue.u64v[0]);
+        }
+        // Index 0 is in ptr terms as if pointer was an array of pointers
+        RDCASSERTEQUAL(indexes[0], 0);
+        uint64_t offset = 0;
+
+        if(indexes.size() > 1)
+          offset += indexes[1] * elementSize;
+        RDCASSERT(indexes.size() <= 2);
+        // Encode the pointer allocation: ptrId, offset, size
+        EncodePointer(ptrId, offset, size, var);
+        return true;
+      }
+      // case Operation::Trunc:
+      // case Operation::ZExt:
+      // case Operation::SExt:
+      // case Operation::FToU:
+      // case Operation::FToS:
+      // case Operation::UToF:
+      // case Operation::SToF:
+      // case Operation::FPTrunc:
+      // case Operation::FPExt:
+      // case Operation::PtrToI:
+      // case Operation::IToPtr:
+      // case Operation::Bitcast:
+      // case Operation::AddrSpaceCast:
+      // case Operation::Select:
+      // case Operation::IEqual:
+      // plus other integer comparisons
+      // case Operation::FOrdEqual:
+      // plus other fp comparisons
+      // case Operation::ExtractElement:
+      // case Operation::ExtractVal:
+      // case Operation::FAdd:
+      // case Operation::FSub:
+      // case Operation::FMul:
+      // case Operation::FDiv:
+      // case Operation::FRem:
+      // case Operation::Add:
+      // case Operation::Sub:
+      // case Operation::Mul:
+      // case Operation::UDiv:
+      // case Operation::SDiv:
+      // case Operation::URem:
+      // case Operation::SRem:
+      // case Operation::ShiftLeft:
+      // case Operation::LogicalShiftRight:
+      // case Operation::ArithShiftRight:
+      // case Operation::And:
+      // case Operation::Or:
+      // case Operation::Xor:
+      RDCERR("Unsupported Constant Op %s", ToStr(constant->op).c_str());
+      return false;
     }
     return false;
   }
@@ -1521,15 +1635,14 @@ void MemoryTracking::AllocateMemoryForType(const DXIL::Type *type, Id allocId, b
   RDCASSERTEQUAL(type->type, Type::TypeKind::Pointer);
   ConvertDXILTypeToShaderVariable(type->inner, var);
 
-  // Add the SSA to m_MemoryAllocs with its backing memory and size
+  // Add the SSA to m_Allocations with its backing memory and size
   size_t byteSize = ComputeDXILTypeByteSize(type->inner);
   void *backingMem = malloc(byteSize);
   memset(backingMem, 0, byteSize);
-  MemoryTracking::Alloc &alloc = m_Allocs[allocId];
-  alloc = {backingMem, byteSize, global};
+  m_Allocations[allocId] = {backingMem, byteSize, global};
 
-  // set the backing memory
-  m_AllocPointers[allocId] = {allocId, backingMem, byteSize};
+  // Create a pointer to represent this allocation
+  m_Pointers[allocId] = {allocId, backingMem, byteSize};
 }
 
 ThreadState::ThreadState(uint32_t workgroupIndex, Debugger &debugger,
@@ -1542,7 +1655,7 @@ ThreadState::ThreadState(uint32_t workgroupIndex, Debugger &debugger,
   m_WorkgroupIndex = workgroupIndex;
   m_FunctionInfo = NULL;
   m_FunctionInstructionIdx = 0;
-  m_GlobalInstructionIdx = 0;
+  m_ActiveGlobalInstructionIdx = 0;
   m_Killed = false;
   m_Ended = false;
   m_Callstack.clear();
@@ -1556,7 +1669,7 @@ ThreadState::ThreadState(uint32_t workgroupIndex, Debugger &debugger,
 
 ThreadState::~ThreadState()
 {
-  for(auto it : m_Memory.m_Allocs)
+  for(auto it : m_Memory.m_Allocations)
   {
     if(!it.second.global)
       free(it.second.backingMemory);
@@ -1633,7 +1746,7 @@ void ThreadState::EnterFunction(const Function *function, const rdcarray<Value *
   m_PreviousBlock = ~0U;
   m_PhiVariables.clear();
 
-  m_GlobalInstructionIdx = m_FunctionInfo->globalInstructionOffset + m_FunctionInstructionIdx;
+  m_ActiveGlobalInstructionIdx = m_FunctionInfo->globalInstructionOffset + m_FunctionInstructionIdx;
   m_Callstack.push_back(frame);
 
   ShaderDebugState *state = m_State;
@@ -2160,14 +2273,15 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
             {
               data += dataOffset;
               int numComps = fmt.numComps;
+              int maxNumComps = fmt.numComps;
               // Clamp the number of components to read based on the amount of data in the buffer
               if(!texData)
               {
                 RDCASSERTNOTEQUAL(numElems, 0);
-                int maxNumComps = (int)((dataSize - dataOffset) / fmt.byteWidth);
-                fmt.numComps = RDCMIN(fmt.numComps, maxNumComps);
+                const int maxNumCompsData = (int)((dataSize - dataOffset) / fmt.byteWidth);
                 size_t maxOffset = (firstElem + numElems) * stride + structOffset;
-                maxNumComps = (int)((maxOffset - dataOffset) / fmt.byteWidth);
+                const int maxNumCompsOffset = (int)((maxOffset - dataOffset) / fmt.byteWidth);
+                maxNumComps = RDCMIN(maxNumCompsData, maxNumCompsOffset);
                 fmt.numComps = RDCMIN(fmt.numComps, maxNumComps);
               }
 
@@ -2186,7 +2300,8 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
                 numComps = 0;
                 // Modify the correct components
                 const uint32_t valueStart = (dxOpCode == DXOp::TextureStore) ? 5 : 4;
-                for(uint32_t c = 0; c < (uint32_t)fmt.numComps; ++c)
+                const uint32_t numArgs = RDCMIN(4, maxNumComps);
+                for(uint32_t c = 0; c < numArgs; ++c)
                 {
                   if(GetShaderVariable(inst.args[c + valueStart], opCode, dxOpCode, arg))
                   {
@@ -2196,7 +2311,7 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
                     ++numComps;
                   }
                 }
-                fmt.numComps = numComps;
+                fmt.numComps = RDCMIN(numComps, maxNumComps);
                 TypedUAVStore(fmt, (byte *)data, result.value);
               }
             }
@@ -3065,7 +3180,10 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
             }
 
             uint32_t stride = fmt.stride;
-            RDCASSERT(!((stride == 1) ^ byteAddress));
+            if(byteAddress)
+              RDCASSERTEQUAL(stride, 1);
+            else
+              RDCASSERTNOTEQUAL(stride, 1);
 
             RDCASSERTEQUAL(result.columns, 1);
             RDCASSERTEQUAL(fmt.numComps, result.columns);
@@ -4025,14 +4143,13 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
       {
         m_Block = blockId;
         m_FunctionInstructionIdx = m_FunctionInfo->function->blocks[m_Block]->startInstructionIdx;
-        m_GlobalInstructionIdx = m_FunctionInfo->globalInstructionOffset + m_FunctionInstructionIdx;
       }
       else
       {
         RDCERR("Unknown branch target %u '%s'", m_Block, GetArgumentName(targetArg).c_str());
       }
       if(m_State && !m_Ended)
-        m_State->nextInstruction = m_GlobalInstructionIdx;
+        m_State->nextInstruction = m_FunctionInfo->globalInstructionOffset + m_FunctionInstructionIdx;
       break;
     }
     case Operation::Phi:
@@ -4118,21 +4235,25 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
       if(ptrId == DXILDebug::INVALID_ID)
         break;
 
-      auto itPtr = m_Memory.m_AllocPointers.find(ptrId);
-      if(itPtr == m_Memory.m_AllocPointers.end())
+      auto itPtr = m_Memory.m_Pointers.find(ptrId);
+      if(itPtr == m_Memory.m_Pointers.end())
       {
-        RDCWARN("Unknown memory pointer Id %u", ptrId);
+        RDCERR("Unknown memory pointer Id %u", ptrId);
         break;
       }
 
-      const MemoryTracking::AllocPointer &ptr = itPtr->second;
+      const MemoryTracking::Pointer &ptr = itPtr->second;
       Id baseMemoryId = ptr.baseMemoryId;
 
-      auto itAlloc = m_Memory.m_Allocs.find(baseMemoryId);
-      RDCASSERT(itAlloc != m_Memory.m_Allocs.end());
-      const MemoryTracking::Alloc &alloc = itAlloc->second;
+      auto itAlloc = m_Memory.m_Allocations.find(baseMemoryId);
+      if(itAlloc == m_Memory.m_Allocations.end())
+      {
+        RDCERR("Unknown memory allocation Id %u", baseMemoryId);
+        break;
+      }
+      const MemoryTracking::Allocation &allocation = itAlloc->second;
       ShaderVariable arg;
-      if(alloc.global)
+      if(allocation.global)
       {
         RDCASSERT(IsVariableAssigned(baseMemoryId));
         arg = m_Variables[baseMemoryId];
@@ -4148,44 +4269,42 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
     case Operation::StoreAtomic:
     {
       // Store(ptr, value)
-      Id baseMemoryId = DXILDebug::INVALID_ID;
-      void *baseMemoryBackingPtr = NULL;
-      size_t allocSize = 0;
-      void *allocMemoryBackingPtr = NULL;
       Id ptrId = GetArgumentId(0);
       if(ptrId == DXILDebug::INVALID_ID)
         break;
-      auto itPtr = m_Memory.m_AllocPointers.find(ptrId);
-      if(itPtr == m_Memory.m_AllocPointers.end())
+      auto itPtr = m_Memory.m_Pointers.find(ptrId);
+      if(itPtr == m_Memory.m_Pointers.end())
       {
-        RDCWARN("Unknown memory pointer Id %u", ptrId);
+        RDCERR("Unknown memory pointer Id %u", ptrId);
         break;
       }
 
-      const MemoryTracking::AllocPointer &ptr = itPtr->second;
-      baseMemoryId = ptr.baseMemoryId;
-      baseMemoryBackingPtr = ptr.backingMemory;
-      allocSize = ptr.size;
+      const MemoryTracking::Pointer &ptr = itPtr->second;
+      Id baseMemoryId = ptr.baseMemoryId;
+      void *memory = ptr.memory;
+      uint64_t allocSize = ptr.size;
 
-      auto itAlloc = m_Memory.m_Allocs.find(baseMemoryId);
-      RDCASSERT(itAlloc != m_Memory.m_Allocs.end());
-      const MemoryTracking::Alloc &alloc = itAlloc->second;
-      allocMemoryBackingPtr = alloc.backingMemory;
-
-      RDCASSERT(baseMemoryBackingPtr);
+      RDCASSERT(memory);
       RDCASSERTNOTEQUAL(baseMemoryId, DXILDebug::INVALID_ID);
 
       ShaderVariable val;
       RDCASSERT(GetShaderVariable(inst.args[1], opCode, dxOpCode, val));
       RDCASSERTEQUAL(resultId, DXILDebug::INVALID_ID);
 
-      UpdateBackingMemoryFromVariable(baseMemoryBackingPtr, allocSize, val);
+      UpdateBackingMemoryFromVariable(memory, allocSize, val);
 
       ShaderVariableChange change;
       RDCASSERT(IsVariableAssigned(baseMemoryId));
       change.before = m_Variables[baseMemoryId];
 
-      UpdateMemoryVariableFromBackingMemory(baseMemoryId, allocMemoryBackingPtr);
+      auto itAlloc = m_Memory.m_Allocations.find(baseMemoryId);
+      if(itAlloc == m_Memory.m_Allocations.end())
+      {
+        RDCERR("Unknown memory allocation Id %u", baseMemoryId);
+        break;
+      }
+      const MemoryTracking::Allocation &allocation = itAlloc->second;
+      UpdateMemoryVariableFromBackingMemory(baseMemoryId, allocation.backingMemory);
 
       // record the change to the base memory variable
       change.after = m_Variables[baseMemoryId];
@@ -4220,7 +4339,11 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
       }
 
       RDCASSERT(IsVariableAssigned(ptrId));
-      RDCASSERT(m_Memory.m_Allocs.count(ptrId) == 1);
+      if(m_Memory.m_Allocations.count(ptrId) == 0)
+      {
+        RDCERR("Unknown memory allocation Id %u", ptrId);
+        break;
+      }
 
       // arg[1..] : indices 1...N
       rdcarray<uint64_t> indexes;
@@ -4249,21 +4372,35 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
       size_t size = countElems * GetElementByteSize(baseType);
 
       // Copy from the backing memory to the result
-      const MemoryTracking::Alloc &alloc = m_Memory.m_Allocs[ptrId];
-      uint8_t *backingMemory = (uint8_t *)alloc.backingMemory;
+      const MemoryTracking::Allocation &allocation = m_Memory.m_Allocations[ptrId];
+      uint8_t *memory = (uint8_t *)allocation.backingMemory;
 
       // Ensure global variables use global memory
       // Ensure non-global variables do not use global memory
-      RDCASSERT(!((cast<GlobalVar>(inst.args[0]) != NULL) ^ alloc.global));
+      if(allocation.global)
+        RDCASSERT(cast<GlobalVar>(inst.args[0]));
+      else
+        RDCASSERT(!cast<GlobalVar>(inst.args[0]));
 
       result.type = baseType;
       result.rows = (uint8_t)countElems;
-      backingMemory += offset;
-      m_Memory.m_AllocPointers[resultId] = {ptrId, backingMemory, size};
 
-      RDCASSERT(offset + size <= alloc.size);
-      RDCASSERT(size < sizeof(result.value.f32v));
-      memcpy(&result.value.f32v[0], backingMemory, size);
+      RDCASSERT(offset + size <= allocation.size);
+      if(offset + size <= allocation.size)
+      {
+        memory += offset;
+        m_Memory.m_Pointers[resultId] = {ptrId, memory, size};
+
+        RDCASSERT(size <= sizeof(ShaderValue));
+        if(size <= sizeof(ShaderValue))
+          memcpy(&result.value, memory, size);
+        else
+          RDCERR("Size %u too large MAX %u for GetElementPtr", size, sizeof(ShaderValue));
+      }
+      else
+      {
+        RDCERR("Invalid GEP offset %u size %u for allocation size %u", offset, size, allocation.size);
+      }
       break;
     }
     case Operation::Bitcast:
@@ -5095,7 +5232,6 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
       {
         m_Block = blockId;
         m_FunctionInstructionIdx = m_FunctionInfo->function->blocks[m_Block]->startInstructionIdx;
-        m_GlobalInstructionIdx = m_FunctionInfo->globalInstructionOffset + m_FunctionInstructionIdx;
       }
       else
       {
@@ -5120,30 +5256,34 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
     case Operation::AtomicUMin:
     case Operation::CompareExchange:
     {
-      size_t allocSize = 0;
-      void *allocMemoryBackingPtr = NULL;
-      void *baseMemoryBackingPtr = NULL;
-      Id baseMemoryId = DXILDebug::INVALID_ID;
       Id ptrId = GetArgumentId(0);
       if(ptrId == DXILDebug::INVALID_ID)
         break;
+
+      auto itPtr = m_Memory.m_Pointers.find(ptrId);
+      if(itPtr == m_Memory.m_Pointers.end())
       {
-        auto itPtr = m_Memory.m_AllocPointers.find(ptrId);
-        RDCASSERT(itPtr != m_Memory.m_AllocPointers.end());
-
-        const MemoryTracking::AllocPointer &ptr = itPtr->second;
-        baseMemoryId = ptr.baseMemoryId;
-        baseMemoryBackingPtr = ptr.backingMemory;
-        allocSize = ptr.size;
-
-        auto itAlloc = m_Memory.m_Allocs.find(baseMemoryId);
-        RDCASSERT(itAlloc != m_Memory.m_Allocs.end());
-        const MemoryTracking::Alloc &alloc = itAlloc->second;
-        allocMemoryBackingPtr = alloc.backingMemory;
+        RDCERR("Unknown memory pointer Id %u", ptrId);
+        break;
       }
 
-      RDCASSERT(baseMemoryBackingPtr);
+      const MemoryTracking::Pointer &ptr = itPtr->second;
+      Id baseMemoryId = ptr.baseMemoryId;
+
       RDCASSERTNOTEQUAL(baseMemoryId, DXILDebug::INVALID_ID);
+
+      void *memory = ptr.memory;
+      RDCASSERT(memory);
+      uint64_t allocSize = ptr.size;
+
+      auto itAlloc = m_Memory.m_Allocations.find(baseMemoryId);
+      if(itAlloc == m_Memory.m_Allocations.end())
+      {
+        RDCERR("Unknown memory allocation Id %u", ptrId);
+        break;
+      }
+      const MemoryTracking::Allocation &allocation = itAlloc->second;
+      void *allocMemoryBackingPtr = allocation.backingMemory;
 
       RDCASSERTNOTEQUAL(resultId, DXILDebug::INVALID_ID);
       RDCASSERT(IsVariableAssigned(ptrId));
@@ -5258,8 +5398,8 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
         RDCERR("Unhandled opCode %s", ToStr(opCode).c_str());
       }
 
-      // Save the result back
-      UpdateBackingMemoryFromVariable(baseMemoryBackingPtr, allocSize, res);
+      // Save the result back to the backing memory of the pointer
+      UpdateBackingMemoryFromVariable(memory, allocSize, res);
 
       ShaderVariableChange change;
       if(m_State)
@@ -5296,7 +5436,11 @@ bool ThreadState::ExecuteInstruction(DebugAPIWrapper *apiWrapper,
   };
 
   // Update the result variable
-  RDCASSERT(!(result.name.empty() ^ (resultId == DXILDebug::INVALID_ID)));
+  if(resultId == DXILDebug::INVALID_ID)
+    RDCASSERT(result.name.empty());
+  else
+    RDCASSERT(!result.name.empty());
+
   if(!result.name.empty() && resultId != DXILDebug::INVALID_ID)
   {
     if(m_State)
@@ -5321,12 +5465,12 @@ void ThreadState::StepOverNopInstructions()
     return;
   do
   {
-    m_GlobalInstructionIdx = m_FunctionInfo->globalInstructionOffset + m_FunctionInstructionIdx;
     RDCASSERT(m_FunctionInstructionIdx < m_FunctionInfo->function->instructions.size());
     const Instruction *inst = m_FunctionInfo->function->instructions[m_FunctionInstructionIdx];
     if(!IsNopInstruction(*inst))
     {
-      m_ActiveGlobalInstructionIdx = m_GlobalInstructionIdx;
+      m_ActiveGlobalInstructionIdx =
+          m_FunctionInfo->globalInstructionOffset + m_FunctionInstructionIdx;
       return;
     }
 
@@ -5339,9 +5483,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 {
   m_State = state;
 
-  RDCASSERTEQUAL(m_GlobalInstructionIdx,
+  RDCASSERTEQUAL(m_ActiveGlobalInstructionIdx,
                  m_FunctionInfo->globalInstructionOffset + m_FunctionInstructionIdx);
-  RDCASSERTEQUAL(m_ActiveGlobalInstructionIdx, m_GlobalInstructionIdx);
   if(m_State)
   {
     m_State->flags = ShaderEvents::NoEvent;
@@ -5604,7 +5747,7 @@ void ThreadState::MarkResourceAccess(const rdcstr &name, const ResourceReference
     accessed.push_back(resRefInfo.binding);
 }
 
-void ThreadState::UpdateBackingMemoryFromVariable(void *ptr, size_t &allocSize,
+void ThreadState::UpdateBackingMemoryFromVariable(void *ptr, uint64_t &allocSize,
                                                   const ShaderVariable &var)
 {
   // Memory copy from value to backing memory
@@ -5613,7 +5756,7 @@ void ThreadState::UpdateBackingMemoryFromVariable(void *ptr, size_t &allocSize,
     RDCASSERTEQUAL(var.rows, 1);
     const size_t elementSize = GetElementByteSize(var.type);
     RDCASSERT(elementSize <= allocSize);
-    RDCASSERT(elementSize < sizeof(var.value.f32v));
+    RDCASSERT(elementSize <= sizeof(ShaderValue));
     const size_t varMemSize = var.columns * elementSize;
     memcpy(ptr, &var.value.f32v[0], varMemSize);
     allocSize -= varMemSize;
@@ -5641,15 +5784,21 @@ void ThreadState::UpdateMemoryVariableFromBackingMemory(Id memoryId, const void 
   {
     RDCASSERTEQUAL(baseMemory.rows, 1);
     RDCASSERTEQUAL(baseMemory.columns, 1);
-    RDCASSERT(elementSize < sizeof(ShaderValue), elementSize);
-    memcpy(&baseMemory.value.f32v[0], src, elementSize);
+    if(elementSize <= sizeof(ShaderValue))
+      memcpy(&baseMemory.value, src, elementSize);
+    else
+      RDCERR("Updating MemoryVariable elementSize %u too large max %u", elementSize,
+             sizeof(ShaderValue));
   }
   else
   {
     for(uint32_t i = 0; i < baseMemory.members.size(); ++i)
     {
-      RDCASSERT(elementSize < sizeof(ShaderValue), elementSize);
-      memcpy(&baseMemory.members[i].value.f32v[0], src, elementSize);
+      if(elementSize <= sizeof(ShaderValue))
+        memcpy(&baseMemory.members[i].value, src, elementSize);
+      else
+        RDCERR("Updating MemoryVariable member %u elementSize %u too large max %u", i, elementSize,
+               sizeof(ShaderValue));
       src += elementSize;
     }
   }
@@ -6112,6 +6261,7 @@ ShaderValue ThreadState::DDY(bool fine, Operation opCode, DXOp dxOpCode,
   }
 
   ShaderValue ret;
+  memset(&ret, 0, sizeof(ret));
   ShaderVariable a;
   ShaderVariable b;
   RDCASSERT(quad[index + 2].GetShaderVariable(dxilValue, opCode, dxOpCode, a));
@@ -6122,7 +6272,7 @@ ShaderValue ThreadState::DDY(bool fine, Operation opCode, DXOp dxOpCode,
 
 GlobalState::~GlobalState()
 {
-  for(auto it : memory.m_Allocs)
+  for(auto it : memory.m_Allocations)
   {
     RDCASSERT(it.second.global);
     free(it.second.backingMemory);
@@ -6284,6 +6434,12 @@ ScopedDebugData *Debugger::AddScopedDebugData(const DXIL::Metadata *scopeMD)
 
 const TypeData &Debugger::AddDebugType(const DXIL::Metadata *typeMD)
 {
+  {
+    auto it = m_DebugInfo.types.find(typeMD);
+    if(it != m_DebugInfo.types.end())
+      return it->second;
+  }
+
   TypeData typeData;
 
   const DXIL::DIBase *base = typeMD->dwarf;
@@ -6393,8 +6549,9 @@ const TypeData &Debugger::AddDebugType(const DXIL::Metadata *typeMD)
           typeData.sizeInBytes = (uint32_t)(compositeType->sizeInBits / 8);
           typeData.alignInBytes = (uint32_t)(compositeType->alignInBits / 8);
 
-          bool isVector = compositeType->name->beginsWith("vector<");
-          bool isMatrix = !isVector && compositeType->name->beginsWith("matrix<");
+          bool isVector = compositeType->name && compositeType->name->beginsWith("vector<");
+          bool isMatrix =
+              compositeType->name && !isVector && compositeType->name->beginsWith("matrix<");
 
           if((compositeType->templateParams) && (isVector || isMatrix))
           {
@@ -6427,7 +6584,7 @@ const TypeData &Debugger::AddDebugType(const DXIL::Metadata *typeMD)
             {
               RDCASSERTEQUAL(params->children[2]->dwarf->type, DXIL::DIBase::TemplateValueParameter);
               const DITemplateValueParameter *secondDim =
-                  params->children[1]->dwarf->As<DITemplateValueParameter>();
+                  params->children[2]->dwarf->As<DITemplateValueParameter>();
 
               // don't need the template value parameter name, it should be 'col_count', just need the value
               RDCASSERT(getival<uint32_t>(secondDim->value->value, typeData.matSize));
@@ -6461,7 +6618,8 @@ const TypeData &Debugger::AddDebugType(const DXIL::Metadata *typeMD)
           }
           else
           {
-            typeData.name = *compositeType->name;
+            typeData.name = compositeType->name ? *compositeType->name
+                                                : StringFormat::Fmt("__anon%u", compositeType->line);
 
             RDCASSERT(!isVector && !isMatrix, isVector, isMatrix, typeData.name);
 
@@ -6481,10 +6639,13 @@ const TypeData &Debugger::AddDebugType(const DXIL::Metadata *typeMD)
                 continue;
 
               const DXIL::DIDerivedType *member = memberBase->As<DIDerivedType>();
-              RDCASSERTEQUAL(member->tag, DXIL::DW_TAG_member);
-              // const TypeData &memberType = AddDebugType(member->base);
+              // Ignore any member tag that isn't DXIL::DW_TAG_member
+              if(member->tag != DXIL::DW_TAG_member)
+                continue;
               AddDebugType(member->base);
-              typeData.structMembers.push_back({*member->name, member->base});
+              RDCASSERT(member->name);
+              rdcstr memberName = member->name ? *member->name : "NULL";
+              typeData.structMembers.push_back({memberName, member->base});
               uint32_t offset = (uint32_t)member->offsetInBits / 8;
               typeData.memberOffsets.push_back(offset);
             }
@@ -6537,123 +6698,40 @@ const TypeData &Debugger::AddDebugType(const DXIL::Metadata *typeMD)
   return m_DebugInfo.types[typeMD];
 }
 
-void Debugger::AddLocalVariable(const DXIL::Metadata *localVariableMD, uint32_t instructionIndex,
-                                bool isDeclare, int32_t byteOffset, uint32_t countBytes,
-                                Id debugVarSSAId, const rdcstr &debugVarSSAName)
+void Debugger::AddLocalVariable(const DXIL::SourceMappingInfo &srcMapping, uint32_t instructionIndex)
 {
-  RDCASSERT(localVariableMD);
-  RDCASSERTEQUAL(localVariableMD->dwarf->type, DIBase::Type::LocalVariable);
-  const DILocalVariable *localVariable = localVariableMD->dwarf->As<DILocalVariable>();
+  ScopedDebugData *scope = AddScopedDebugData(srcMapping.localVariable->scope);
 
-  ScopedDebugData *scope = AddScopedDebugData(localVariable->scope);
-
-  rdcstr sourceVarName = m_Program->GetDebugVarName(localVariable);
   LocalMapping localMapping;
-  localMapping.variable = localVariable;
-  localMapping.sourceVarName = sourceVarName;
-  localMapping.debugVarSSAName = debugVarSSAName;
-  localMapping.debugVarSSAId = debugVarSSAId;
-  localMapping.byteOffset = byteOffset;
-  localMapping.countBytes = countBytes;
+  localMapping.sourceVarName = m_Program->GetDebugVarName(srcMapping.localVariable);
+  localMapping.variable = srcMapping.localVariable;
+  localMapping.debugVarSSAName = srcMapping.dbgVarName;
+  localMapping.debugVarSSAId = srcMapping.dbgVarId;
+  localMapping.byteOffset = srcMapping.srcByteOffset;
+  localMapping.countBytes = srcMapping.srcCountBytes;
+  localMapping.isDeclare = srcMapping.isDeclare;
   localMapping.instIndex = instructionIndex;
-  localMapping.isDeclare = isDeclare;
 
   scope->localMappings.push_back(localMapping);
 
-  const DXIL::Metadata *typeMD = localVariable->type;
+  const DXIL::Metadata *typeMD = srcMapping.localVariable->type;
   if(m_DebugInfo.types.count(typeMD) == 0)
     AddDebugType(typeMD);
 
-  if(m_DebugInfo.locals.count(localVariable) == 0)
-    m_DebugInfo.locals[localVariable] = localMapping;
+  if(m_DebugInfo.locals.count(srcMapping.localVariable) == 0)
+    m_DebugInfo.locals[srcMapping.localVariable] = localMapping;
 }
 
 void Debugger::ParseDbgOpDeclare(const DXIL::Instruction &inst, uint32_t instructionIndex)
 {
-  // arg 0 contains the SSA Id of the alloca result which represents the local variable (a pointer)
-  const Metadata *allocaInstMD = cast<Metadata>(inst.args[0]);
-  RDCASSERT(allocaInstMD);
-  const Instruction *allocaInst = cast<Instruction>(allocaInstMD->value);
-  RDCASSERT(allocaInst);
-  RDCASSERTEQUAL(allocaInst->op, Operation::Alloca);
-  Id resultId = Program::GetResultSSAId(*allocaInst);
-  rdcstr resultName;
-  Program::MakeResultId(*allocaInst, resultName);
-  int32_t byteOffset = 0;
-
-  // arg 1 is DILocalVariable metadata
-  const Metadata *localVariableMD = cast<Metadata>(inst.args[1]);
-
-  // arg 2 is DIExpression metadata
-  const Metadata *expressionMD = cast<Metadata>(inst.args[2]);
-  uint32_t countBytes = 0;
-  if(expressionMD)
-  {
-    if(expressionMD->dwarf->type == DIBase::Type::Expression)
-    {
-      const DIExpression *expression = expressionMD->dwarf->As<DXIL::DIExpression>();
-      switch(expression->op)
-      {
-        case DXIL::DW_OP::DW_OP_bit_piece:
-          byteOffset += (uint32_t)(expression->evaluated.bit_piece.offset / 8);
-          countBytes = (uint32_t)(expression->evaluated.bit_piece.size / 8);
-          break;
-        case DXIL::DW_OP::DW_OP_none: break;
-        case DXIL::DW_OP::DW_OP_nop: break;
-        default: RDCERR("Unhandled DIExpression op %s", ToStr(expression->op).c_str()); break;
-      }
-    }
-    else
-    {
-      RDCERR("Unhandled Expression Metadata %s", ToStr(expressionMD->dwarf->type).c_str());
-    }
-  }
-
-  AddLocalVariable(localVariableMD, instructionIndex, true, byteOffset, countBytes, resultId,
-                   resultName);
+  DXIL::SourceMappingInfo sourceMappingInfo = m_Program->ParseDbgOpDeclare(inst);
+  AddLocalVariable(sourceMappingInfo, instructionIndex);
 }
 
 void Debugger::ParseDbgOpValue(const DXIL::Instruction &inst, uint32_t instructionIndex)
 {
-  // arg 0 is metadata containing the new value
-  const Metadata *valueMD = cast<Metadata>(inst.args[0]);
-  Id resultId = GetSSAId(valueMD->value);
-  rdcstr resultName = m_Program->GetArgumentName(valueMD->value);
-  // arg 1 is i64 byte offset in the source variable where the new value is written
-  int64_t value = 0;
-  RDCASSERT(getival<int64_t>(inst.args[1], value));
-  int32_t byteOffset = (int32_t)(value);
-
-  // arg 2 is DILocalVariable metadata
-  const Metadata *localVariableMD = cast<Metadata>(inst.args[2]);
-
-  // arg 3 is DIExpression metadata
-  uint32_t countBytes = 0;
-  const Metadata *expressionMD = cast<Metadata>(inst.args[3]);
-  if(expressionMD)
-  {
-    if(expressionMD->dwarf->type == DIBase::Type::Expression)
-    {
-      const DIExpression *expression = expressionMD->dwarf->As<DXIL::DIExpression>();
-      switch(expression->op)
-      {
-        case DXIL::DW_OP::DW_OP_bit_piece:
-          byteOffset += (uint32_t)(expression->evaluated.bit_piece.offset / 8);
-          countBytes = (uint32_t)(expression->evaluated.bit_piece.size / 8);
-          break;
-        case DXIL::DW_OP::DW_OP_none: break;
-        case DXIL::DW_OP::DW_OP_nop: break;
-        default: RDCERR("Unhandled DIExpression op %s", ToStr(expression->op).c_str()); break;
-      }
-    }
-    else
-    {
-      RDCERR("Unhandled Expression Metadata %s", ToStr(expressionMD->dwarf->type).c_str());
-    }
-  }
-
-  AddLocalVariable(localVariableMD, instructionIndex, false, byteOffset, countBytes, resultId,
-                   resultName);
+  DXIL::SourceMappingInfo sourceMappingInfo = m_Program->ParseDbgOpValue(inst);
+  AddLocalVariable(sourceMappingInfo, instructionIndex);
 }
 
 void Debugger::ParseDebugData()
@@ -7180,7 +7258,7 @@ void Debugger::ParseDebugData()
                   RDCASSERTEQUAL(usage->children.size(), rows);
 
                   // assigning to a vector (row or column)
-                  uint32_t vecSize = (typeWalk->colMajorMat) ? columns : rows;
+                  uint32_t vecSize = (typeWalk->colMajorMat) ? rows : columns;
                   // assigning to a single element
                   if(bytesRemaining == scalar.sizeInBytes)
                   {
@@ -7190,13 +7268,13 @@ void Debugger::ParseDebugData()
 
                     if(typeWalk->colMajorMat)
                     {
-                      row = componentIndex % columns;
-                      col = componentIndex / columns;
+                      row = componentIndex % rows;
+                      col = componentIndex / rows;
                     }
                     else
                     {
-                      col = componentIndex % rows;
-                      row = componentIndex / rows;
+                      row = componentIndex / columns;
+                      col = componentIndex % columns;
                     }
                     RDCASSERT(row < rows, row, rows);
                     RDCASSERT(col < columns, col, columns);
@@ -7232,7 +7310,7 @@ void Debugger::ParseDebugData()
                     uint32_t componentIndex = byteOffset / scalar.sizeInBytes;
                     if(typeWalk->colMajorMat)
                     {
-                      uint32_t col = componentIndex % columns;
+                      uint32_t col = componentIndex / rows;
                       RDCASSERT(col < columns, col, columns);
                       // one remaining index selects a column within the matrix.
                       // source vars are displayed as row-major, need <rows> mappings
@@ -7247,7 +7325,7 @@ void Debugger::ParseDebugData()
                     }
                     else
                     {
-                      uint32_t row = componentIndex % rows;
+                      uint32_t row = componentIndex / columns;
                       RDCASSERT(row < rows, row, rows);
                       RDCASSERTEQUAL(usage->children.size(), rows);
                       RDCASSERTEQUAL(usage->children[row].children.size(), columns);
@@ -7611,10 +7689,6 @@ ShaderDebugTrace *Debugger::BeginDebug(uint32_t eventId, const DXBC::DXBCContain
   MemoryTracking &globalMemory = m_GlobalState.memory;
   for(const DXIL::GlobalVar *gv : m_Program->m_GlobalVars)
   {
-    // Ignore DXIL global variables which start with "dx.nothing."
-    if(gv->name.beginsWith("dx.nothing."))
-      continue;
-
     GlobalVariable globalVar;
     rdcstr n = DXBC::BasicDemangle(gv->name);
     DXIL::SanitiseName(n);
@@ -7630,13 +7704,19 @@ ShaderDebugTrace *Debugger::BeginDebug(uint32_t eventId, const DXBC::DXBCContain
         {
           RDCASSERT(ConvertDXILConstantToShaderVariable(initialData, globalVar.var));
           // Write ShaderVariable data back to memory
-          auto itAlloc = globalMemory.m_Allocs.find(globalVar.id);
-          RDCASSERT(itAlloc != globalMemory.m_Allocs.end());
-          const MemoryTracking::Alloc &alloc = itAlloc->second;
-          void *allocMemoryBackingPtr = alloc.backingMemory;
-          size_t allocSize = alloc.size;
-          state.UpdateBackingMemoryFromVariable(allocMemoryBackingPtr, allocSize, globalVar.var);
-          RDCASSERTEQUAL(allocSize, 0);
+          auto itAlloc = globalMemory.m_Allocations.find(globalVar.id);
+          if(itAlloc != globalMemory.m_Allocations.end())
+          {
+            const MemoryTracking::Allocation &allocation = itAlloc->second;
+            void *allocMemoryBackingPtr = allocation.backingMemory;
+            uint64_t allocSize = allocation.size;
+            state.UpdateBackingMemoryFromVariable(allocMemoryBackingPtr, allocSize, globalVar.var);
+            RDCASSERTEQUAL(allocSize, 0);
+          }
+          else
+          {
+            RDCERR("Unknown memory allocation for GlobalVariable Id %u", globalVar.id);
+          }
         }
       }
     }
@@ -7650,6 +7730,8 @@ ShaderDebugTrace *Debugger::BeginDebug(uint32_t eventId, const DXBC::DXBCContain
     {
       for(Instruction *inst : f->instructions)
       {
+        if(IsNopInstruction(*inst))
+          continue;
         for(const Value *arg : inst->args)
         {
           if(arg && arg->kind() == ValueKind::Constant)
@@ -7662,14 +7744,45 @@ ShaderDebugTrace *Debugger::BeginDebug(uint32_t eventId, const DXBC::DXBCContain
             }
 
             GlobalConstant constantVar;
-            ConvertDXILTypeToShaderVariable(c->type, constantVar.var);
-            ConvertDXILConstantToShaderVariable(c, constantVar.var);
-            constantVar.var.name = m_Program->GetArgumentName(c);
-            constantVar.id = c->ssaId;
+            ShaderVariable &var = constantVar.var;
+            ConvertDXILTypeToShaderVariable(c->type, var);
+            ConvertDXILConstantToShaderVariable(c, var);
+            var.name = m_Program->GetArgumentName(c);
             Id id = c->ssaId;
             RDCASSERTNOTEQUAL(id, DXILDebug::INVALID_ID);
+            constantVar.id = id;
+            if(var.type == VarType::GPUPointer)
+            {
+              Id ptrId;
+              uint64_t offset;
+              uint64_t size;
+              // Decode the pointer allocation: ptrId, offset, size
+              RDCASSERT(DecodePointer(ptrId, offset, size, var));
+
+              auto it = globalMemory.m_Allocations.find(ptrId);
+              if(it != globalMemory.m_Allocations.end())
+              {
+                const MemoryTracking::Allocation &allocation = it->second;
+                uint8_t *memory = (uint8_t *)allocation.backingMemory;
+                RDCASSERT(offset + size <= allocation.size);
+                if(offset + size <= allocation.size)
+                {
+                  memory += offset;
+                  globalMemory.m_Pointers[id] = {ptrId, memory, size};
+                }
+                else
+                {
+                  RDCERR("Invalid GEP offset %u size %u for allocation size %u", offset, size,
+                         allocation.size);
+                }
+              }
+              else
+              {
+                RDCERR("Failed to find allocation for Constant global variable pointer %u", ptrId);
+              }
+            }
             m_GlobalState.constants.push_back(constantVar);
-            m_LiveGlobals[constantVar.id] = true;
+            m_LiveGlobals[id] = true;
           }
         }
       }
@@ -7830,7 +7943,44 @@ ShaderDebugTrace *Debugger::BeginDebug(uint32_t eventId, const DXBC::DXBCContain
     }
   }
 
-  // Generate scopes and callstacks
+  // Generate scopes
+  for(const Function *f : m_Program->m_Functions)
+  {
+    if(!f->external)
+    {
+      FunctionInfo &info = m_FunctionInfos[f];
+      uint32_t countInstructions = (uint32_t)f->instructions.size();
+
+      ScopedDebugData *currentScope = NULL;
+      for(uint32_t i = 0; i < countInstructions; ++i)
+      {
+        uint32_t instructionIndex = i + info.globalInstructionOffset;
+        const Instruction &inst = *f->instructions[i];
+        ScopedDebugData *thisScope = NULL;
+        // Use DebugLoc data for building up the list of scopes
+        uint32_t dbgLoc = ShouldIgnoreSourceMapping(inst) ? ~0U : inst.debugLoc;
+        if(dbgLoc != ~0U)
+        {
+          const DebugLocation &debugLoc = m_Program->m_DebugLocations[dbgLoc];
+          thisScope = AddScopedDebugData(debugLoc.scope);
+        }
+        if(!thisScope)
+          continue;
+
+        if(currentScope)
+          currentScope->maxInstruction = instructionIndex - 1;
+
+        currentScope = thisScope;
+        thisScope->maxInstruction = instructionIndex;
+      }
+    }
+  }
+
+  // Sort the scopes by instruction index
+  std::sort(m_DebugInfo.scopedDebugDatas.begin(), m_DebugInfo.scopedDebugDatas.end(),
+            [](const ScopedDebugData *a, const ScopedDebugData *b) { return *a < *b; });
+
+  // Generate callstacks
   for(const Function *f : m_Program->m_Functions)
   {
     if(!f->external)
@@ -7839,74 +7989,63 @@ ShaderDebugTrace *Debugger::BeginDebug(uint32_t eventId, const DXBC::DXBCContain
       uint32_t countInstructions = (uint32_t)f->instructions.size();
 
       rdcarray<ScopedDebugData *> scopeHierarchy;
-      ScopedDebugData *currentScope = NULL;
       for(uint32_t i = 0; i < countInstructions; ++i)
       {
         uint32_t instructionIndex = i + info.globalInstructionOffset;
         const Instruction &inst = *f->instructions[i];
-        ScopedDebugData *thisScope = NULL;
-        if(!DXIL::IsLLVMDebugCall(inst))
-        {
-          // Use DebugLoc data for building up the list of scopes
-          uint32_t dbgLoc = ShouldIgnoreSourceMapping(inst) ? ~0U : inst.debugLoc;
-          if(dbgLoc != ~0U)
-          {
-            const DebugLocation &debugLoc = m_Program->m_DebugLocations[dbgLoc];
-            thisScope = AddScopedDebugData(debugLoc.scope);
-          }
-        }
-        if(currentScope)
-          currentScope->maxInstruction = instructionIndex - 1;
-
-        if(thisScope == currentScope)
+        // Use DebugLoc data for building up the list of scopes
+        uint32_t dbgLoc = ShouldIgnoreSourceMapping(inst) ? ~0U : inst.debugLoc;
+        if(dbgLoc == ~0U)
           continue;
 
-        if(!thisScope)
-          continue;
+        FunctionInfo::Callstack callstack;
 
-        currentScope = thisScope;
-        thisScope->maxInstruction = instructionIndex;
-        // Walk upwards from this scope to find where to append to the scope hierarchy
+        const DebugLocation *debugLoc = &m_Program->m_DebugLocations[dbgLoc];
+        // For each DILocation
+        while(debugLoc)
         {
-          ScopedDebugData *scope = thisScope;
-          while(scope)
+          // Walk scope upwards to make callstack : always a DebugScope
+          const DXIL::Metadata *scopeMD = debugLoc->scope;
+          while(scopeMD)
           {
-            int32_t index = scopeHierarchy.indexOf(thisScope);
-            if(index >= 0)
+            DXIL::DIBase *dwarf = scopeMD->dwarf;
+            if(dwarf)
             {
-              scopeHierarchy.erase(index, scopeHierarchy.count() - index);
-              break;
+              // Walk upwards through all the functions
+              if(dwarf->type == DIBase::Subprogram)
+              {
+                rdcstr funcName = m_Program->GetFunctionScopeName(dwarf);
+                if(!funcName.empty())
+                  callstack.insert(0, funcName);
+                scopeMD = dwarf->As<DISubprogram>()->scope;
+              }
+              else if(dwarf->type == DIBase::LexicalBlock)
+              {
+                scopeMD = dwarf->As<DILexicalBlock>()->scope;
+              }
+              else if(dwarf->type == DIBase::File)
+              {
+                scopeMD = NULL;
+                break;
+              }
+              else
+              {
+                RDCERR("Unhandled scope type %s", ToStr(dwarf->type).c_str());
+                scopeMD = NULL;
+                break;
+              }
             }
-            scope = scope->parent;
           }
+          // Make new DILocation from inlinedAt and walk that DILocation
+          if(debugLoc->inlinedAt)
+            debugLoc = debugLoc->inlinedAt->debugLoc;
+          else
+            debugLoc = NULL;
         }
-        // Add the new scope to the hierarchy and generate the callstack
-        scopeHierarchy.push_back(thisScope);
-
-        FunctionInfo::Callstack callstack;
-        for(ScopedDebugData *scope : scopeHierarchy)
-        {
-          if(!scope->functionName.empty())
-            callstack.push_back(scope->functionName);
-        }
-        // If there is no callstack then use the function name
-        if(callstack.empty())
-          callstack.push_back(f->name);
         info.callstacks[instructionIndex] = callstack;
-      }
-      // If there is no callstack for the function then use the function name
-      if(info.callstacks.empty())
-      {
-        FunctionInfo::Callstack callstack;
-        callstack.push_back(f->name);
-        info.callstacks[0] = callstack;
       }
     }
   }
-
-  // Sort the scopes by instruction index
-  std::sort(m_DebugInfo.scopedDebugDatas.begin(), m_DebugInfo.scopedDebugDatas.end(),
-            [](const ScopedDebugData *a, const ScopedDebugData *b) { return *a < *b; });
 
   ParseDebugData();
 
@@ -8260,7 +8399,7 @@ rdcarray<ShaderDebugState> Debugger::ContinueDebug(DebugAPIWrapper *apiWrapper)
       {
         thread.EnterEntryPoint(m_EntryPointFunction, &initial);
         thread.FillCallstack(initial);
-        initial.nextInstruction = thread.m_GlobalInstructionIdx;
+        initial.nextInstruction = thread.m_ActiveGlobalInstructionIdx;
       }
       else
       {

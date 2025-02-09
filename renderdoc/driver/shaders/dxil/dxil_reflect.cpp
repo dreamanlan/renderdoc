@@ -72,7 +72,7 @@ enum class StructMemberAnnotation
   Precise = 8,
   CBUsed = 9,
   // ResourceProperties = 10,
-  // BitFields = 11,
+  BitFields = 11,
   FieldWidth = 12,
   VectorSize = 13,
 };
@@ -157,6 +157,8 @@ struct TypeInfo
     ComponentType type;
     uint32_t fieldWidth;
     uint32_t vectorSize;
+
+    rdcarray<MemberData> bitfieldMembers;
   };
 
   struct StructData
@@ -201,70 +203,81 @@ struct TypeInfo
         const Metadata *memberIn = structMembers->children[m + 1];
         MemberData &memberOut = data.members[m];
 
-        for(size_t tag = 0; tag < memberIn->children.size(); tag += 2)
+        const rdcarray<Metadata *> &tagList = memberIn->children;
+
+        ProcessTagListForMember(tagList, memberOut);
+      }
+    }
+  }
+
+  void ProcessTagListForMember(const rdcarray<Metadata *> &tagList, MemberData &out)
+  {
+    for(size_t tag = 0; tag < tagList.size(); tag += 2)
+    {
+      StructMemberAnnotation fieldTag = getival<StructMemberAnnotation>(tagList[tag]);
+      switch(fieldTag)
+      {
+        case StructMemberAnnotation::SNorm:
         {
-          StructMemberAnnotation fieldTag = getival<StructMemberAnnotation>(memberIn->children[tag]);
-          switch(fieldTag)
-          {
-            case StructMemberAnnotation::SNorm:
-            {
-              if(getival<uint32_t>(memberIn->children[tag + 1]) != 0)
-                memberOut.flags = MemberData::Flags(memberOut.flags | MemberData::SNorm);
-              break;
-            }
-            case StructMemberAnnotation::UNorm:
-            {
-              if(getival<uint32_t>(memberIn->children[tag + 1]) != 0)
-                memberOut.flags = MemberData::Flags(memberOut.flags | MemberData::UNorm);
-              break;
-            }
-            case StructMemberAnnotation::Matrix:
-            {
-              const Metadata *matrixData = memberIn->children[tag + 1];
-              memberOut.rows = getival<uint8_t>(matrixData->children[0]);
-              memberOut.cols = getival<uint8_t>(matrixData->children[1]);
-              bool rowmajor = (getival<uint32_t>(matrixData->children[2]) == 1);
-              if(rowmajor)
-                memberOut.flags =
-                    MemberData::Flags(memberOut.flags | MemberData::RowMajor | MemberData::Matrix);
-              else
-                memberOut.flags = MemberData::Flags(memberOut.flags | MemberData::Matrix);
-              break;
-            }
-            case StructMemberAnnotation::CBufferOffset:
-              memberOut.offset = getival<uint32_t>(memberIn->children[tag + 1]);
-              break;
-            case StructMemberAnnotation::SemanticString:
-              memberOut.semantic = memberIn->children[tag + 1]->str;
-              break;
-            case StructMemberAnnotation::InterpolationMode: break;
-            case StructMemberAnnotation::FieldName:
-              memberOut.name = memberIn->children[tag + 1]->str;
-              break;
-            case StructMemberAnnotation::CompType:
-              memberOut.type = getival<ComponentType>(memberIn->children[tag + 1]);
-              break;
-            case StructMemberAnnotation::Precise:
-            {
-              if(getival<uint32_t>(memberIn->children[tag + 1]) != 0)
-                memberOut.flags = MemberData::Flags(memberOut.flags | MemberData::Precise);
-              break;
-            }
-            case StructMemberAnnotation::CBUsed:
-            {
-              if(getival<uint32_t>(memberIn->children[tag + 1]) != 0)
-                memberOut.flags = MemberData::Flags(memberOut.flags | MemberData::CBUsed);
-              break;
-            }
-            case StructMemberAnnotation::FieldWidth:
-              memberOut.fieldWidth = getival<uint32_t>(memberIn->children[tag + 1]);
-              break;
-            case StructMemberAnnotation::VectorSize:
-              memberOut.vectorSize = getival<uint32_t>(memberIn->children[tag + 1]);
-              break;
-            default: RDCWARN("Unexpected field tag %u", fieldTag); break;
-          }
+          if(getival<uint32_t>(tagList[tag + 1]) != 0)
+            out.flags = MemberData::Flags(out.flags | MemberData::SNorm);
+          break;
         }
+        case StructMemberAnnotation::UNorm:
+        {
+          if(getival<uint32_t>(tagList[tag + 1]) != 0)
+            out.flags = MemberData::Flags(out.flags | MemberData::UNorm);
+          break;
+        }
+        case StructMemberAnnotation::Matrix:
+        {
+          const Metadata *matrixData = tagList[tag + 1];
+          out.rows = getival<uint8_t>(matrixData->children[0]);
+          out.cols = getival<uint8_t>(matrixData->children[1]);
+          bool rowmajor = (getival<uint32_t>(matrixData->children[2]) == 1);
+          if(rowmajor)
+            out.flags = MemberData::Flags(out.flags | MemberData::RowMajor | MemberData::Matrix);
+          else
+            out.flags = MemberData::Flags(out.flags | MemberData::Matrix);
+          break;
+        }
+        case StructMemberAnnotation::CBufferOffset:
+          out.offset = getival<uint32_t>(tagList[tag + 1]);
+          break;
+        case StructMemberAnnotation::SemanticString: out.semantic = tagList[tag + 1]->str; break;
+        case StructMemberAnnotation::InterpolationMode: break;
+        case StructMemberAnnotation::FieldName: out.name = tagList[tag + 1]->str; break;
+        case StructMemberAnnotation::CompType:
+          out.type = getival<ComponentType>(tagList[tag + 1]);
+          break;
+        case StructMemberAnnotation::Precise:
+        {
+          if(getival<uint32_t>(tagList[tag + 1]) != 0)
+            out.flags = MemberData::Flags(out.flags | MemberData::Precise);
+          break;
+        }
+        case StructMemberAnnotation::CBUsed:
+        {
+          if(getival<uint32_t>(tagList[tag + 1]) != 0)
+            out.flags = MemberData::Flags(out.flags | MemberData::CBUsed);
+          break;
+        }
+        case StructMemberAnnotation::FieldWidth:
+          out.fieldWidth = getival<uint32_t>(tagList[tag + 1]);
+          break;
+        case StructMemberAnnotation::VectorSize:
+          out.vectorSize = getival<uint32_t>(tagList[tag + 1]);
+          break;
+        case StructMemberAnnotation::BitFields:
+        {
+          out.bitfieldMembers.resize(tagList[tag + 1]->children.size());
+          for(size_t i = 0; i < tagList[tag + 1]->children.size(); i++)
+          {
+            ProcessTagListForMember(tagList[tag + 1]->children[i]->children, out.bitfieldMembers[i]);
+          }
+          break;
+        }
+        default: RDCWARN("Unexpected field tag %u", fieldTag); break;
       }
     }
   }
@@ -1139,6 +1152,31 @@ static DXBC::CBufferVariableType MakeCBufferVariableType(const TypeInfo &typeInf
   {
     CBufferVariable var;
 
+    if(!it->second.members[i].bitfieldMembers.empty())
+    {
+      for(size_t b = 0; b < it->second.members[i].bitfieldMembers.size(); b++)
+      {
+        const TypeInfo::MemberData &bitfieldMember = it->second.members[i].bitfieldMembers[b];
+
+        var.name = bitfieldMember.name;
+        var.offset = it->second.members[i].offset;
+        var.bitFieldOffset = bitfieldMember.offset & 0xffff;
+        var.bitFieldSize = bitfieldMember.fieldWidth & 0xffff;
+
+        var.type.varType = VarTypeForComponentType(bitfieldMember.type);
+        var.type.bytesize = VarTypeByteSize(var.type.varType);
+        var.type.name = ToStr(var.type.varType);
+        var.type.rows = var.type.cols = var.type.elements = 1;
+        var.type.varClass = CLASS_SCALAR;
+
+        ret.bytesize = var.offset + var.type.bytesize;
+
+        ret.members.push_back(var);
+      }
+
+      continue;
+    }
+
     var.name = it->second.members[i].name;
     var.offset = it->second.members[i].offset;
 
@@ -1215,6 +1253,38 @@ static DXBC::CBufferVariableType MakeCBufferVariableType(const TypeInfo &typeInf
     return ret.members[0].type;
 
   return ret;
+}
+
+// DXIL wonderfully provides us with offsets that are completely useless/pointless for structured
+// buffers. We need to recalculate them now based on tight packing
+void RecalculateScalarOffsetsSizes(DXBC::CBufferVariableType &type)
+{
+  uint32_t offset = 0;
+  uint32_t pendingOffsetIncr = 0;
+  uint32_t lastBitfieldOffset = 0;
+  for(DXBC::CBufferVariable &var : type.members)
+  {
+    // if we encounter a non-bitfield, or the offset goes backwards, apply the 'real' offset now
+    if(var.bitFieldSize == 0 || var.bitFieldOffset < lastBitfieldOffset)
+    {
+      offset += pendingOffsetIncr;
+      pendingOffsetIncr = 0;
+    }
+
+    var.offset = offset;
+
+    // all bitfields share the same offset, which will be incremented at the next bitfield boundary (above)
+    if(var.bitFieldSize > 0)
+    {
+      pendingOffsetIncr = var.type.bytesize;
+      lastBitfieldOffset = var.bitFieldOffset + var.bitFieldSize;
+      continue;
+    }
+
+    offset += var.type.rows * var.type.cols * VarTypeByteSize(var.type.varType) * var.type.elements;
+
+    RecalculateScalarOffsetsSizes(var.type);
+  }
 }
 
 static void AddResourceBind(DXBC::Reflection *refl, const TypeInfo &typeInfo, const Metadata *r,
@@ -1426,6 +1496,7 @@ static void AddResourceBind(DXBC::Reflection *refl, const TypeInfo &typeInfo, co
       if(!typeInfo.structData.empty())
       {
         refl->ResourceBinds[bind.name] = MakeCBufferVariableType(typeInfo, baseType->inner);
+        RecalculateScalarOffsetsSizes(refl->ResourceBinds[bind.name]);
       }
       else
       {

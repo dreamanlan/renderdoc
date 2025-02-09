@@ -33,8 +33,6 @@ VulkanReplay::OutputWindow::OutputWindow()
 {
   surface = VK_NULL_HANDLE;
   swap = VK_NULL_HANDLE;
-  for(size_t i = 0; i < ARRAY_COUNT(colimg); i++)
-    colimg[i] = VK_NULL_HANDLE;
 
   WINDOW_HANDLE_INIT;
 
@@ -58,7 +56,6 @@ VulkanReplay::OutputWindow::OutputWindow()
   rp = VK_NULL_HANDLE;
   rpdepth = VK_NULL_HANDLE;
 
-  numImgs = 0;
   curidx = 0;
 
   m_ResourceManager = NULL;
@@ -75,9 +72,6 @@ VulkanReplay::OutputWindow::OutputWindow()
       VK_NULL_HANDLE,
       {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
   };
-  for(size_t i = 0; i < ARRAY_COUNT(colBarrier); i++)
-    colBarrier[i] = t;
-
   bbBarrier = t;
 
   t.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -118,12 +112,12 @@ void VulkanReplay::OutputWindow::Destroy(WrappedVulkan *driver, VkDevice device)
   }
 
   // not owned - freed with the swapchain
-  for(size_t i = 0; i < ARRAY_COUNT(colimg); i++)
+  for(size_t i = 0; i < colimg.size(); i++)
   {
-    if(colimg[i] != VK_NULL_HANDLE)
-      GetResourceManager()->ReleaseWrappedResource(colimg[i]);
-    colimg[i] = VK_NULL_HANDLE;
+    GetResourceManager()->ReleaseWrappedResource(colimg[i]);
   }
+  colimg.clear();
+  colBarrier.clear();
 
   if(dsimg != VK_NULL_HANDLE)
   {
@@ -216,8 +210,7 @@ void VulkanReplay::OutputWindow::Create(WrappedVulkan *driver, VkDevice device, 
     ObjDisp(inst)->GetPhysicalDeviceSurfaceCapabilitiesKHR(Unwrap(phys), Unwrap(surface),
                                                            &capabilities);
 
-    if(capabilities.minImageCount < 8)
-      numImages = RDCMAX(numImages, capabilities.minImageCount);
+    numImages = RDCMAX(numImages, capabilities.minImageCount);
 
     if(capabilities.supportedUsageFlags == 0)
     {
@@ -401,24 +394,33 @@ void VulkanReplay::OutputWindow::Create(WrappedVulkan *driver, VkDevice device, 
 
     GetResourceManager()->WrapResource(Unwrap(device), swap);
 
+    uint32_t numImgs = 0;
     vkr = vt->GetSwapchainImagesKHR(Unwrap(device), Unwrap(swap), &numImgs, NULL);
     CHECK_VKR(driver, vkr);
 
-    RDCASSERT(numImgs <= 8, numImgs);
+    colimg.resize(numImgs);
+    colBarrier.resize(numImgs);
 
-    VkImage *imgs = new VkImage[numImgs];
-    vkr = vt->GetSwapchainImagesKHR(Unwrap(device), Unwrap(swap), &numImgs, imgs);
+    vkr = vt->GetSwapchainImagesKHR(Unwrap(device), Unwrap(swap), &numImgs, colimg.data());
     CHECK_VKR(driver, vkr);
 
     for(size_t i = 0; i < numImgs; i++)
     {
-      colimg[i] = imgs[i];
       GetResourceManager()->WrapResource(Unwrap(device), colimg[i]);
-      colBarrier[i].image = Unwrap(colimg[i]);
-      colBarrier[i].oldLayout = colBarrier[i].newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    }
 
-    delete[] imgs;
+      colBarrier[i] = {
+          VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          NULL,
+          0,
+          0,
+          VK_IMAGE_LAYOUT_UNDEFINED,
+          VK_IMAGE_LAYOUT_UNDEFINED,
+          VK_QUEUE_FAMILY_IGNORED,
+          VK_QUEUE_FAMILY_IGNORED,
+          Unwrap(colimg[i]),
+          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+      };
+    }
   }
 
   curidx = 0;
@@ -869,23 +871,6 @@ void VulkanReplay::GetOutputWindowData(uint64_t id, bytebuf &retData)
   vt->FreeMemory(Unwrap(device), readbackMem, NULL);
 }
 
-void VulkanReplay::SetOutputWindowDimensions(uint64_t id, int32_t w, int32_t h)
-{
-  if(id == 0 || m_OutputWindows.find(id) == m_OutputWindows.end())
-    return;
-
-  OutputWindow &outw = m_OutputWindows[id];
-
-  // can't resize an output with an actual window backing
-  if(outw.m_WindowSystem != WindowingSystem::Headless)
-    return;
-
-  outw.width = w;
-  outw.height = h;
-
-  outw.Create(m_pDriver, m_pDriver->GetDev(), outw.hasDepth);
-}
-
 bool VulkanReplay::CheckResizeOutputWindow(uint64_t id)
 {
   if(id == 0 || m_OutputWindows.find(id) == m_OutputWindows.end())
@@ -941,13 +926,13 @@ void VulkanReplay::BindOutputWindow(uint64_t id, bool depth)
 
   OutputWindow &outw = it->second;
 
+  m_DebugWidth = outw.width;
+  m_DebugHeight = outw.height;
+
   // if the swapchain failed to create, do nothing. We will try to recreate it
   // again in CheckResizeOutputWindow (once per render 'frame')
   if(outw.m_WindowSystem != WindowingSystem::Headless && outw.swap == VK_NULL_HANDLE)
     return;
-
-  m_DebugWidth = (int32_t)outw.width;
-  m_DebugHeight = (int32_t)outw.height;
 
   VkDevice dev = m_pDriver->GetDev();
   const VkDevDispatchTable *vt = ObjDisp(dev);
@@ -976,9 +961,18 @@ void VulkanReplay::BindOutputWindow(uint64_t id, bool depth)
 
       CheckResizeOutputWindow(id);
 
+      m_DebugWidth = outw.width;
+      m_DebugHeight = outw.height;
+
       // then try again to acquire.
       vkr = vt->AcquireNextImageKHR(Unwrap(dev), Unwrap(outw.swap), 2000000000ULL, sem,
                                     VK_NULL_HANDLE, &outw.curidx);
+
+      if(vkr == VK_ERROR_OUT_OF_DATE_KHR)
+      {
+        RDCWARN("Swapchain still reported as out of date even after recreation");
+        outw.outofdate = true;
+      }
     }
 
     if(vkr == VK_SUBOPTIMAL_KHR)
@@ -986,22 +980,25 @@ void VulkanReplay::BindOutputWindow(uint64_t id, bool depth)
 
     CHECK_VKR(m_pDriver, vkr);
 
-    VkSubmitInfo submitInfo = {
-        VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        NULL,
-        1,
-        &sem,
-        &stage,
-        0,
-        NULL,    // cmd buffers
-        0,
-        NULL,    // signal semaphores
-    };
+    if(vkr == VK_SUCCESS)
+    {
+      VkSubmitInfo submitInfo = {
+          VK_STRUCTURE_TYPE_SUBMIT_INFO,
+          NULL,
+          1,
+          &sem,
+          &stage,
+          0,
+          NULL,    // cmd buffers
+          0,
+          NULL,    // signal semaphores
+      };
 
-    vkr = vt->QueueSubmit(Unwrap(m_pDriver->GetQ()), 1, &submitInfo, VK_NULL_HANDLE);
-    CHECK_VKR(m_pDriver, vkr);
+      vkr = vt->QueueSubmit(Unwrap(m_pDriver->GetQ()), 1, &submitInfo, VK_NULL_HANDLE);
+      CHECK_VKR(m_pDriver, vkr);
 
-    vt->QueueWaitIdle(Unwrap(m_pDriver->GetQ()));
+      vt->QueueWaitIdle(Unwrap(m_pDriver->GetQ()));
+    }
 
     vt->DestroySemaphore(Unwrap(dev), sem, NULL);
   }
@@ -1038,20 +1035,22 @@ void VulkanReplay::BindOutputWindow(uint64_t id, bool depth)
 
   outw.bbBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   outw.bbBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-  outw.colBarrier[outw.curidx].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  outw.colBarrier[outw.curidx].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
   DoPipelineBarrier(cmd, 1, &outw.bbBarrier);
-  if(outw.colimg[0] != VK_NULL_HANDLE)
+  if(outw.colBarrier.size() > 0)
+  {
+    outw.colBarrier[outw.curidx].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    outw.colBarrier[outw.curidx].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     DoPipelineBarrier(cmd, 1, &outw.colBarrier[outw.curidx]);
+    outw.colBarrier[outw.curidx].oldLayout = outw.colBarrier[outw.curidx].newLayout;
+    outw.colBarrier[outw.curidx].srcAccessMask = outw.colBarrier[outw.curidx].dstAccessMask;
+  }
   if(outw.dsimg != VK_NULL_HANDLE)
     DoPipelineBarrier(cmd, 1, &outw.depthBarrier);
 
   outw.depthBarrier.oldLayout = outw.depthBarrier.newLayout;
   outw.bbBarrier.oldLayout = outw.bbBarrier.newLayout;
   outw.bbBarrier.srcAccessMask = outw.bbBarrier.dstAccessMask;
-  outw.colBarrier[outw.curidx].oldLayout = outw.colBarrier[outw.curidx].newLayout;
-  outw.colBarrier[outw.curidx].srcAccessMask = outw.colBarrier[outw.curidx].dstAccessMask;
 
   vt->EndCommandBuffer(Unwrap(cmd));
 
@@ -1297,7 +1296,15 @@ void VulkanReplay::FlipOutputWindow(uint64_t id)
                                   &outw.curidx,
                                   &vkr};
 
-  VkResult retvkr = vt->QueuePresentKHR(Unwrap(m_pDriver->GetQ()), &presentInfo);
+  VkResult retvkr;
+
+  // if we were not able to acquire an image successfully in Bind even after resizing due to an
+  // OUT_OF_DATE, then don't present here as we never got a valid image.
+  // This will also force another recreate below
+  if(outw.outofdate)
+    retvkr = VK_ERROR_OUT_OF_DATE_KHR;
+  else
+    retvkr = vt->QueuePresentKHR(Unwrap(m_pDriver->GetQ()), &presentInfo);
 
   if(retvkr != VK_ERROR_OUT_OF_DATE_KHR && retvkr != VK_SUBOPTIMAL_KHR &&
      retvkr != VK_ERROR_SURFACE_LOST_KHR)

@@ -390,18 +390,20 @@ D3D12DebugManager::D3D12DebugManager(WrappedID3D12Device *wrapper)
     shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_PixelHistoryCopyPixel",
                                D3DCOMPILE_WARNINGS_ARE_ERRORS, {}, "cs_5_0", &m_PixelHistoryCopyCS);
 
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeDesc = {};
-    pipeDesc.CS.pShaderBytecode = m_PixelHistoryCopyCS->GetBufferPointer();
-    pipeDesc.CS.BytecodeLength = m_PixelHistoryCopyCS->GetBufferSize();
-    pipeDesc.pRootSignature = m_PixelHistoryCopySig;
-    hr = m_pDevice->CreateComputePipelineState(&pipeDesc, __uuidof(ID3D12PipelineState),
-                                               (void **)&m_PixelHistoryCopyPso);
-    if(FAILED(hr))
+    if(m_PixelHistoryCopyCS)
     {
-      RDCERR("Failed to create PSO for pixel history HRESULT: %s", ToStr(hr).c_str());
-      return;
+      D3D12_COMPUTE_PIPELINE_STATE_DESC pipeDesc = {};
+      pipeDesc.CS.pShaderBytecode = m_PixelHistoryCopyCS->GetBufferPointer();
+      pipeDesc.CS.BytecodeLength = m_PixelHistoryCopyCS->GetBufferSize();
+      pipeDesc.pRootSignature = m_PixelHistoryCopySig;
+      hr = m_pDevice->CreateComputePipelineState(&pipeDesc, __uuidof(ID3D12PipelineState),
+                                                 (void **)&m_PixelHistoryCopyPso);
+      if(FAILED(hr))
+      {
+        RDCERR("Failed to create PSO for pixel history HRESULT: %s", ToStr(hr).c_str());
+      }
+      m_pDevice->GetResourceManager()->SetInternalResource(m_PixelHistoryCopyPso);
     }
-    m_pDevice->GetResourceManager()->SetInternalResource(m_PixelHistoryCopyPso);
   }
 
   shaderCache->SetCaching(false);
@@ -434,10 +436,10 @@ D3D12DebugManager::D3D12DebugManager(WrappedID3D12Device *wrapper)
   if(FAILED(hr))
   {
     RDCERR("Failed to create readback buffer, HRESULT: %s", ToStr(hr).c_str());
-    return;
   }
 
-  m_ReadbackBuffer->SetName(L"m_ReadbackBuffer");
+  if(m_ReadbackBuffer)
+    m_ReadbackBuffer->SetName(L"m_ReadbackBuffer");
 
   rm->SetInternalResource(m_ReadbackBuffer);
 
@@ -448,7 +450,6 @@ D3D12DebugManager::D3D12DebugManager(WrappedID3D12Device *wrapper)
   if(FAILED(hr))
   {
     RDCERR("Failed to create readback command allocator, HRESULT: %s", ToStr(hr).c_str());
-    return;
   }
 
   rm->SetInternalResource(m_DebugAlloc);
@@ -460,17 +461,19 @@ D3D12DebugManager::D3D12DebugManager(WrappedID3D12Device *wrapper)
 
   ID3D12GraphicsCommandList *list = NULL;
 
-  hr = m_pDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_DebugAlloc, NULL,
-                                    __uuidof(ID3D12GraphicsCommandList), (void **)&list);
-  m_pDevice->InternalRef();
-
-  // safe to upcast - this is a wrapped object
-  m_DebugList = (ID3D12GraphicsCommandListX *)list;
-
-  if(FAILED(hr))
+  if(m_DebugAlloc)
   {
-    RDCERR("Failed to create readback command list, HRESULT: %s", ToStr(hr).c_str());
-    return;
+    hr = m_pDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_DebugAlloc, NULL,
+                                      __uuidof(ID3D12GraphicsCommandList), (void **)&list);
+    m_pDevice->InternalRef();
+
+    // safe to upcast - this is a wrapped object
+    m_DebugList = (ID3D12GraphicsCommandListX *)list;
+
+    if(FAILED(hr))
+    {
+      RDCERR("Failed to create readback command list, HRESULT: %s", ToStr(hr).c_str());
+    }
   }
 
   rm->SetInternalResource(m_DebugList);
@@ -1988,7 +1991,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12DebugManager::GetUAVClearHandle(CBVUAVSRVSlot s
   return ret;
 }
 
-void D3D12DebugManager::PrepareExecuteIndirectPatching(const GPUAddressRangeTracker &origAddresses)
+void D3D12DebugManager::PrepareExecuteIndirectPatching(GPUAddressRangeTracker &origAddresses)
 {
   D3D12ShaderCache *shaderCache = m_pDevice->GetShaderCache();
 
@@ -2052,7 +2055,7 @@ void D3D12DebugManager::PrepareExecuteIndirectPatching(const GPUAddressRangeTrac
   };
   rdcarray<buffermapping> buffers;
 
-  for(const GPUAddressRange &addr : origAddresses.addresses)
+  for(const GPUAddressRange &addr : origAddresses.GetAddresses())
   {
     buffermapping b = {};
     b.origBase = addr.start;
@@ -2116,7 +2119,7 @@ void D3D12DebugManager::GetBufferData(ID3D12Resource *buffer, uint64_t offset, u
   if(buffer == NULL)
     return;
 
-  m_pDevice->GPUSyncAllQueues();
+  m_pDevice->ReplayWorkWaitForIdle();
 
   D3D12_RESOURCE_DESC desc = buffer->GetDesc();
   D3D12_HEAP_PROPERTIES heapProps = {};
@@ -2207,7 +2210,7 @@ void D3D12DebugManager::GetBufferData(ID3D12Resource *buffer, uint64_t offset, u
 
     ID3D12CommandList *l = m_DebugList;
     m_pDevice->GetQueue()->ExecuteCommandLists(1, &l);
-    m_pDevice->GPUSync();
+    m_pDevice->InternalQueueWaitForIdle();
     m_DebugAlloc->Reset();
 
     D3D12_RANGE range = {0, (size_t)chunkSize};
@@ -2247,7 +2250,7 @@ void D3D12DebugManager::GetBufferData(ID3D12Resource *buffer, uint64_t offset, u
 
   ID3D12CommandList *l = m_DebugList;
   m_pDevice->GetQueue()->ExecuteCommandLists(1, &l);
-  m_pDevice->GPUSync();
+  m_pDevice->InternalQueueWaitForIdle();
   m_DebugAlloc->Reset();
 }
 

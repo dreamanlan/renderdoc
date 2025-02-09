@@ -203,10 +203,9 @@ int main(int argc, char *argv[])
   {
     const char *qpa_plat = getenv("QT_QPA_PLATFORM");
     // if not set or empty, force non-wayland to help go through backwards compatibility path on wayland.
-    char env_set[] = "QT_QPA_PLATFORM=xcb\0";
     if(!qpa_plat || qpa_plat[0] == 0)
     {
-      putenv(env_set);
+      setenv("QT_QPA_PLATFORM", "xcb", 1);
       envChanged = true;
     }
   }
@@ -561,8 +560,11 @@ int main(int argc, char *argv[])
       // documentation is unclear, mentions both these files so check both just in case
       QFileInfo vkconfigcheck1(fn + lit("VkLayerOverride.json"));
       QFileInfo vkconfigcheck2(fn + lit("VkLayer_Override.json"));
+      // lower case might be used on linux
+      QFileInfo vkconfigcheck3(fn + lit("VkLayer_override.json"));
       if((vkconfigcheck1.exists() && vkconfigcheck1.isFile()) ||
-         (vkconfigcheck2.exists() && vkconfigcheck2.isFile()))
+         (vkconfigcheck2.exists() && vkconfigcheck2.isFile()) ||
+         (vkconfigcheck3.exists() && vkconfigcheck3.isFile()))
       {
         RDDialog::warning(
             NULL, tr("vkconfig detected - possible incompatibility"),

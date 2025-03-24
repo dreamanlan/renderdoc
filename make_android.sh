@@ -2,14 +2,14 @@
 
 export ANDROID_SDK=/c/sdk_full
 export ANDROID_NDK=/d/android-ndk-r23b
-export JAVA_HOME=/f/jdk-1.8
+export JAVA_HOME=/f/jdk-21
 
-export APK_TARGET_ID=android-28
+export APK_TARGET_ID=android-35
 export ANDROID_SDK_ROOT_PATH=%ANDROID_SDK%
 export ANDROID_NDK_ROOT_PATH=%ANDROID_NDK%
 export GIT_HASH=8a394019fdb62ad82be87bfd338a5ec43f4a5d95
 
-export PATH=/C/Program\ Files/CMake/bin:/F/jdk-1.8/bin:/C/Strawberry/c/bin:/D/Git/mingw64/bin:/D/Git/usr/bin:/D/Git/bin:/C/windows/system32:/C/windows:/C/windows/System32/Wbem:/C/windows/System32/WindowsPowerShell/v1.0:/C/windows/System32/OpenSSH
+export PATH=/C/Program\ Files/CMake/bin:/F/jdk-21/bin:/C/Strawberry/c/bin:/D/Git/mingw64/bin:/D/Git/usr/bin:/D/Git/bin:/C/windows/system32:/C/windows:/C/windows/System32/Wbem:/C/windows/System32/WindowsPowerShell/v1.0:/C/windows/System32/OpenSSH
 
 mkdir -p build-android-v8a
 cd build-android-v8a

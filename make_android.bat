@@ -10,7 +10,7 @@ set ANDROID_CMAKE=C:\Users\dreamanlan\AppData\Local\Android\Sdk\cmake\3.22.1\bin
 set ANDROID_NINJA=C:\Users\dreamanlan\AppData\Local\Android\Sdk\cmake\3.22.1\bin\ninja.exe
 set GIT_HASH=8a394019fdb62ad82be87bfd338a5ec43f4a5d95
 
-set path="C:\Program Files\CMake\bin";F:\jdk-1.8\bin;C:\Strawberry\c\bin;D:\Git\bin;C:\windows\system32;C:\windows;C:\windows\System32\Wbem;C:\windows\System32\WindowsPowerShell\v1.0\;C:\windows\System32\OpenSSH\;
+set path="C:\Program Files\CMake\bin";F:\jdk-21\bin;C:\Strawberry\c\bin;D:\Git\bin;C:\windows\system32;C:\windows;C:\windows\System32\Wbem;C:\windows\System32\WindowsPowerShell\v1.0\;C:\windows\System32\OpenSSH\;
 
 cmake -S . -B build.Android.armeabi-v7a -DBUILD_ANDROID=On -DCMAKE_ANDROID_ARCH_ABI=armeabi-v7a -DANDROID_ABI=armeabi-v7a ^
 	-DCMAKE_MAKE_PROGRAM=%ANDROID_NINJA% -DAPK_TARGET_ID=%APK_TARGET_ID% ^

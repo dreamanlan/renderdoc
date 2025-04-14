@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -2598,7 +2598,7 @@ void MainWindow::on_action_Start_Replay_Loop_triggered()
   if(!m_Ctx.IsCaptureLoaded())
     return;
 
-  QDialog popup;
+  RDDialog popup;
   popup.setWindowFlags(popup.windowFlags() & ~Qt::WindowContextHelpButtonHint);
   popup.setWindowIcon(windowIcon());
 
@@ -2660,6 +2660,13 @@ void MainWindow::on_action_Start_Replay_Loop_triggered()
   WindowingData winData = m_Ctx.CreateWindowingData(&popup);
 
   m_Ctx.Replay().AsyncInvoke([winData, id](IReplayController *r) { r->ReplayLoop(winData, id); });
+
+  QObject::connect(&popup, &RDDialog::aboutToClose,
+                   [this](QCloseEvent *) { m_Ctx.Replay().CancelReplayLoop(); });
+  QObject::connect(&popup, &RDDialog::keyPress, [this](QKeyEvent *e) {
+    if(e->matches(QKeySequence::Cancel))
+      m_Ctx.Replay().CancelReplayLoop();
+  });
 
   RDDialog::show(&popup);
 

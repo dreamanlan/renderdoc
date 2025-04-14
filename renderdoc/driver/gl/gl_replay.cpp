@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -3751,6 +3751,11 @@ void GLReplay::FreeTargetResource(ResourceId id)
 {
   MakeCurrentReplayContext(&m_ReplayCtx);
   m_pDriver->FreeTargetResource(id);
+}
+
+void GLReplay::ClearReplayCache()
+{
+  ClearPostVSCache();
 }
 
 ResourceId GLReplay::CreateProxyTexture(const TextureDescription &templateTex)

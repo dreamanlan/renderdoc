@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1466,6 +1466,7 @@ BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
     case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
     case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
     case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+    case VK_FORMAT_A1B5G5R5_UNORM_PACK16:
     case VK_FORMAT_B5G6R5_UNORM_PACK16:
     case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
     case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
@@ -1479,7 +1480,8 @@ BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
     case VK_FORMAT_R8_UINT:
     case VK_FORMAT_R8_SINT:
     case VK_FORMAT_R8_SRGB:
-    case VK_FORMAT_S8_UINT: return {1, 1, 1};
+    case VK_FORMAT_S8_UINT:
+    case VK_FORMAT_A8_UNORM: return {1, 1, 1};
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
@@ -1819,7 +1821,8 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_B5G6R5_UNORM_PACK16: ret.type = ResourceFormatType::R5G6B5; break;
     case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
     case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
-    case VK_FORMAT_A1R5G5B5_UNORM_PACK16: ret.type = ResourceFormatType::R5G5B5A1; break;
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+    case VK_FORMAT_A1B5G5R5_UNORM_PACK16: ret.type = ResourceFormatType::R5G5B5A1; break;
     case VK_FORMAT_D16_UNORM_S8_UINT: ret.type = ResourceFormatType::D16S8; break;
     case VK_FORMAT_D24_UNORM_S8_UINT: ret.type = ResourceFormatType::D24S8; break;
     case VK_FORMAT_D32_SFLOAT_S8_UINT: ret.type = ResourceFormatType::D32S8; break;
@@ -1942,6 +1945,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
     case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM: ret.type = ResourceFormatType::YUV16; break;
+    case VK_FORMAT_A8_UNORM: ret.type = ResourceFormatType::A8; break;
     default: break;
   }
 
@@ -2011,7 +2015,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_EAC_R11_SNORM_BLOCK:
     case VK_FORMAT_R10X6_UNORM_PACK16:
     case VK_FORMAT_R12X4_UNORM_PACK16:
-    case VK_FORMAT_A8_UNORM_KHR: ret.compCount = 1; break;
+    case VK_FORMAT_A8_UNORM: ret.compCount = 1; break;
     case VK_FORMAT_R4G4_UNORM_PACK8:
     case VK_FORMAT_R8G8_UNORM:
     case VK_FORMAT_R8G8_SNORM:
@@ -2179,7 +2183,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_A2B10G10R10_SINT_PACK32:
     case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
     case VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16:
-    case VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR: ret.compCount = 4; break;
+    case VK_FORMAT_A1B5G5R5_UNORM_PACK16: ret.compCount = 4; break;
     case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
     case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
     case VK_FORMAT_ASTC_5x4_UNORM_BLOCK:
@@ -2242,8 +2246,8 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
     case VK_FORMAT_R5G6B5_UNORM_PACK16:
     case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
-    case VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR:
-    case VK_FORMAT_A8_UNORM_KHR:
+    case VK_FORMAT_A1B5G5R5_UNORM_PACK16:
+    case VK_FORMAT_A8_UNORM:
     case VK_FORMAT_R8_UNORM:
     case VK_FORMAT_R8G8_UNORM:
     case VK_FORMAT_R8G8B8_UNORM:
@@ -2541,7 +2545,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_B8G8R8A8_UINT:
     case VK_FORMAT_B8G8R8A8_SINT:
     case VK_FORMAT_B8G8R8A8_SRGB:
-    case VK_FORMAT_A8_UNORM_KHR: ret.compByteWidth = 1; break;
+    case VK_FORMAT_A8_UNORM: ret.compByteWidth = 1; break;
     case VK_FORMAT_R16_UNORM:
     case VK_FORMAT_R16_SNORM:
     case VK_FORMAT_R16_USCALED:
@@ -2607,7 +2611,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
     case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
     case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
-    case VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR:
+    case VK_FORMAT_A1B5G5R5_UNORM_PACK16:
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
     case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
     case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
@@ -2890,6 +2894,7 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
       case ResourceFormatType::D24S8: ret = VK_FORMAT_D24_UNORM_S8_UINT; break;
       case ResourceFormatType::D32S8: ret = VK_FORMAT_D32_SFLOAT_S8_UINT; break;
       case ResourceFormatType::S8: ret = VK_FORMAT_S8_UINT; break;
+      case ResourceFormatType::A8: ret = VK_FORMAT_A8_UNORM; break;
       case ResourceFormatType::YUV8:
       {
         int subsampling = fmt.YUVSubsampling();
@@ -3952,6 +3957,7 @@ QueryPoolInfo::QueryPoolInfo(WrappedVulkan *driver, VkDevice device,
                              const VkQueryPoolCreateInfo *pCreateInfo)
 {
   m_Buffer.Create(driver, device, pCreateInfo->queryCount * 8, 1, GPUBuffer::eGPUBufferReadback);
+  m_Buffer.Name(StringFormat::Fmt("QueryPoolInfoBuffer%u", pCreateInfo->queryCount));
   m_MappedMem = (byte *)m_Buffer.Map(0, m_Buffer.TotalSize());
 }
 
@@ -4326,6 +4332,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       VK_FORMAT_R5G5B5A1_UNORM_PACK16,
       VK_FORMAT_B5G5R5A1_UNORM_PACK16,
       VK_FORMAT_A1R5G5B5_UNORM_PACK16,
+      VK_FORMAT_A1B5G5R5_UNORM_PACK16,
       VK_FORMAT_R8_UNORM,
       VK_FORMAT_R8_SNORM,
       VK_FORMAT_R8_USCALED,
@@ -4333,6 +4340,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       VK_FORMAT_R8_UINT,
       VK_FORMAT_R8_SINT,
       VK_FORMAT_R8_SRGB,
+      VK_FORMAT_A8_UNORM,
       VK_FORMAT_R8G8_UNORM,
       VK_FORMAT_R8G8_SNORM,
       VK_FORMAT_R8G8_USCALED,
@@ -4605,6 +4613,10 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       if(f == VK_FORMAT_A1R5G5B5_UNORM_PACK16)
       {
         CHECK(reconstructed == VK_FORMAT_R5G5B5A1_UNORM_PACK16);
+      }
+      else if(f == VK_FORMAT_A1B5G5R5_UNORM_PACK16)
+      {
+        CHECK(reconstructed == VK_FORMAT_B5G5R5A1_UNORM_PACK16);
       }
       else if(f == VK_FORMAT_A8B8G8R8_UNORM_PACK32)
       {

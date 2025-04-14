@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2024 Baldur Karlsson
+ * Copyright (c) 2017-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -100,6 +100,8 @@ rdcstr DoStringise(const ResultCode &el)
     STRINGISE_ENUM_CLASS_NAMED(InvalidParameter,
                                "An invalid parameter was passed to RenderDoc's API");
     STRINGISE_ENUM_CLASS_NAMED(CompressionFailed, "Compression or decompression failed");
+    STRINGISE_ENUM_CLASS_NAMED(AndroidLayerConfFailed,
+                               "Debug layer configuration failed on Android");
   }
   END_ENUM_STRINGISE();
 }

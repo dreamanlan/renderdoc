@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -2102,6 +2102,7 @@ void D3D12DebugManager::PrepareExecuteIndirectPatching(GPUAddressRangeTracker &o
     hr = m_pDevice->CreateCommittedResource(
         &heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, NULL,
         __uuidof(ID3D12Resource), (void **)&m_EIPatchScratchBuffer);
+    m_pDevice->RemoveReplayResource(GetResID(m_EIPatchScratchBuffer));
 
     m_EIPatchScratchBuffer->SetName(L"m_EIPatchScratchBuffer");
 
@@ -3407,7 +3408,8 @@ uint32_t GetFreeRegSpace(const D3D12RootSignature &sig, const uint32_t registerS
   for(size_t i = 0; i < numParams; i++)
   {
     if(sig.Parameters[i].ShaderVisibility == visibility ||
-       sig.Parameters[i].ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL)
+       sig.Parameters[i].ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL ||
+       visibility == D3D12_SHADER_VISIBILITY_ALL)
     {
       D3D12_ROOT_PARAMETER_TYPE rootType = sig.Parameters[i].ParameterType;
       if(rootType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
@@ -3458,12 +3460,14 @@ uint32_t GetFreeRegSpace(const D3D12RootSignature &sig, const uint32_t registerS
 }
 
 void AddDebugDescriptorsToRenderState(WrappedID3D12Device *pDevice, D3D12RenderState &rs,
-                                      const rdcarray<PortableHandle> &handles,
+                                      bool compute, const rdcarray<PortableHandle> &handles,
                                       D3D12_DESCRIPTOR_HEAP_TYPE heapType, uint32_t sigElem,
                                       std::set<ResourceId> &copiedHeaps)
 {
-  if(rs.graphics.sigelems.size() <= sigElem)
-    rs.graphics.sigelems.resize(sigElem + 1);
+  D3D12RenderState::RootSignature &sig = compute ? rs.compute : rs.graphics;
+
+  if(sig.sigelems.size() <= sigElem)
+    sig.sigelems.resize(sigElem + 1);
 
   PortableHandle newHandle = handles[0];
 
@@ -3513,6 +3517,6 @@ void AddDebugDescriptorsToRenderState(WrappedID3D12Device *pDevice, D3D12RenderS
   if(newHandle.heap == handles[0].heap)
     rs.heaps.push_back(handles[0].heap);
 
-  rs.graphics.sigelems[sigElem] =
+  sig.sigelems[sigElem] =
       D3D12RenderState::SignatureElement(eRootTable, newHandle.heap, newHandle.index);
 }

@@ -119,6 +119,7 @@ set(VULKAN_SRC
         vk/vk_ext_buffer_address.cpp
         vk/vk_extended_dyn_state.cpp
         vk/vk_graphics_pipeline.cpp
+        vk/vk_groupshared.cpp
         vk/vk_image_layouts.cpp
         vk/vk_imageless_framebuffer.cpp
         vk/vk_indirect.cpp
@@ -131,6 +132,7 @@ set(VULKAN_SRC
         vk/vk_load_store_none.cpp
         vk/vk_mem_bench.cpp
         vk/vk_mesh_zoo.cpp
+        vk/vk_mesh_shader.cpp
         vk/vk_misaligned_dirty.cpp
         vk/vk_multi_entry.cpp
         vk/vk_multi_present.cpp
@@ -155,6 +157,7 @@ set(VULKAN_SRC
         vk/vk_simple_triangle.cpp
         vk/vk_spec_constants.cpp
         vk/vk_spirv_13_shaders.cpp
+        vk/vk_subgroup_zoo.cpp
         vk/vk_structured_buffer_nested.cpp
         vk/vk_sync2.cpp
         vk/vk_texture_zoo.cpp

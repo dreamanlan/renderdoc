@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1331,6 +1331,7 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
     // Input Assembly
     ret.inputAssembly.indexBuffer.resourceId = rm->GetOriginalID(state.ibuffer.buf);
     ret.inputAssembly.indexBuffer.byteOffset = state.ibuffer.offs;
+    ret.inputAssembly.indexBuffer.byteSize = state.ibuffer.size;
     ret.inputAssembly.indexBuffer.byteStride = state.ibuffer.bytewidth;
     ret.inputAssembly.primitiveRestartEnable = state.primRestartEnable != VK_FALSE;
     ret.inputAssembly.topology =
@@ -1583,20 +1584,20 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
 
     ret.rasterizer.lineRasterMode = LineRaster::Default;
 
-    // "VK_LINE_RASTERIZATION_MODE_DEFAULT_HKR is equivalent to
-    // VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR if VkPhysicalDeviceLimits::strictLines is VK_TRUE"
+    // "VK_LINE_RASTERIZATION_MODE_DEFAULT is equivalent to
+    // VK_LINE_RASTERIZATION_MODE_RECTANGULAR if VkPhysicalDeviceLimits::strictLines is VK_TRUE"
     if(m_pDriver->GetDeviceProps().limits.strictLines)
       ret.rasterizer.lineRasterMode = LineRaster::Rectangular;
 
     switch(state.lineRasterMode)
     {
-      case VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR:
+      case VK_LINE_RASTERIZATION_MODE_RECTANGULAR:
         ret.rasterizer.lineRasterMode = LineRaster::Rectangular;
         break;
-      case VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR:
+      case VK_LINE_RASTERIZATION_MODE_BRESENHAM:
         ret.rasterizer.lineRasterMode = LineRaster::Bresenham;
         break;
-      case VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_KHR:
+      case VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH:
         ret.rasterizer.lineRasterMode = LineRaster::RectangularSmooth;
         break;
       default: break;
@@ -2153,7 +2154,7 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
         &state.compute.descSets,
     };
 
-    const VKDynamicShaderFeedback &usage = m_BindlessFeedback.Usage[eventId];
+    const VKDynamicShaderFeedback &usage = m_BindlessFeedback[eventId];
 
     ret.shaderMessages = usage.messages;
 
@@ -2176,7 +2177,7 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
 
         destSet.descriptorSetResourceId = rm->GetOriginalID(sourceSet);
         destSet.pushDescriptor = (c.m_DescSetLayout[layoutId].flags &
-                                  VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
+                                  VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT);
 
         destSet.layoutResourceId = rm->GetOriginalID(layoutId);
       }
@@ -2680,7 +2681,7 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
       access = DescriptorAccess();
   }
 
-  const VKDynamicShaderFeedback &usage = m_BindlessFeedback.Usage[eventId];
+  const VKDynamicShaderFeedback &usage = m_BindlessFeedback[eventId];
 
   if(usage.valid)
     ret.append(usage.access);
@@ -4914,6 +4915,12 @@ void VulkanReplay::FreeTargetResource(ResourceId id)
   m_pDriver->ReleaseResource(GetResourceManager()->GetCurrentResource(id));
 }
 
+void VulkanReplay::ClearReplayCache()
+{
+  ClearPostVSCache();
+  ClearFeedbackCache();
+}
+
 void VulkanReplay::ReplaceResource(ResourceId from, ResourceId to)
 {
   // remove existing shader replacement
@@ -5056,8 +5063,10 @@ void VulkanReplay::RefreshDerivedReplacements()
         // if we have pipeline executable properties, capture the data
         if(m_pDriver->GetExtensions(NULL).ext_KHR_pipeline_executable_properties)
         {
-          pipeCreateInfo.flags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
-                                   VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+          uint64_t flags = GetPipelineCreateFlags(&pipeCreateInfo);
+          flags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                    VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+          SetPipelineCreateFlags(&pipeCreateInfo, flags);
         }
 
         // create the new graphics pipeline
@@ -5104,8 +5113,10 @@ void VulkanReplay::RefreshDerivedReplacements()
         // if we have pipeline executable properties, capture the data
         if(m_pDriver->GetExtensions(NULL).ext_KHR_pipeline_executable_properties)
         {
-          pipeCreateInfo.flags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
-                                   VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+          uint64_t flags = GetPipelineCreateFlags(&pipeCreateInfo);
+          flags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                    VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+          SetPipelineCreateFlags(&pipeCreateInfo, flags);
         }
 
         // create the new compute pipeline
@@ -5264,6 +5275,12 @@ RDResult Vulkan_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRep
 
   Process::RegisterEnvironmentModification(
       EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "VK_LAYER_bandicam_helper_DEBUG_1", "1"));
+
+  Process::RegisterEnvironmentModification(
+      EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "DISABLE_VK_LAYER_reshade_1", "1"));
+
+  Process::RegisterEnvironmentModification(
+      EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "DISABLE_VK_LAYER_GPUOpen_GRS", "1"));
 
   // fpsmon not only has a buggy layer but it also picks an absurdly generic disable environment
   // variable :(. Hopefully no other program picks this, or if it does then it's probably not a

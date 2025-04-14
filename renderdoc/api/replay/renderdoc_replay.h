@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -721,6 +721,11 @@ See :meth:`BuildTargetShader`, :meth:`RemoveReplacement`.
 :param ResourceId replacement: The id of the new resource that should be used instead.
 )");
   virtual void ReplaceResource(ResourceId original, ResourceId replacement) = 0;
+
+  DOCUMENT(R"(Clear any cached data from previous replays and ensure subsequent replays fully
+re-initialise any data, including e.g. bindless feedback, printf results or mesh output data.
+)");
+  virtual void ClearReplayCache() = 0;
 
   DOCUMENT(R"(Remove any previously specified replacement for an object.
 

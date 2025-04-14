@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1157,6 +1157,23 @@ void Program::Parse(const DXBC::Reflection *reflection)
   FillEntryPointInterfaces();
   m_SsaAliases.clear();
   ParseReferences(reflection);
+
+  if(m_Type == DXBC::ShaderType::Compute || m_Type == DXBC::ShaderType::Amplification ||
+     m_Type == DXBC::ShaderType::Mesh)
+  {
+    for(GlobalVar *g : m_GlobalVars)
+    {
+      RDCASSERT(g->type->type == Type::Pointer);
+      if(g->type->type == Type::Pointer && g->type->addrSpace == Type::PointerAddrSpace::GroupShared)
+        m_Threadscope |= DXBC::ThreadScope::Workgroup;
+    }
+
+    for(Function *f : m_Functions)
+    {
+      if(f->name == "dx.op.barrier")
+        m_Threadscope |= DXBC::ThreadScope::Workgroup;
+    }
+  }
 
   m_Parsed = true;
 }
@@ -3710,12 +3727,20 @@ void Program::MakeRDDisassemblyString(const DXBC::Reflection *reflection)
                         uint32_t bytesPerElement = 4;
                         if(retType)
                         {
-                          RDCASSERTEQUAL(retType->type, Type::TypeKind::Struct);
                           if(retType->type == Type::TypeKind::Struct)
                           {
                             const Type *baseType = retType->members[0];
                             RDCASSERTEQUAL(baseType->type, Type::TypeKind::Scalar);
                             bytesPerElement = baseType->bitWidth / 8;
+                          }
+                          else if(retType->type == Type::TypeKind::Scalar)
+                          {
+                            const Type *baseType = retType;
+                            bytesPerElement = baseType->bitWidth / 8;
+                          }
+                          else
+                          {
+                            RDCWARN("Unhandled cbuffer return type");
                           }
                         }
                         lineStr +=
@@ -4135,6 +4160,80 @@ void Program::MakeRDDisassemblyString(const DXBC::Reflection *reflection)
                   }
                   break;
                 }
+                case DXOp::WaveActiveOp:
+                {
+                  // WaveActiveOp(value, i8 waveOp, i8 sign)
+                  WaveOpCode waveOpCode;
+                  SignedOpKind sop;
+                  if(getival<SignedOpKind>(inst.args[3], sop))
+                    commentStr += ToStr(sop);
+
+                  if(getival<WaveOpCode>(inst.args[2], waveOpCode))
+                  {
+                    lineStr += "WaveActive" + ToStr(waveOpCode);
+                    lineStr += "(";
+                    lineStr += GetArgId(inst, 1);
+                    lineStr += ")";
+                  }
+                  else
+                  {
+                    showDxFuncName = true;
+                  }
+                  break;
+                }
+                case DXOp::WaveActiveBit:
+                {
+                  // WaveActiveBit(value, i8 waveBitOp)
+                  WaveBitOpCode waveBitOpCode;
+                  if(getival<WaveBitOpCode>(inst.args[2], waveBitOpCode))
+                  {
+                    lineStr += "WaveActiveBit" + ToStr(waveBitOpCode);
+                    lineStr += "(";
+                    lineStr += GetArgId(inst, 1);
+                    lineStr += ")";
+                  }
+                  else
+                  {
+                    showDxFuncName = true;
+                  }
+                  break;
+                }
+                case DXOp::WaveMultiPrefixOp:
+                {
+                  // WaveMultiPrefixOp(value,mask0,mask1,mask2,mask3,op,sop)
+                  SignedOpKind sop;
+                  if(getival<SignedOpKind>(inst.args[7], sop))
+                    commentStr += ToStr(sop);
+
+                  WaveMultiPrefixOpCode waveMultiOpCode;
+                  if(getival<WaveMultiPrefixOpCode>(inst.args[6], waveMultiOpCode))
+                  {
+                    lineStr += "WaveMultiPrefix";
+                    if((waveMultiOpCode == WaveMultiPrefixOpCode::And) ||
+                       (waveMultiOpCode == WaveMultiPrefixOpCode::Or) ||
+                       (waveMultiOpCode == WaveMultiPrefixOpCode::Xor))
+                      lineStr += "Bit";
+
+                    lineStr += ToStr(waveMultiOpCode);
+                    lineStr += "(";
+                    lineStr += GetArgId(inst, 1);
+                    lineStr += ", {";
+                    lineStr += GetArgId(inst, 2);
+                    lineStr += ",";
+                    lineStr += GetArgId(inst, 3);
+                    lineStr += ",";
+                    lineStr += GetArgId(inst, 4);
+                    lineStr += ",";
+                    lineStr += GetArgId(inst, 5);
+                    lineStr += "}";
+                    lineStr += ")";
+                  }
+                  else
+                  {
+                    showDxFuncName = true;
+                  }
+                  break;
+                }
                 case DXOp::Pack4x8:
                 {
                   // Pack4x8(packMode,x,y,z,w)
@@ -4215,6 +4314,23 @@ void Program::MakeRDDisassemblyString(const DXBC::Reflection *reflection)
                       lineStr += "QuadReadAcrossY";
                     else if(quadOpKind == QuadOpKind::ReadAcrossDiagonal)
                       lineStr += "QuadReadAcrossDiagonal";
+                    lineStr += "(";
+                    lineStr += GetArgId(inst, 1);
+                    lineStr += ")";
+                  }
+                  else
+                  {
+                    showDxFuncName = true;
+                  }
+                  break;
+                }
+                case DXOp::QuadVote:
+                {
+                  // SM6.7 QuadVote(cond,op)
+                  QuadVoteOpKind quadVoteOpKind;
+                  if(getival<QuadVoteOpKind>(inst.args[2], quadVoteOpKind))
+                  {
+                    lineStr += "Quad" + ToStr(quadVoteOpKind);
                     lineStr += "(";
                     lineStr += GetArgId(inst, 1);
                     lineStr += ")";
@@ -5402,19 +5518,24 @@ void Program::ParseReferences(const DXBC::Reflection *reflection)
                   m_ResourceByIdHandles[resultId] = m_ResourceByIdHandles.size();
                   m_ResourceReferences.push_back(resRef);
                   resName = resourceBase->name;
-                  uint32_t index = 0;
-                  if(getival<uint32_t>(inst.args[resIndexArgId], index))
+                  uint32_t arrayIndex = 0;
+                  if(getival<uint32_t>(inst.args[resIndexArgId], arrayIndex))
                   {
-                    if(index != resIndex)
+                    if(arrayIndex != resIndex)
                     {
                       if(resourceBase->regCount > 1)
-                        resName += StringFormat::Fmt("[%u]", index);
+                      {
+                        RDCASSERT(arrayIndex >= resourceBase->regBase);
+                        arrayIndex -= resourceBase->regBase;
+                        resName += StringFormat::Fmt("[%u]", arrayIndex);
+                      }
                     }
                   }
                   else
                   {
                     if(resourceBase->regCount > 1)
-                      resName += "[" + GetArgId(inst, resIndexArgId) + "]";
+                      resName += StringFormat::Fmt(
+                          "[%s - %u]", GetArgId(inst, resIndexArgId).c_str(), resourceBase->regBase);
                   }
                 }
                 if(!resName.isEmpty())
@@ -6185,6 +6306,8 @@ rdcpair<int32_t, int32_t> Program::ParseDIExpressionMD(const Metadata *expressio
           break;
         case DXIL::DW_OP::DW_OP_none: break;
         case DXIL::DW_OP::DW_OP_nop: break;
+        case DXIL::DW_OP::DW_OP_plus: RDCERR("DIExpression DW_OP_plus is not implemented"); break;
+        case DXIL::DW_OP::DW_OP_deref: break;
         default: RDCERR("Unhandled DIExpression op %s", ToStr(expression->op).c_str()); break;
       }
     }
@@ -6231,14 +6354,31 @@ SourceMappingInfo Program::ParseDbgOpDeclare(const DXIL::Instruction &inst) cons
   SourceMappingInfo ret;
   ret.isDeclare = true;
 
-  // arg 0 contains the SSA Id of the alloca result which represents the local variable (a pointer)
+  // arg 0 contains the SSA Id of the result which represents the local variable (a pointer)
   const Metadata *allocaInstMD = cast<Metadata>(inst.args[0]);
   RDCASSERT(allocaInstMD);
-  const Instruction *allocaInst = cast<Instruction>(allocaInstMD->value);
-  RDCASSERT(allocaInst);
-  RDCASSERTEQUAL(allocaInst->op, Operation::Alloca);
-  ret.dbgVarId = Program::GetResultSSAId(*allocaInst);
-  Program::MakeResultId(*allocaInst, ret.dbgVarName);
+  const DXIL::Value *value = allocaInstMD->value;
+  if(const Instruction *varInst = cast<Instruction>(value))
+  {
+    ret.dbgVarId = Program::GetResultSSAId(*varInst);
+    Program::MakeResultId(*varInst, ret.dbgVarName);
+  }
+  else if(const GlobalVar *gv = cast<GlobalVar>(value))
+  {
+    ret.dbgVarId = gv->ssaId;
+    rdcstr n = DXBC::BasicDemangle(gv->name);
+    DXIL::SanitiseName(n);
+    ret.dbgVarName = n;
+  }
+  else if(const Constant *c = cast<Constant>(value))
+  {
+    ret.dbgVarId = c->ssaId;
+    ret.dbgVarName = StringFormat::Fmt("%c%u", '_', c->ssaId);
+  }
+  else
+  {
+    RDCERR("Unhandled metadata value type %s", ToStr(value->kind()).c_str());
+  }
 
   // arg 1 is DILocalVariable metadata
   const Metadata *localVariableMD = cast<Metadata>(inst.args[1]);

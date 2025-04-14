@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -138,7 +138,7 @@ enum class GlobalShaderFlags : int64_t
   DerivativesInMeshAndAmpShaders = 0x1000000,
   ResourceDescriptorHeapIndexing = 0x2000000,
   SamplerDescriptorHeapIndexing = 0x4000000,
-  Reserved = 0x8000000,
+  WaveMatrix = 0x8000000,
   AtomicInt64OnHeapResource = 0x10000000,
   AdvancedTextureOps = 0x20000000,
   WriteableMSAATextures = 0x40000000,
@@ -176,6 +176,7 @@ static const uint32_t FOURCC_PSV0 = MAKE_FOURCC('P', 'S', 'V', '0');
 static const uint32_t FOURCC_RTS0 = MAKE_FOURCC('R', 'T', 'S', '0');
 static const uint32_t FOURCC_RDAT = MAKE_FOURCC('R', 'D', 'A', 'T');
 static const uint32_t FOURCC_VERS = MAKE_FOURCC('V', 'E', 'R', 'S');
+static const uint32_t FOURCC_SRCI = MAKE_FOURCC('S', 'R', 'C', 'I');
 
 struct RDEFHeader;
 
@@ -206,6 +207,7 @@ public:
   const IDebugInfo *GetDebugInfo() const { return m_DebugInfo; }
   const Reflection *GetReflection() const { return m_Reflection; }
   D3D_PRIMITIVE_TOPOLOGY GetOutputTopology();
+  ThreadScope GetThreadScope() const { return m_Threadscope; }
 
   CBufferVariableType GetRayPayload(const ShaderEntryPoint &entry)
   {
@@ -275,6 +277,7 @@ public:
 
 private:
   void TryFetchSeparateDebugInfo(bytebuf &byteCode, const rdcstr &debugInfoPath);
+  void ProcessSourceInfo(const byte *chunkContents, uint32_t size);
 
   bytebuf m_DebugShaderBlob;
   bytebuf m_ShaderBlob;
@@ -304,6 +307,7 @@ private:
 
   rdcflatmap<ShaderEntryPoint, rdcpair<CBufferVariableType, CBufferVariableType>> m_RayPayloads;
 
+  ThreadScope m_Threadscope = ThreadScope::Thread;
   ShaderStatistics m_ShaderStats;
   DXBCBytecode::Program *m_DXBCByteCode = NULL;
   DXIL::Program *m_DXILByteCode = NULL;

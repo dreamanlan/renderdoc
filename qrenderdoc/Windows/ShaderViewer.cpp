@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -4569,15 +4569,15 @@ bool ShaderViewer::updateWatchVariable(RDTreeWidgetItem *watchItem, const RDTree
         if(i == 0)
         {
           swatchColor = QColor(0, 0, 0, 255);
-          swatchColor.setRedF(f);
+          swatchColor.setRedF(ConvertLinearToSRGB(f));
         }
         else if(i == 1)
         {
-          swatchColor.setGreenF(f);
+          swatchColor.setGreenF(ConvertLinearToSRGB(f));
         }
         else
         {
-          swatchColor.setBlueF(f);
+          swatchColor.setBlueF(ConvertLinearToSRGB(f));
         }
       }
     }
@@ -4618,23 +4618,7 @@ bool ShaderViewer::updateWatchVariable(RDTreeWidgetItem *watchItem, const RDTree
   }
   else
   {
-    int h = ui->watch->fontMetrics().height();
-    QPixmap pm(1, 1);
-    pm.fill(swatchColor);
-    pm = pm.scaled(QSize(h, h));
-
-    {
-      QPainter painter(&pm);
-
-      QPen pen(ui->watch->palette().foreground(), 1.0);
-      painter.setPen(pen);
-      painter.drawLine(QPoint(0, 0), QPoint(h - 1, 0));
-      painter.drawLine(QPoint(h - 1, 0), QPoint(h - 1, h - 1));
-      painter.drawLine(QPoint(h - 1, h - 1), QPoint(0, h - 1));
-      painter.drawLine(QPoint(0, h - 1), QPoint(0, 0));
-    }
-
-    watchItem->setIcon(3, QIcon(pm));
+    watchItem->setIcon(3, MakeSwatchIcon(ui->watch, swatchColor));
   }
 
   watchItem->setText(3, val);

@@ -50,6 +50,46 @@ class Iter_Test(rdtest.TestCase):
 
         rdtest.log.success('Successfully saved images at {}'.format(action.eventId))
 
+    def compute_debug(self, action: rd.ActionDescription):
+        pipe: rd.PipeState = self.controller.GetPipelineState()
+
+        refl: rd.ShaderReflection = pipe.GetShaderReflection(rd.ShaderStage.Compute)
+
+        if pipe.GetShader(rd.ShaderStage.Compute) == rd.ResourceId.Null():
+            rdtest.log.print(f"No compute shader bound at {action.eventId}")
+            return
+
+        if not (action.flags & rd.ActionFlags.Dispatch) and action.drawIndex == 0:
+            rdtest.log.print(f"{action.eventId} is not a debuggable action")
+            return
+
+        wgSize = action.dispatchDimension
+        if any(dim == 0 for dim in wgSize):
+            rdtest.log.print(f"Empty dispatch ({wgSize[0]}x{wgSize[1]}x{wgSize[2]}), skipping")
+            return
+
+        groupid = [0,0,0]
+        for i in range(3):
+            groupid[i] = random.randint(0, wgSize[i]-1)
+
+        threadid = [0,0,0]
+        for i in range(3):
+            threadid[i] = random.randint(0, refl.dispatchThreadsDimension[i]-1)
+
+        rdtest.log.print(f"Debug Thread Workgroup:{wgSize} groupid:{tuple(groupid)} threadid:{tuple(threadid)}")
+        trace: rd.ShaderDebugTrace = self.controller.DebugThread(tuple(groupid), tuple(threadid))
+
+        if trace.debugger is None:
+            self.controller.FreeTrace(trace)
+            rdtest.log.print("No debug result")
+            return
+
+        cycles, variables = self.process_trace(trace)
+
+        rdtest.log.success(f'Successfully debugged compute shader in {cycles} cycles {len(refl.outputSignature)}')
+
+        self.controller.FreeTrace(trace)
+
     def vert_debug(self, action: rd.ActionDescription):
         pipe: rd.PipeState = self.controller.GetPipelineState()
 
@@ -310,14 +350,21 @@ class Iter_Test(rdtest.TestCase):
                         if debugged.value.u32v[idx] == 0xcccccccc:
                             debuggedValue[idx] = lastmod.shaderOut.col.floatValue[idx]
 
+                    historyValue = list(lastmod.shaderOut.col.floatValue)
+
+                    tex = self.get_texture(target)
+
+                    historyValue = historyValue[0:tex.format.compCount]
+                    debuggedValue = debuggedValue[0:tex.format.compCount]
+
                     # Unfortunately we can't ever trust that we should get back a matching results, because some shaders
                     # rely on undefined/inaccurate maths that we don't emulate.
                     # So the best we can do is log an error for manual verification
-                    is_eq, diff_amt = rdtest.value_compare_diff(lastmod.shaderOut.col.floatValue, debuggedValue, eps=5.0E-06)
+                    is_eq, diff_amt = rdtest.value_compare_diff(historyValue, debuggedValue, eps=5.0E-06)
                     if not is_eq:
                         rdtest.log.error(
                             "Debugged value {} at EID {} {},{}: {} difference. {} doesn't exactly match history shader output {}".format(
-                                debugged.name, lastmod.eventId, x, y, diff_amt, debuggedValue, lastmod.shaderOut.col.floatValue))
+                                debugged.name, lastmod.eventId, x, y, diff_amt, debuggedValue, historyValue))
 
                     rdtest.log.success('Successfully debugged pixel in {} cycles, result matches'.format(cycles))
                 else:
@@ -364,6 +411,7 @@ class Iter_Test(rdtest.TestCase):
 
         test_chance = 0.1       # Chance of doing anything at all
         do_image_save = 0.25    # Chance of saving images of the outputs
+        do_compute_debug = 1.0  # Chance of debugging a compute thread
         do_vert_debug = 1.0     # Chance of debugging a vertex (if valid)
         do_pixel_debug = 1.0    # Chance of doing pixel history at the current event and debugging a pixel (if valid)
         mesh_output = 1.0       # Chance of fetching mesh output data
@@ -373,6 +421,7 @@ class Iter_Test(rdtest.TestCase):
 
         event_tests = {
             'Image Save': {'chance': do_image_save, 'func': self.image_save},
+            'Compute Debug': {'chance': do_compute_debug, 'func': self.compute_debug},
             'Vertex Debug': {'chance': do_vert_debug, 'func': self.vert_debug},
             'Pixel History & Debug': {'chance': do_pixel_debug, 'func': self.pixel_debug},
             'Mesh Output': {'chance': mesh_output, 'func': self.mesh_output},
@@ -409,6 +458,11 @@ class Iter_Test(rdtest.TestCase):
                         break
                     else:
                         c -= chance
+
+                fatal = self.controller.GetFatalErrorStatus()
+                if fatal.code != rd.ResultCode.Succeeded:
+                    rdtest.log.error(f"Fatal error detected: {fatal.Message()}")
+                    break
 
             action = action.next
 

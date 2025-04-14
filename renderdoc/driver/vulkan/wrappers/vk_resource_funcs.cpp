@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -506,7 +506,7 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   VkMemoryAllocateFlagsInfo *memFlags = (VkMemoryAllocateFlagsInfo *)FindNextStruct(
       &unwrapped, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
 
-  static VkMemoryAllocateFlagsInfo rtForcedFlags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  VkMemoryAllocateFlagsInfo rtForcedFlags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
 
   // massive wart and oversight in RT APIs. ASs are bound to buffers which are then bound to memory.
   // Buffers are not required to be BDA, but we need them to be BDA capture/replay'd in order to
@@ -514,19 +514,29 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   // will be bound against since there's no requirement for the buffer to be marked as BDA. This
   // means that when RT is enabled ALL MEMORY IN THE ENTIRE PROGRAM must be marked as BDA just in
   // case.
+  //
+  // we don't force this on for memory allocations that are going to be used for dedicated images
+  bool forceBDA = false;
   if(IsCaptureMode(m_State) && AccelerationStructures())
   {
-    // force BDA flag when creating, by adding the struct if needed
-    if(memFlags)
+    VkMemoryDedicatedAllocateInfo *dedicated = (VkMemoryDedicatedAllocateInfo *)FindNextStruct(
+        pAllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    if(dedicated == NULL || dedicated->image == VK_NULL_HANDLE)
     {
-      memFlags->flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    }
-    else
-    {
-      rtForcedFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT |
-                            VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
-      rtForcedFlags.pNext = unwrapped.pNext;
-      unwrapped.pNext = &rtForcedFlags;
+      // force BDA flag when creating, by adding the struct if needed
+      forceBDA = true;
+
+      if(memFlags)
+      {
+        memFlags->flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+      }
+      else
+      {
+        rtForcedFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT |
+                              VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+        rtForcedFlags.pNext = unwrapped.pNext;
+        unwrapped.pNext = &rtForcedFlags;
+      }
     }
   }
 
@@ -690,7 +700,7 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
           &serialisedInfo, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
 
       // see above for this gross workaround we have to do
-      if(AccelerationStructures())
+      if(forceBDA)
       {
         if(memFlags)
         {
@@ -713,16 +723,29 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
             Unwrap(*pMemory),
         };
 
-        memoryDeviceAddress.opaqueCaptureAddress =
+        VkMemoryOpaqueCaptureAddressAllocateInfo *addr =
+            (VkMemoryOpaqueCaptureAddressAllocateInfo *)FindNextStruct(
+                &serialisedInfo, VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
+
+        uint64_t opaque =
             ObjDisp(device)->GetDeviceMemoryOpaqueCaptureAddress(Unwrap(device), &getInfo);
 
-        // we explicitly DON'T assert on this, because some drivers will only need the device
-        // address specified at allocate time.
-        // RDCASSERT(memoryDeviceAddress.opaqueCaptureAddress);
+        if(addr)
+        {
+          RDCASSERT(addr->opaqueCaptureAddress == opaque, addr->opaqueCaptureAddress, opaque);
+        }
+        else
+        {
+          memoryDeviceAddress.opaqueCaptureAddress = opaque;
 
-        // push this struct onto the start of the chain
-        memoryDeviceAddress.pNext = serialisedInfo.pNext;
-        serialisedInfo.pNext = &memoryDeviceAddress;
+          // we explicitly DON'T assert on this, because some drivers will only need the device
+          // address specified at allocate time.
+          // RDCASSERT(memoryDeviceAddress.opaqueCaptureAddress);
+
+          // push this struct onto the start of the chain
+          memoryDeviceAddress.pNext = serialisedInfo.pNext;
+          serialisedInfo.pNext = &memoryDeviceAddress;
+        }
 
         memFlags->flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
 
@@ -1748,15 +1771,16 @@ bool WrappedVulkan::Serialise_vkCreateBuffer(SerialiserType &ser, VkDevice devic
   {
     VkBuffer buf = VK_NULL_HANDLE;
 
-    VkBufferUsageFlags origusage = CreateInfo.usage;
-
+    uint64_t origusage = GetBufferUsageFlags(&CreateInfo);
+    uint64_t patchedusage = origusage;
     // ensure we can always readback from buffers
-    CreateInfo.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    patchedusage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
     // we only need to add TRANSFER_DST_BIT for dedicated buffers, but there's not a reliable way to
     // know if a buffer will be dedicated-allocation or not. We assume that TRANSFER_DST is
     // effectively free as a usage bit for all sensible implementations so we just add it here.
-    CreateInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    patchedusage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    SetBufferUsageFlags(&CreateInfo, patchedusage);
 
     // remap the queue family indices
     if(CreateInfo.sharingMode == VK_SHARING_MODE_CONCURRENT)
@@ -1774,13 +1798,7 @@ bool WrappedVulkan::Serialise_vkCreateBuffer(SerialiserType &ser, VkDevice devic
 
     VkResult ret = ObjDisp(device)->CreateBuffer(Unwrap(device), &patched, NULL, &buf);
 
-    if(CreateInfo.flags &
-       (VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT))
-    {
-      APIProps.SparseResources = true;
-    }
-
-    CreateInfo.usage = origusage;
+    SetBufferUsageFlags(&CreateInfo, origusage);
 
     if(ret != VK_SUCCESS)
     {
@@ -1797,6 +1815,34 @@ bool WrappedVulkan::Serialise_vkCreateBuffer(SerialiserType &ser, VkDevice devic
                                          memoryRequirements);
     }
 
+    if(CreateInfo.flags &
+       (VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT))
+    {
+      APIProps.SparseResources = true;
+
+      // for sparse BDA buffers we can and must request the address now since it won't be queried on memory bind
+      if(CreateInfo.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+      {
+        VulkanCreationInfo::Buffer &bufInfo = m_CreationInfo.m_Buffer[GetResID(buf)];
+
+        VkBufferDeviceAddressInfo getInfo = {
+            VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            NULL,
+            Unwrap(buf),
+        };
+
+        RDCCOMPILE_ASSERT(VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO ==
+                              VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT,
+                          "KHR and EXT buffer_device_address should be interchangeable here.");
+
+        if(GetExtensions(GetRecord(device)).ext_KHR_buffer_device_address)
+          bufInfo.gpuAddress = ObjDisp(device)->GetBufferDeviceAddress(Unwrap(device), &getInfo);
+        else if(GetExtensions(GetRecord(device)).ext_EXT_buffer_device_address)
+          bufInfo.gpuAddress = ObjDisp(device)->GetBufferDeviceAddressEXT(Unwrap(device), &getInfo);
+        m_CreationInfo.m_BufferAddresses[bufInfo.gpuAddress] = GetResID(buf);
+      }
+    }
+
     AddResource(Buffer, ResourceType::Buffer, "Buffer");
     DerivedResource(device, Buffer);
   }
@@ -1811,27 +1857,29 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
 
   // if you change any properties here, ensure you also update
   // vkGetDeviceBufferMemoryRequirementsKHR
-
+  uint64_t adjusted_usage = GetBufferUsageFlags(&adjusted_info);
   // TEMP HACK: Until we define a portable fake hardware, need to match the requirements for usage
   // on replay, so that the memory requirements are the same
-  adjusted_info.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  adjusted_usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
   // we only need to add TRANSFER_DST_BIT for dedicated buffers, but there's not a reliable way to
   // know if a buffer will be dedicated-allocation or not. We assume that TRANSFER_DST is
   // effectively free as a usage bit for all sensible implementations so we just add it here.
-  adjusted_info.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  adjusted_usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
   if(IsCaptureMode(m_State))
   {
-    // If we're using this buffer for AS storage we need to enable BDA
-    if(adjusted_info.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
-      adjusted_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    // If we're using this buffer for AS or OMM storage we need to enable BDA
+    if(adjusted_usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
+      adjusted_usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
     // If we're using this buffer for device addresses, ensure we force on capture replay bit.
     // We ensured the physical device can support this feature before whitelisting the extension.
-    if(adjusted_info.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    if(adjusted_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
       adjusted_info.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
   }
+
+  SetBufferUsageFlags(&adjusted_info, adjusted_usage);
 
   byte *tempMem = GetTempMemory(GetNextPatchSize(adjusted_info.pNext));
 
@@ -1860,14 +1908,16 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
       VkResourceRecord *record = GetResourceManager()->AddResourceRecord(*pBuffer);
       record->memSize = serialisedCreateInfo.size;
 
+      uint64_t serialisedUsage = GetBufferUsageFlags(&serialisedCreateInfo);
       // If we're using this buffer for AS storage we need to enable BDA
-      if(serialisedCreateInfo.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
-        serialisedCreateInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+      if(serialisedUsage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
+        serialisedUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+      SetBufferUsageFlags(&serialisedCreateInfo, serialisedUsage);
 
       // if we're using VK_[KHR|EXT]_buffer_device_address, we fetch the device address that's been
       // allocated and insert it into the next chain and patch the flags so that it replays
       // naturally.
-      if((serialisedCreateInfo.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0)
+      if((serialisedUsage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0)
       {
         VkBufferDeviceAddressInfo getInfo = {
             VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
@@ -1877,16 +1927,30 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
 
         if(GetExtensions(GetRecord(device)).ext_KHR_buffer_device_address)
         {
-          bufferDeviceAddressCoreOrKHR.opaqueCaptureAddress =
-              ObjDisp(device)->GetBufferOpaqueCaptureAddress(Unwrap(device), &getInfo);
+          VkBufferOpaqueCaptureAddressCreateInfo *addr =
+              (VkBufferOpaqueCaptureAddressCreateInfo *)FindNextStruct(
+                  &serialisedCreateInfo, VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO);
 
-          // we explicitly DON'T assert on this, because some drivers will only need the device
-          // address specified at allocate time.
-          // RDCASSERT(bufferDeviceAddressKHR.opaqueCaptureAddress);
+          uint64_t opaque = ObjDisp(device)->GetBufferOpaqueCaptureAddress(Unwrap(device), &getInfo);
 
-          // push this struct onto the start of the chain
-          bufferDeviceAddressCoreOrKHR.pNext = serialisedCreateInfo.pNext;
-          serialisedCreateInfo.pNext = &bufferDeviceAddressCoreOrKHR;
+          if(addr)
+          {
+            RDCASSERT(opaque == addr->opaqueCaptureAddress, opaque, addr->opaqueCaptureAddress);
+          }
+          else
+          {
+            addr = &bufferDeviceAddressCoreOrKHR;
+
+            bufferDeviceAddressCoreOrKHR.opaqueCaptureAddress = opaque;
+
+            // we explicitly DON'T assert on this, because some drivers will only need the device
+            // address specified at allocate time.
+            // RDCASSERT(bufferDeviceAddressKHR.opaqueCaptureAddress);
+
+            // push this struct onto the start of the chain
+            bufferDeviceAddressCoreOrKHR.pNext = serialisedCreateInfo.pNext;
+            serialisedCreateInfo.pNext = &bufferDeviceAddressCoreOrKHR;
+          }
         }
         else if(GetExtensions(GetRecord(device)).ext_EXT_buffer_device_address)
         {
@@ -1928,8 +1992,9 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
 
       record->AddChunk(chunk);
 
-      record->storable = (pCreateInfo->usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                                VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)) != 0;
+      record->storable =
+          (GetBufferUsageFlags(pCreateInfo) &
+           (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)) != 0;
 
       bool isSparse = (pCreateInfo->flags & (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
                                              VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT)) != 0;

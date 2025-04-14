@@ -8,6 +8,7 @@ from . import util
 from . import analyse
 from . import capture
 from .logging import log, TestFailureException
+from typing import List
 
 
 class ShaderVariableCheck:
@@ -167,7 +168,7 @@ class TestCase:
     def set_test_list(tests):
         TestCase._test_list = tests
 
-    def check_support(self):
+    def check_support(self, **kwargs):
         if self.demos_test_name != '':
             if self.demos_test_name not in TestCase._test_list:
                 return False,'Test {} not in compiled tests'.format(self.demos_test_name)
@@ -383,6 +384,34 @@ class TestCase:
         attrs = analyse.get_postvs_attrs(self.controller, mesh, data_stage)
 
         return analyse.decode_mesh_data(self.controller, indices, in_indices, attrs, 0, mesh.baseVertex)
+
+    def parse_shader_var_type(self, varType):
+        scalarType = varType
+        countElems = 1
+        if str(varType[-1]).isdigit():
+            if str(varType[-2]).isdigit():
+                scalarType = varType[:-2]
+                countElems = int(varType[-2:])
+            else:
+                scalarType = varType[:-1]
+                countElems = int(varType[-1:])
+        return (scalarType, countElems)
+        
+    def get_source_shader_var_value(self, sourceVars: List[rd.SourceVariableMapping], name, varType, debuggerVars):
+        sourceVar = [v for v in sourceVars if v.name == name]
+        if len(sourceVar) != 1:
+            raise TestFailureException(f"Couldn't find source variable {name} {varType}")
+
+        scalarType, countElems = self.parse_shader_var_type(varType)
+
+        debugged = self.evaluate_source_var(sourceVar[0], debuggerVars)
+        if scalarType == 'float':
+            return list(debugged.value.f32v[0:countElems])
+        elif scalarType == 'int':
+            return list(debugged.value.s32v[0:countElems])
+        else:
+            raise TestFailureException(f"Unhandled scalarType {scalarType} {varType}")
+        return None
 
     def check_task_data(self, task_ref, task_data):
         for idx in task_ref:
@@ -677,10 +706,10 @@ class TestCase:
 
             raise KeyError("Couldn't find {} in debug vars".format(path))
 
-        raise KeyError("Couldn't parse path {}".format(path))
+        raise KeyError(f"Couldn't find '{path}' in debug vars or parse it")
 
 
-    def evaluate_source_var(self, sourceVar: rd.SourceVariableMapping, debugVars):
+    def evaluate_source_var(self, sourceVar: rd.SourceVariableMapping, debugVars) -> rd.ShaderVariable:
         debugged = rd.ShaderVariable()
         debugged.name = sourceVar.name
         debugged.type = sourceVar.type
@@ -793,3 +822,73 @@ class TestCase:
             raise TestFailureException("Recompressed capture file doesn't match re-imported capture file", conv_path, recomp_path, conv_zipxml_path)
 
         log.success("Recompressed and re-imported capture files are identical")
+
+    def check_debug_pixel(self, x: int, y: int):
+        pipe: rd.PipeState = self.controller.GetPipelineState()
+        if not pipe.GetShaderReflection(rd.ShaderStage.Pixel).debugInfo.debuggable:
+            log.print("Skipping undebuggable shader.")
+            return 
+
+        # Debug the shader
+        trace = self.controller.DebugPixel(x, y, rd.DebugPixelInputs())
+        if trace.debugger is None:
+            self.controller.FreeTrace(trace)
+            raise TestFailureException(f"Pixel shader could not be debugged.")
+
+        _, variables = self.process_trace(trace)
+        output = self.find_output_source_var(trace, rd.ShaderBuiltin.ColorOutput, 0)
+        debugged = self.evaluate_source_var(output, variables)
+        self.controller.FreeTrace(trace)
+
+        try:
+            self.check_pixel_value(pipe.GetOutputTargets()[0].resource, x, y, debugged.value.f32v[0:4])
+        except TestFailureException as ex:
+            raise TestFailureException(f"Pixel shader did not debug correctly. {ex}")
+
+        log.success(f"Pixel shader debugging at {x},{y} was successful")
+
+    def decode_task_data(self, controller: rd.ReplayController, mesh: rd.MeshFormat, payload: rd.ConstantBlock, task: int = 0):
+
+        begin = mesh.vertexByteOffset + mesh.vertexByteStride * task
+        end = min(begin + mesh.vertexByteSize, 0xffffffffffffffff)
+        buffer_data = controller.GetBufferData(mesh.vertexResourceId, begin, end -begin)
+
+        ret = []
+        offset = 0
+        for var in payload.variables:
+            var_data = {}
+            var_data[var.name] = []
+            # This is not complete to decode all possible payload layouts
+            for i in range(var.type.elements):
+                format = rd.ResourceFormat()
+                format.compByteWidth = rd.VarTypeByteSize(var.type.baseType)
+                format.compCount = var.type.columns
+                format.compType = rd.VarTypeCompType(var.type.baseType)
+                format.type = rd.ResourceFormatType.Regular
+
+                data =  analyse.unpack_data(format, buffer_data, offset)
+                var_data[var.name] += data
+                offset += format.compByteWidth * format.compCount
+            ret.append(var_data)
+
+        return ret
+
+    def get_task_data(self, action: rd.ActionDescription):
+        mesh: rd.MeshFormat = self.controller.GetPostVSData(0, 0, rd.MeshDataStage.TaskOut)
+        if mesh.numIndices == 0:
+            raise TestFailureException("Task data is empty")
+
+        if len(mesh.taskSizes) == 0:
+            raise TestFailureException("Task data is empty")
+
+        pipe: rd.PipeState = self.controller.GetPipelineState()
+        shader = pipe.GetShaderReflection(rd.ShaderStage.Task)
+        taskIdx = 0
+        task = action.dispatchDimension
+        data = []
+        for x in range(task[0]):
+            for y in range(task[1]):
+                for z in range(task[2]):
+                    data += self.decode_task_data(self.controller, mesh, shader.taskPayload, taskIdx)
+                    taskIdx += 1
+        return data

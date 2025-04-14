@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,16 +29,22 @@
 
 RDOC_EXTERN_CONFIG(bool, Replay_Debug_SingleThreadedCompilation);
 
-static RDResult DeferredPipelineCompile(VkDevice device,
+RDOC_CONFIG(bool, Vulkan_Debug_UsePipelineCacheForReplay, true,
+            "Use application-provided pipeline cache when compiling shaders on replay");
+
+static RDResult DeferredPipelineCompile(VkDevice device, VkPipelineCache pipelineCache,
                                         const VkGraphicsPipelineCreateInfo &createInfo,
                                         WrappedVkPipeline *wrappedPipe)
 {
+  if(!Vulkan_Debug_UsePipelineCacheForReplay())
+    pipelineCache = VK_NULL_HANDLE;
+
   byte *mem = AllocAlignedBuffer(GetNextPatchSize(&createInfo));
   VkGraphicsPipelineCreateInfo *unwrapped =
       UnwrapStructAndChain(CaptureState::LoadingReplaying, mem, &createInfo);
 
   VkPipeline realPipe;
-  VkResult ret = ObjDisp(device)->CreateGraphicsPipelines(Unwrap(device), VK_NULL_HANDLE, 1,
+  VkResult ret = ObjDisp(device)->CreateGraphicsPipelines(Unwrap(device), Unwrap(pipelineCache), 1,
                                                           unwrapped, NULL, &realPipe);
 
   FreeAlignedBuffer((byte *)unwrapped);
@@ -54,16 +60,19 @@ static RDResult DeferredPipelineCompile(VkDevice device,
   return ResultCode::Succeeded;
 }
 
-static RDResult DeferredPipelineCompile(VkDevice device,
+static RDResult DeferredPipelineCompile(VkDevice device, VkPipelineCache pipelineCache,
                                         const VkComputePipelineCreateInfo &createInfo,
                                         WrappedVkPipeline *wrappedPipe)
 {
+  if(!Vulkan_Debug_UsePipelineCacheForReplay())
+    pipelineCache = VK_NULL_HANDLE;
+
   byte *mem = AllocAlignedBuffer(GetNextPatchSize(&createInfo));
   VkComputePipelineCreateInfo *unwrapped =
       UnwrapStructAndChain(CaptureState::LoadingReplaying, mem, &createInfo);
 
   VkPipeline realPipe;
-  VkResult ret = ObjDisp(device)->CreateComputePipelines(Unwrap(device), VK_NULL_HANDLE, 1,
+  VkResult ret = ObjDisp(device)->CreateComputePipelines(Unwrap(device), Unwrap(pipelineCache), 1,
                                                          unwrapped, NULL, &realPipe);
 
   FreeAlignedBuffer((byte *)unwrapped);
@@ -79,12 +88,15 @@ static RDResult DeferredPipelineCompile(VkDevice device,
   return ResultCode::Succeeded;
 }
 
-static RDResult DeferredPipelineCompile(VkDevice device,
+static RDResult DeferredPipelineCompile(VkDevice device, VkPipelineCache pipelineCache,
                                         const VkRayTracingPipelineCreateInfoKHR &createInfo,
                                         const bytebuf &replayHandles,
                                         uint32_t captureReplayHandleSize,
                                         WrappedVkPipeline *wrappedPipe)
 {
+  if(!Vulkan_Debug_UsePipelineCacheForReplay())
+    pipelineCache = VK_NULL_HANDLE;
+
   byte *mem = AllocAlignedBuffer(GetNextPatchSize(&createInfo));
   VkRayTracingPipelineCreateInfoKHR *unwrapped =
       UnwrapStructAndChain(CaptureState::LoadingReplaying, mem, &createInfo);
@@ -98,7 +110,7 @@ static RDResult DeferredPipelineCompile(VkDevice device,
 
   VkPipeline realPipe;
   VkResult ret = ObjDisp(device)->CreateRayTracingPipelinesKHR(
-      Unwrap(device), VK_NULL_HANDLE, VK_NULL_HANDLE, 1, unwrapped, NULL, &realPipe);
+      Unwrap(device), VK_NULL_HANDLE, Unwrap(pipelineCache), 1, unwrapped, NULL, &realPipe);
 
   FreeAlignedBuffer((byte *)unwrapped);
 
@@ -131,7 +143,7 @@ VkComputePipelineCreateInfo *WrappedVulkan::UnwrapInfos(CaptureState state,
     unwrapped[i] = info[i];
     unwrapped[i].stage.module = Unwrap(unwrapped[i].stage.module);
     unwrapped[i].layout = Unwrap(unwrapped[i].layout);
-    if(unwrapped[i].flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+    if(GetPipelineCreateFlags(&unwrapped[i]) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
       unwrapped[i].basePipelineHandle = Unwrap(unwrapped[i].basePipelineHandle);
   }
 
@@ -172,7 +184,7 @@ VkGraphicsPipelineCreateInfo *WrappedVulkan::UnwrapInfos(CaptureState state,
     unwrappedInfos[i].pStages = unwrappedStages;
     unwrappedInfos[i].layout = Unwrap(unwrappedInfos[i].layout);
     unwrappedInfos[i].renderPass = Unwrap(unwrappedInfos[i].renderPass);
-    if(unwrappedInfos[i].flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+    if(GetPipelineCreateFlags(&unwrappedInfos[i]) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
       unwrappedInfos[i].basePipelineHandle = Unwrap(unwrappedInfos[i].basePipelineHandle);
 
     UnwrapNextChain(state, "VkGraphicsPipelineCreateInfo", tempMem,
@@ -557,7 +569,7 @@ VkResult WrappedVulkan::vkCreateShadersEXT(VkDevice device, uint32_t createInfoC
     // shader binaries aren't supported, and any calls to vkGetShaderBinaryData should return a
     // valid but incompatible UUID
     if(pCreateInfos[i].codeType == VK_SHADER_CODE_TYPE_BINARY_EXT)
-      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+      return VK_INCOMPATIBLE_SHADER_BINARY_EXT;
     else
       pShaders[i] = VK_NULL_HANDLE;
   }
@@ -660,18 +672,7 @@ VkResult WrappedVulkan::vkCreatePipelineCache(VkDevice device,
                                               const VkAllocationCallbacks *,
                                               VkPipelineCache *pPipelineCache)
 {
-  // pretend the user didn't provide any cache data
-
   VkPipelineCacheCreateInfo createInfo = *pCreateInfo;
-  createInfo.initialDataSize = 0;
-  createInfo.pInitialData = NULL;
-
-  if(pCreateInfo->initialDataSize > 0)
-  {
-    RDCWARN(
-        "Application provided pipeline cache data! This is invalid, as RenderDoc reports "
-        "incompatibility with previous caches");
-  }
 
   VkResult ret;
   SERIALISE_TIME_CALL(ret = ObjDisp(device)->CreatePipelineCache(Unwrap(device), &createInfo, NULL,
@@ -726,28 +727,26 @@ bool WrappedVulkan::Serialise_vkCreateGraphicsPipelines(
     VkPipeline pipe = VK_NULL_HANDLE;
 
     VkRenderPass origRP = CreateInfo.renderPass;
-    VkPipelineCache origCache = pipelineCache;
-
-    // don't use pipeline caches on replay
-    pipelineCache = VK_NULL_HANDLE;
-
+    uint64_t createFlags = GetPipelineCreateFlags(&CreateInfo);
     // if we have pipeline executable properties, capture the data
     if(GetExtensions(NULL).ext_KHR_pipeline_executable_properties)
     {
-      CreateInfo.flags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
-                           VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+      createFlags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                      VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
     }
 
     // don't fail when a compile is required because we don't currently replay caches so this will
     // always happen. This still allows application to use this flag at runtime where it will be
     // valid
-    CreateInfo.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    createFlags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
     // disable pipeline derivatives, because I don't think any driver actually uses them and it
     // would require a job-wait for the parent
-    CreateInfo.flags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
+    createFlags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
     CreateInfo.basePipelineHandle = VK_NULL_HANDLE;
     CreateInfo.basePipelineIndex = -1;
+
+    SetPipelineCreateFlags(&CreateInfo, createFlags);
 
     // we steal the serialised create info here so we can pass it to jobs without its contents and
     // all of the allocated structures and arrays being deserialised. We add a job which waits on
@@ -852,9 +851,9 @@ bool WrappedVulkan::Serialise_vkCreateGraphicsPipelines(
     }
 
     DerivedResource(device, Pipeline);
-    if(origCache != VK_NULL_HANDLE)
-      DerivedResource(origCache, Pipeline);
-    if(OrigCreateInfo.flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+    if(pipelineCache != VK_NULL_HANDLE)
+      DerivedResource(pipelineCache, Pipeline);
+    if(GetPipelineCreateFlags(&OrigCreateInfo) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
     {
       if(OrigCreateInfo.basePipelineHandle != VK_NULL_HANDLE)
         DerivedResource(OrigCreateInfo.basePipelineHandle, Pipeline);
@@ -887,8 +886,8 @@ bool WrappedVulkan::Serialise_vkCreateGraphicsPipelines(
     {
       for(rdcpair<VkGraphicsPipelineCreateInfo, VkPipeline> &deferredPipe : pipelinesToCompile)
       {
-        RDResult res =
-            DeferredPipelineCompile(device, deferredPipe.first, GetWrapped(deferredPipe.second));
+        RDResult res = DeferredPipelineCompile(device, pipelineCache, deferredPipe.first,
+                                               GetWrapped(deferredPipe.second));
 
         if(res != ResultCode::Succeeded)
         {
@@ -908,10 +907,11 @@ bool WrappedVulkan::Serialise_vkCreateGraphicsPipelines(
       {
         WrappedVkPipeline *wrappedPipe = GetWrapped(deferredPipe.second);
         wrappedPipe->deferredJob = Threading::JobSystem::AddJob(
-            [wrappedVulkan = this, device, createInfo = deferredPipe.first, wrappedPipe]() {
+            [wrappedVulkan = this, device, pipelineCache, createInfo = deferredPipe.first,
+             wrappedPipe]() {
               PerformanceTimer timer;
               wrappedVulkan->CheckDeferredResult(
-                  DeferredPipelineCompile(device, createInfo, wrappedPipe));
+                  DeferredPipelineCompile(device, pipelineCache, createInfo, wrappedPipe));
               wrappedVulkan->AddDeferredTime(timer.GetMilliseconds());
             },
             parents);
@@ -963,7 +963,7 @@ VkResult WrappedVulkan::vkCreateGraphicsPipelines(VkDevice device, VkPipelineCac
           VkGraphicsPipelineCreateInfo modifiedCreateInfo;
           const VkGraphicsPipelineCreateInfo *createInfo = &pCreateInfos[i];
 
-          if(createInfo->flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+          if(GetPipelineCreateFlags(createInfo) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
           {
             // since we serialise one by one, we need to fixup basePipelineIndex
             if(createInfo->basePipelineIndex != -1 && createInfo->basePipelineIndex < (int)i)
@@ -986,7 +986,7 @@ VkResult WrappedVulkan::vkCreateGraphicsPipelines(VkDevice device, VkPipelineCac
         VkResourceRecord *record = GetResourceManager()->AddResourceRecord(pPipelines[i]);
         record->AddChunk(chunk);
 
-        if(pCreateInfos[i].flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+        if(GetPipelineCreateFlags(&pCreateInfos[i]) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
         {
           if(pCreateInfos[i].basePipelineHandle != VK_NULL_HANDLE)
           {
@@ -1073,29 +1073,26 @@ bool WrappedVulkan::Serialise_vkCreateComputePipelines(SerialiserType &ser, VkDe
   if(IsReplayingAndReading())
   {
     VkPipeline pipe = VK_NULL_HANDLE;
-
-    VkPipelineCache origCache = pipelineCache;
-
-    // don't use pipeline caches on replay
-    pipelineCache = VK_NULL_HANDLE;
-
+    uint64_t createFlags = GetPipelineCreateFlags(&CreateInfo);
     // if we have pipeline executable properties, capture the data
     if(GetExtensions(NULL).ext_KHR_pipeline_executable_properties)
     {
-      CreateInfo.flags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
-                           VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+      createFlags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                      VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
     }
 
     // don't fail when a compile is required because we don't currently replay caches so this will
     // always happen. This still allows application to use this flag at runtime where it will be
     // valid
-    CreateInfo.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    createFlags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
     // disable pipeline derivatives, because I don't think any driver actually uses them and it
     // would require a job-wait for the parent
-    CreateInfo.flags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
+    createFlags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
     CreateInfo.basePipelineHandle = VK_NULL_HANDLE;
     CreateInfo.basePipelineIndex = -1;
+
+    SetPipelineCreateFlags(&CreateInfo, createFlags);
 
     // we steal the serialised create info here so we can pass it to jobs without its contents and
     // all of the allocated structures and arrays being deserialised. We add a job which waits on
@@ -1152,7 +1149,7 @@ bool WrappedVulkan::Serialise_vkCreateComputePipelines(SerialiserType &ser, VkDe
 
     if(Replay_Debug_SingleThreadedCompilation())
     {
-      RDResult res = DeferredPipelineCompile(device, OrigCreateInfo, GetWrapped(pipe));
+      RDResult res = DeferredPipelineCompile(device, pipelineCache, OrigCreateInfo, GetWrapped(pipe));
       Deserialise(OrigCreateInfo);
 
       if(res != ResultCode::Succeeded)
@@ -1164,11 +1161,11 @@ bool WrappedVulkan::Serialise_vkCreateComputePipelines(SerialiserType &ser, VkDe
     else
     {
       WrappedVkPipeline *wrappedPipe = GetWrapped(pipe);
-      wrappedPipe->deferredJob =
-          Threading::JobSystem::AddJob([wrappedVulkan = this, device, OrigCreateInfo, wrappedPipe]() {
+      wrappedPipe->deferredJob = Threading::JobSystem::AddJob(
+          [wrappedVulkan = this, device, pipelineCache, OrigCreateInfo, wrappedPipe]() {
             PerformanceTimer timer;
             wrappedVulkan->CheckDeferredResult(
-                DeferredPipelineCompile(device, OrigCreateInfo, wrappedPipe));
+                DeferredPipelineCompile(device, pipelineCache, OrigCreateInfo, wrappedPipe));
             wrappedVulkan->AddDeferredTime(timer.GetMilliseconds());
 
             Deserialise(OrigCreateInfo);
@@ -1176,9 +1173,9 @@ bool WrappedVulkan::Serialise_vkCreateComputePipelines(SerialiserType &ser, VkDe
     }
 
     DerivedResource(device, Pipeline);
-    if(origCache != VK_NULL_HANDLE)
-      DerivedResource(origCache, Pipeline);
-    if(OrigCreateInfo.flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+    if(pipelineCache != VK_NULL_HANDLE)
+      DerivedResource(pipelineCache, Pipeline);
+    if(GetPipelineCreateFlags(&OrigCreateInfo) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
     {
       if(OrigCreateInfo.basePipelineHandle != VK_NULL_HANDLE)
         DerivedResource(OrigCreateInfo.basePipelineHandle, Pipeline);
@@ -1218,7 +1215,7 @@ VkResult WrappedVulkan::vkCreateComputePipelines(VkDevice device, VkPipelineCach
           VkComputePipelineCreateInfo modifiedCreateInfo;
           const VkComputePipelineCreateInfo *createInfo = &pCreateInfos[i];
 
-          if(createInfo->flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+          if(GetPipelineCreateFlags(createInfo) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
           {
             // since we serialise one by one, we need to fixup basePipelineIndex
             if(createInfo->basePipelineIndex != -1 && createInfo->basePipelineIndex < (int)i)
@@ -1247,7 +1244,7 @@ VkResult WrappedVulkan::vkCreateComputePipelines(VkDevice device, VkPipelineCach
           record->AddParent(cacherecord);
         }
 
-        if(pCreateInfos[i].flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+        if(GetPipelineCreateFlags(pCreateInfos) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
         {
           if(pCreateInfos[i].basePipelineHandle != VK_NULL_HANDLE)
           {
@@ -1360,15 +1357,12 @@ bool WrappedVulkan::Serialise_vkCreateRayTracingPipelinesKHR(
 
     VkPipeline pipe = VK_NULL_HANDLE;
 
-    VkPipelineCache origCache = pipelineCache;
-
-    // don't use pipeline caches on replay
-    pipelineCache = VK_NULL_HANDLE;
-
     // don't fail when a compile is required because we don't currently replay caches so this will
     // always happen. This still allows application to use this flag at runtime where it will be
     // valid
-    CreateInfo.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    uint64_t createFlags = GetPipelineCreateFlags(&CreateInfo);
+    createFlags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    SetPipelineCreateFlags(&CreateInfo, createFlags);
 
     // we steal the serialised create info and handle buffer here so we can pass it to jobs without
     // its contents and all of the allocated structures and arrays being deserialised. We add a job
@@ -1390,9 +1384,9 @@ bool WrappedVulkan::Serialise_vkCreateRayTracingPipelinesKHR(
     pipeInfo.Init(GetResourceManager(), m_CreationInfo, live, &OrigCreateInfo);
 
     DerivedResource(device, Pipeline);
-    if(origCache != VK_NULL_HANDLE)
-      DerivedResource(origCache, Pipeline);
-    if(OrigCreateInfo.flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+    if(pipelineCache != VK_NULL_HANDLE)
+      DerivedResource(pipelineCache, Pipeline);
+    if(GetPipelineCreateFlags(&OrigCreateInfo) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
     {
       if(OrigCreateInfo.basePipelineHandle != VK_NULL_HANDLE)
         DerivedResource(OrigCreateInfo.basePipelineHandle, Pipeline);
@@ -1418,8 +1412,9 @@ bool WrappedVulkan::Serialise_vkCreateRayTracingPipelinesKHR(
 
     if(Replay_Debug_SingleThreadedCompilation())
     {
-      RDResult res = DeferredPipelineCompile(device, OrigCreateInfo, *OrigReplayHandles,
-                                             captureReplayHandleSize, GetWrapped(pipe));
+      RDResult res =
+          DeferredPipelineCompile(device, pipelineCache, OrigCreateInfo, *OrigReplayHandles,
+                                  captureReplayHandleSize, GetWrapped(pipe));
       if(res == ResultCode::APIHardwareUnsupported)
         res.message = rdcstr(res.message) + "\n" + GetPhysDeviceCompatString(false, false);
       Deserialise(OrigCreateInfo);
@@ -1435,11 +1430,12 @@ bool WrappedVulkan::Serialise_vkCreateRayTracingPipelinesKHR(
     {
       WrappedVkPipeline *wrappedPipe = GetWrapped(pipe);
       wrappedPipe->deferredJob = Threading::JobSystem::AddJob(
-          [wrappedVulkan = this, device, OrigCreateInfo, OrigReplayHandles, captureReplayHandleSize,
-           wrappedPipe]() {
+          [wrappedVulkan = this, device, pipelineCache, OrigCreateInfo, OrigReplayHandles,
+           captureReplayHandleSize, wrappedPipe]() {
             PerformanceTimer timer;
-            RDResult res = DeferredPipelineCompile(device, OrigCreateInfo, *OrigReplayHandles,
-                                                   captureReplayHandleSize, wrappedPipe);
+            RDResult res =
+                DeferredPipelineCompile(device, pipelineCache, OrigCreateInfo, *OrigReplayHandles,
+                                        captureReplayHandleSize, wrappedPipe);
             wrappedVulkan->AddDeferredTime(timer.GetMilliseconds());
             if(res == ResultCode::APIHardwareUnsupported)
               res.message = rdcstr(res.message) + "\n" +
@@ -1473,14 +1469,9 @@ VkResult WrappedVulkan::vkCreateRayTracingPipelinesKHR(
     pPipelines[i] = VK_NULL_HANDLE;
 
     // Patch in capture/replay creation flags
-    VkPipelineCreateFlags2CreateInfoKHR *flagsInfo =
-        (VkPipelineCreateFlags2CreateInfoKHR *)FindNextStruct(
-            &unwrappedCreateInfos[i], VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
-    if(flagsInfo)
-      flagsInfo->flags |= VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR;
-    else
-      unwrappedCreateInfos[i].flags |=
-          VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR;
+    uint64_t createFlags = GetPipelineCreateFlags(&unwrappedCreateInfos[i]);
+    createFlags |= VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR;
+    SetPipelineCreateFlags(&unwrappedCreateInfos[i], createFlags);
   }
 
   // deferred operations are currently not wrapped
@@ -1507,10 +1498,11 @@ VkResult WrappedVulkan::vkCreateRayTracingPipelinesKHR(
           CACHE_THREAD_SERIALISER();
 
           VkRayTracingPipelineCreateInfoKHR modifiedCreateInfo = pCreateInfos[i];
-          modifiedCreateInfo.flags |=
-              VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR;
+          uint64_t createFlags = GetPipelineCreateFlags(&modifiedCreateInfo);
+          createFlags |= VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR;
+          SetPipelineCreateFlags(&modifiedCreateInfo, createFlags);
 
-          if(pCreateInfos[i].flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+          if(createFlags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
           {
             // since we serialise one by one, we need to fixup basePipelineIndex
             if(pCreateInfos[i].basePipelineIndex != -1 && pCreateInfos[i].basePipelineIndex < (int)i)
@@ -1531,7 +1523,7 @@ VkResult WrappedVulkan::vkCreateRayTracingPipelinesKHR(
         VkResourceRecord *record = GetResourceManager()->AddResourceRecord(pPipelines[i]);
         record->AddChunk(chunk);
 
-        if(pCreateInfos[i].flags & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
+        if(GetPipelineCreateFlags(&pCreateInfos[i]) & VK_PIPELINE_CREATE_DERIVATIVE_BIT)
         {
           if(pCreateInfos[i].basePipelineHandle != VK_NULL_HANDLE)
           {

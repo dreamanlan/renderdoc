@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -249,6 +249,7 @@ struct PixelHistoryShaderCache
         dummybuf.Create(vk, vk->GetDev(), 1024, 1,
                         GPUBuffer::eGPUBufferGPULocal | GPUBuffer::eGPUBufferSSBO |
                             GPUBuffer::eGPUBufferAddressable);
+        dummybuf.Name("PixelHistoryDummy");
       }
       else
       {
@@ -540,41 +541,31 @@ private:
         VkBufferDeviceAddressInfo getAddressInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         getAddressInfo.buffer = dummybuf.UnwrappedBuffer();
 
+        editor.SetBufferStorageMode(BufferStorageMode::KHR_bda32);
+        editor.PrepareAddedBufferAccess();
+
         VkDevice dev = m_pDriver->GetDev();
         VkDeviceAddress bufferAddress =
             ObjDisp(dev)->GetBufferDeviceAddress(Unwrap(dev), &getAddressInfo);
 
         rdcspv::Id uint32Type = editor.DeclareType(rdcspv::scalar<uint32_t>());
-        rdcspv::Id bufptrtype = editor.DeclareType(
-            rdcspv::Pointer(uint32Type, rdcspv::StorageClass::PhysicalStorageBuffer));
+
+        // we know because we're using KHR_bda that no globals will be added, we can ignore this
+        rdcarray<rdcspv::Id> dummyAddedGlobals;
+        rdcpair<rdcspv::Id, rdcspv::Id> bufVar = editor.AddBufferVariable(
+            dummyAddedGlobals, uint32Type, "_rd_dummyBuf", 0, 0, bufferAddress);
+        RDCASSERT(dummyAddedGlobals.empty());
 
         rdcspv::Id uint1 = editor.AddConstantImmediate<uint32_t>(uint32_t(1));
-
-        editor.AddExtension("SPV_KHR_physical_storage_buffer");
-
-        {
-          // change the memory model to physical storage buffer 64
-          rdcspv::Iter it = editor.Begin(rdcspv::Section::MemoryModel);
-          rdcspv::OpMemoryModel model(it);
-          model.addressingModel = rdcspv::AddressingModel::PhysicalStorageBuffer64;
-          it = model;
-        }
-
-        editor.AddCapability(rdcspv::Capability::PhysicalStorageBufferAddresses);
-
-        rdcspv::Id addressConstantLSB =
-            editor.AddConstantImmediate<uint32_t>(bufferAddress & 0xFFFFFFFF);
-        rdcspv::Id addressConstantMSB =
-            editor.AddConstantImmediate<uint32_t>((bufferAddress >> 32) & 0xFFFFFFFF);
-
-        rdcspv::Id uintPair = editor.DeclareType(rdcspv::Vector(rdcspv::scalar<uint32_t>(), 2));
-
-        rdcspv::Id addressConstant = editor.AddConstant(rdcspv::OpSpecConstantComposite(
-            uintPair, editor.MakeId(), {addressConstantLSB, addressConstantMSB}));
 
         rdcspv::Id scope = editor.AddConstantImmediate<uint32_t>((uint32_t)rdcspv::Scope::Device);
         rdcspv::Id semantics =
             editor.AddConstantImmediate<uint32_t>((uint32_t)rdcspv::MemorySemantics::AcquireRelease);
+
+        rdcspv::OperationList ops;
+
+        rdcspv::Id bufLoaded = editor.LoadBufferVariable(ops, bufVar);
+        ops.add(rdcspv::OpAtomicUMax(uint32Type, editor.MakeId(), bufLoaded, scope, semantics, uint1));
 
         // patch every function to include a BDA write just to be safe
         for(rdcspv::Iter it = editor.Begin(rdcspv::Section::Functions),
@@ -598,13 +589,12 @@ private:
                   it.opcode() == rdcspv::Op::NoLine)
               ++it;
 
-            rdcspv::Id structPtr = editor.AddOperation(
-                it, rdcspv::OpBitcast(bufptrtype, editor.MakeId(), addressConstant));
-            it++;
+            // give the umax a new result each time
+            rdcspv::OpAtomicUMax umax(ops.back().AsIter());
+            umax.result = editor.MakeId();
+            ops.back() = umax;
 
-            editor.AddOperation(it, rdcspv::OpAtomicUMax(uint32Type, editor.MakeId(), structPtr,
-                                                         scope, semantics, uint1));
-            it++;
+            it = editor.AddOperations(it, ops);
           }
         }
       }
@@ -1120,7 +1110,7 @@ protected:
         dyn.color[i].resolveMode = VK_RESOLVE_MODE_NONE;
         dyn.color[i].resolveImageView = VK_NULL_HANDLE;
 
-        if(dyn.color[i].loadOp != VK_ATTACHMENT_LOAD_OP_NONE_KHR)
+        if(dyn.color[i].loadOp != VK_ATTACHMENT_LOAD_OP_NONE)
           dyn.color[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         if(dyn.color[i].storeOp != VK_ATTACHMENT_STORE_OP_NONE)
           dyn.color[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1214,12 +1204,12 @@ protected:
       descs[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       descs[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
       descs[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-      if(rpInfo.attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR)
-        descs[i].loadOp = VK_ATTACHMENT_LOAD_OP_NONE_KHR;
+      if(rpInfo.attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_NONE)
+        descs[i].loadOp = VK_ATTACHMENT_LOAD_OP_NONE;
       if(rpInfo.attachments[i].storeOp == VK_ATTACHMENT_STORE_OP_NONE)
         descs[i].storeOp = VK_ATTACHMENT_STORE_OP_NONE;
-      if(rpInfo.attachments[i].stencilLoadOp == VK_ATTACHMENT_LOAD_OP_NONE_KHR)
-        descs[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_NONE_KHR;
+      if(rpInfo.attachments[i].stencilLoadOp == VK_ATTACHMENT_LOAD_OP_NONE)
+        descs[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_NONE;
       if(rpInfo.attachments[i].stencilStoreOp == VK_ATTACHMENT_STORE_OP_NONE)
         descs[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_NONE;
 
@@ -3152,15 +3142,6 @@ struct VulkanPixelHistoryPerFragmentCallback : VulkanPixelHistoryCallback
       // state that applies to all passes
       SetOneFragStencilStateForEXTShaderObject(state);
       shads = CreatePerFragmentShaders(state, eid, colorOutputIndex);
-    }
-
-    for(uint32_t i = 0; i < state.views.size(); i++)
-    {
-      ScissorToPixel(state.views[i], state.scissors[i]);
-
-      state.scissors[i].offset.x &= ~0x1;
-      state.scissors[i].offset.y &= ~0x1;
-      state.scissors[i].extent = {2, 2};
     }
 
     VkPipeline pipesIter[2];

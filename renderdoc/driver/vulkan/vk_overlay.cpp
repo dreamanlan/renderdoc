@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -329,14 +329,14 @@ struct VulkanQuadOverdrawCallback : public VulkanActionCallback
       // Reset the attachment mapping, if any
       if(m_PrevState.dynamicRendering.localRead.AreLocationsNonDefault())
       {
-        VkRenderingAttachmentLocationInfoKHR attachmentLocations = {};
-        attachmentLocations.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR;
+        VkRenderingAttachmentLocationInfo attachmentLocations = {};
+        attachmentLocations.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO;
         m_pDriver->vkCmdSetRenderingAttachmentLocationsKHR(cmd, &attachmentLocations);
       }
       if(m_PrevState.dynamicRendering.localRead.AreInputIndicesNonDefault())
       {
-        VkRenderingInputAttachmentIndexInfoKHR inputIndices = {};
-        inputIndices.sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR;
+        VkRenderingInputAttachmentIndexInfo inputIndices = {};
+        inputIndices.sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO;
 
         m_pDriver->vkCmdSetRenderingInputAttachmentIndicesKHR(cmd, &inputIndices);
       }
@@ -558,9 +558,19 @@ void VulkanDebugManager::PatchLineStripIndexBuffer(const ActionDescription *acti
 
   if(action->flags & ActionFlags::Indexed)
   {
+    uint64_t readSizeBytes = uint64_t(action->numIndices) * rs.ibuffer.bytewidth;
+    // clamp to handle subrange bound via vkCmdBindIndexBuffer2
+    if(rs.ibuffer.size != VK_WHOLE_SIZE)
+    {
+      uint64_t offsetBytes = uint64_t(action->indexOffset) * rs.ibuffer.bytewidth;
+      uint64_t maxSubrangeBytes = rs.ibuffer.size > offsetBytes ? rs.ibuffer.size - offsetBytes : 0;
+
+      readSizeBytes = RDCMIN(readSizeBytes, maxSubrangeBytes);
+    }
+
     GetBufferData(rs.ibuffer.buf,
                   rs.ibuffer.offs + uint64_t(action->indexOffset) * rs.ibuffer.bytewidth,
-                  uint64_t(action->numIndices) * rs.ibuffer.bytewidth, indices);
+                  readSizeBytes, indices);
 
     if(rs.ibuffer.bytewidth == 4)
       idx32 = (uint32_t *)indices.data();
@@ -578,6 +588,7 @@ void VulkanDebugManager::PatchLineStripIndexBuffer(const ActionDescription *acti
 
   indexBuffer.Create(m_pDriver, m_Device, patchedIndices.size() * sizeof(uint32_t), 1,
                      GPUBuffer::eGPUBufferIBuffer);
+  indexBuffer.Name("PatchedStripIB");
 
   void *ptr = indexBuffer.Map(0, patchedIndices.size() * sizeof(uint32_t));
   if(!ptr)
@@ -1079,6 +1090,8 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
       state.depthBoundsTestEnable = VK_FALSE;
       state.cullMode = VK_CULL_MODE_NONE;
 
+      state.sampleMask = {~0U};
+
       // disable all discard rectangles
       RemoveNextStruct(&pipeCreateInfo,
                        VK_STRUCTURE_TYPE_PIPELINE_DISCARD_RECTANGLE_STATE_CREATE_INFO_EXT);
@@ -1091,9 +1104,9 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
       }
 
       // disable line stipple
-      VkPipelineRasterizationLineStateCreateInfoEXT *lineRasterState =
-          (VkPipelineRasterizationLineStateCreateInfoEXT *)FindNextStruct(
-              rs, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT);
+      VkPipelineRasterizationLineStateCreateInfo *lineRasterState =
+          (VkPipelineRasterizationLineStateCreateInfo *)FindNextStruct(
+              rs, VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO);
 
       if(lineRasterState)
       {
@@ -1176,6 +1189,12 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
           att->colorWriteMask = 0xf;
         }
       }
+
+      state.logicOpEnable = false;
+      for(uint32_t i = 0; i < state.colorBlendEnable.size(); i++)
+        state.colorBlendEnable[i] = false;
+      for(uint32_t i = 0; i < state.colorWriteMask.size(); i++)
+        state.colorWriteMask[i] = 0xf;
 
       // set scissors to max for drawcall
       if(overlay == DebugOverlay::Drawcall && pipeCreateInfo.pViewportState)
@@ -1487,9 +1506,17 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
       state.depthBoundsTestEnable = VK_FALSE;
       state.cullMode = VK_CULL_MODE_NONE;
 
+      state.sampleMask = {~0U};
+
       // enable dynamic depth clamp
       if(m_pDriver->GetDeviceEnabledFeatures().depthClamp)
         state.depthClampEnable = true;
+
+      state.logicOpEnable = false;
+      for(uint32_t i = 0; i < state.colorBlendEnable.size(); i++)
+        state.colorBlendEnable[i] = false;
+      for(uint32_t i = 0; i < state.colorWriteMask.size(); i++)
+        state.colorWriteMask[i] = 0xf;
 
       // modify state
       state.SetRenderPass(GetResID(m_Overlay.NoDepthRP));
@@ -1816,9 +1843,17 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
       state.depthBoundsTestEnable = VK_FALSE;
       state.cullMode = VK_CULL_MODE_NONE;
 
+      state.sampleMask = {~0U};
+
       // enable dynamic depth clamp
       if(m_pDriver->GetDeviceEnabledFeatures().depthClamp)
         state.depthClampEnable = true;
+
+      state.logicOpEnable = false;
+      for(uint32_t i = 0; i < state.colorBlendEnable.size(); i++)
+        state.colorBlendEnable[i] = false;
+      for(uint32_t i = 0; i < state.colorWriteMask.size(); i++)
+        state.colorWriteMask[i] = 0xf;
 
       // modify state
       state.SetRenderPass(GetResID(m_Overlay.NoDepthRP));
@@ -1952,7 +1987,9 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
         if(useDepthWriteStencilPass)
         {
           useDepthWriteStencilPass = false;
-          const VulkanCreationInfo::ShaderEntry &ps = pipeInfo.shaders[4];
+          const VulkanCreationInfo::ShaderEntry &ps =
+              state.graphics.shaderObject ? createinfo.m_ShaderObject[state.shaderObjects[4]].shad
+                                          : pipeInfo.shaders[4];
           if(ps.module != ResourceId())
           {
             ShaderReflection *reflection = ps.refl;
@@ -2472,9 +2509,31 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
       state.depthBoundsTestEnable = VK_FALSE;
       state.cullMode = VK_CULL_MODE_NONE;
 
+      state.sampleMask = {~0U};
+
       // enable dynamic depth clamp
       if(m_pDriver->GetDeviceEnabledFeatures().depthClamp)
         state.depthClampEnable = true;
+
+      state.logicOpEnable = false;
+      for(uint32_t i = 0; i < state.colorBlendEnable.size(); i++)
+        state.colorBlendEnable[i] = false;
+      for(uint32_t i = 0; i < state.colorWriteMask.size(); i++)
+        state.colorWriteMask[i] = 0xf;
+
+      if(depthRP != VK_NULL_HANDLE)
+      {
+        if(overlay == DebugOverlay::Depth)
+        {
+          state.depthTestEnable = origDepthTest;
+        }
+        else
+        {
+          state.front.passOp = state.front.failOp = state.front.depthFailOp = VK_STENCIL_OP_KEEP;
+          state.back.passOp = state.back.failOp = state.back.depthFailOp = VK_STENCIL_OP_KEEP;
+          state.stencilTestEnable = origStencilTest;
+        }
+      }
 
       if(state.graphics.shaderObject)
       {
@@ -2486,6 +2545,10 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
 
       if(useDepthWriteStencilPass)
       {
+        // disable colour write
+        for(uint32_t i = 0; i < state.colorWriteMask.size(); i++)
+          state.colorWriteMask[i] = 0x0;
+
         // override stencil dynamic state
         state.front.compare = 0xff;
         state.front.write = 0xff;
@@ -4028,7 +4091,7 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
                 if(fmt.indexByteStride == 4)
                   idxtype = VK_INDEX_TYPE_UINT32;
                 else if(fmt.indexByteStride == 1)
-                  idxtype = VK_INDEX_TYPE_UINT8_KHR;
+                  idxtype = VK_INDEX_TYPE_UINT8;
 
                 if(fmt.indexResourceId != ResourceId())
                 {

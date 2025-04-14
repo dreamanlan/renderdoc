@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,6 +27,8 @@
 #include "strings/string_utils.h"
 #include "dxil_bytecode.h"
 #include "dxil_common.h"
+
+RDOC_EXTERN_CONFIG(bool, D3D_Hack_EnableGroups);
 
 namespace DXIL
 {
@@ -735,6 +737,12 @@ void Program::FetchComputeProperties(DXBC::Reflection *reflection)
           reflection->DispatchThreadsDimension[2] = getival<uint32_t>(threadDim.children[2]);
           return;
         }
+        else if(shaderTypeTag == ShaderEntryTag::WaveSize)
+        {
+          Metadata &sizeData = *tags.children[t + 1];
+          RDCASSERTEQUAL(sizeData.children.size(), 1);
+          reflection->WaveSize = getival<uint32_t>(sizeData.children[0]);
+        }
       }
 
       break;
@@ -1255,38 +1263,6 @@ static DXBC::CBufferVariableType MakeCBufferVariableType(const TypeInfo &typeInf
   return ret;
 }
 
-// DXIL wonderfully provides us with offsets that are completely useless/pointless for structured
-// buffers. We need to recalculate them now based on tight packing
-void RecalculateScalarOffsetsSizes(DXBC::CBufferVariableType &type)
-{
-  uint32_t offset = 0;
-  uint32_t pendingOffsetIncr = 0;
-  uint32_t lastBitfieldOffset = 0;
-  for(DXBC::CBufferVariable &var : type.members)
-  {
-    // if we encounter a non-bitfield, or the offset goes backwards, apply the 'real' offset now
-    if(var.bitFieldSize == 0 || var.bitFieldOffset < lastBitfieldOffset)
-    {
-      offset += pendingOffsetIncr;
-      pendingOffsetIncr = 0;
-    }
-
-    var.offset = offset;
-
-    // all bitfields share the same offset, which will be incremented at the next bitfield boundary (above)
-    if(var.bitFieldSize > 0)
-    {
-      pendingOffsetIncr = var.type.bytesize;
-      lastBitfieldOffset = var.bitFieldOffset + var.bitFieldSize;
-      continue;
-    }
-
-    offset += var.type.rows * var.type.cols * VarTypeByteSize(var.type.varType) * var.type.elements;
-
-    RecalculateScalarOffsetsSizes(var.type);
-  }
-}
-
 static void AddResourceBind(DXBC::Reflection *refl, const TypeInfo &typeInfo, const Metadata *r,
                             const bool srv)
 {
@@ -1716,11 +1692,14 @@ DXBC::Reflection *Program::BuildReflection()
       }
     }
 
+    if(cmdline.empty())
+      cmdline = GetDefaultCommandLine();
+
     m_CompileFlags.flags.push_back({"@cmdline", cmdline});
   }
   else
   {
-    m_CompileFlags.flags.push_back({"@cmdline", "-T " + m_Profile});
+    m_CompileFlags.flags.push_back({"@cmdline", GetDefaultCommandLine()});
   }
 
   if(dx.resources)
@@ -1891,6 +1870,27 @@ rdcstr Program::GetDebugStatus()
                       "Only supported when debugging pixel shaders dx.op call `%s` %s",
                       callFunc->name.c_str(), ToStr(dxOpCode).c_str());
                 continue;
+              case DXOp::WaveIsFirstLane:
+              case DXOp::WaveGetLaneIndex:
+              case DXOp::WaveGetLaneCount:
+              case DXOp::WaveAnyTrue:
+              case DXOp::WaveAllTrue:
+              case DXOp::WaveActiveAllEqual:
+              case DXOp::WaveActiveBallot:
+              case DXOp::WaveReadLaneAt:
+              case DXOp::WaveReadLaneFirst:
+              case DXOp::WaveActiveOp:
+              case DXOp::WaveActiveBit:
+              case DXOp::WavePrefixOp:
+              case DXOp::WavePrefixBitCount:
+              case DXOp::WaveAllBitCount:
+              case DXOp::WaveMatch:
+              case DXOp::WaveMultiPrefixOp:
+              case DXOp::WaveMultiPrefixBitCount:
+                if(!D3D_Hack_EnableGroups())
+                  return StringFormat::Fmt("Unsupported dx.op call `%s` %s", callFunc->name.c_str(),
+                                           ToStr(dxOpCode).c_str());
+                continue;
               case DXOp::TempRegLoad:
               case DXOp::TempRegStore:
               case DXOp::MinPrecXRegLoad:
@@ -1911,20 +1911,6 @@ rdcstr Program::GetDebugStatus()
               case DXOp::StorePatchConstant:
               case DXOp::OutputControlPointID:
               case DXOp::CycleCounterLegacy:
-              case DXOp::WaveIsFirstLane:
-              case DXOp::WaveGetLaneIndex:
-              case DXOp::WaveGetLaneCount:
-              case DXOp::WaveAnyTrue:
-              case DXOp::WaveAllTrue:
-              case DXOp::WaveActiveAllEqual:
-              case DXOp::WaveActiveBallot:
-              case DXOp::WaveReadLaneAt:
-              case DXOp::WaveReadLaneFirst:
-              case DXOp::WaveActiveOp:
-              case DXOp::WaveActiveBit:
-              case DXOp::WavePrefixOp:
-              case DXOp::WaveAllBitCount:
-              case DXOp::WavePrefixBitCount:
               case DXOp::AttributeAtVertex:
               case DXOp::InstanceID:
               case DXOp::InstanceIndex:
@@ -1947,9 +1933,6 @@ rdcstr Program::GetDebugStatus()
               case DXOp::CallShader:
               case DXOp::CreateHandleForLib:
               case DXOp::PrimitiveIndex:
-              case DXOp::WaveMatch:
-              case DXOp::WaveMultiPrefixOp:
-              case DXOp::WaveMultiPrefixBitCount:
               case DXOp::SetMeshOutputCounts:
               case DXOp::EmitIndices:
               case DXOp::GetMeshPayload:
@@ -1998,7 +1981,6 @@ rdcstr Program::GetDebugStatus()
               case DXOp::GeometryIndex:
               case DXOp::RayQuery_CandidateInstanceContributionToHitGroupIndex:
               case DXOp::RayQuery_CommittedInstanceContributionToHitGroupIndex:
-              case DXOp::QuadVote:
               case DXOp::TextureGatherRaw:
               case DXOp::TextureStoreSample:
               case DXOp::WaveMatrix_Annotate:
@@ -2126,12 +2108,6 @@ void Program::GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo &
 void Program::GetCallstack(size_t instruction, uintptr_t offset, rdcarray<rdcstr> &callstack) const
 {
   callstack.clear();
-}
-
-bool Program::HasSourceMapping() const
-{
-  // not yet implemented and only relevant for debugging
-  return false;
 }
 
 void Program::GetLocals(const DXBC::DXBCContainer *dxbc, size_t instruction, uintptr_t offset,

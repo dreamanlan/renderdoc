@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2024 Baldur Karlsson
+ * Copyright (c) 2024-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -507,7 +507,10 @@ bool operator<(const GPUAddressRange &a, const GPUAddressRange &b)
   if(a.start != b.start)
     return a.start < b.start;
 
-  return !(a.realEnd < b.realEnd);
+  if(a.realEnd != b.realEnd)
+    return !(a.realEnd < b.realEnd);
+
+  return false;
 }
 
 static GPUAddressRange MakeRange(ResourceId id, GPUAddressRange::Address addr, uint64_t size,

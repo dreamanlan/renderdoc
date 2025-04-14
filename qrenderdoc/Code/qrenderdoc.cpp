@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -279,6 +279,11 @@ int main(int argc, char *argv[])
       }
     }
 
+    GlobalEnvironment env;
+    env.enumerateGPUs = false;
+    rdcarray<rdcstr> coreargs;
+    RENDERDOC_InitialiseReplay(env, coreargs);
+
     {
       QCoreApplication application(argc, mod_argv);
       PythonContext::GlobalInit();
@@ -302,7 +307,11 @@ int main(int argc, char *argv[])
       {
         logstream << "Python bindings are consistent.\n";
       }
+
+      PythonContext::GlobalShutdown();
     }
+
+    RENDERDOC_ShutdownReplay();
 
     logbuf.finish();
 

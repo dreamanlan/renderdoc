@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2024 Baldur Karlsson
+ * Copyright (c) 2024-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -65,6 +65,9 @@ public:
                                            const DXDebug::BindingSlot &slot);
 
 private:
+  void FetchSRV(const D3D12Descriptor *resDescriptor, const BindingSlot &slot);
+  void FetchUAV(const D3D12Descriptor *resDescriptor, const BindingSlot &slot);
+
   WrappedID3D12Device *m_Device;
   const DXIL::EntryPointInterface *m_EntryPointInterface;
   GlobalState &m_GlobalState;

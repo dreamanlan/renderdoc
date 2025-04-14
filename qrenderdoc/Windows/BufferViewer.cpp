@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1075,7 +1075,8 @@ public:
                 double g = list.size() > 1 ? qBound(0.0, list[1].toDouble(), 1.0) : 0.0;
                 double b = list.size() > 2 ? qBound(0.0, list[2].toDouble(), 1.0) : 0.0;
 
-                rgb = QColor::fromRgbF(r, g, b);
+                rgb = QColor::fromRgbF(ConvertLinearToSRGB(float(r)), ConvertLinearToSRGB(float(g)),
+                                       ConvertLinearToSRGB(float(b)));
               }
               else if(vt == QMetaType::Float)
               {
@@ -1083,7 +1084,8 @@ public:
                 float g = list.size() > 1 ? qBound(0.0f, list[1].toFloat(), 1.0f) : 0.0;
                 float b = list.size() > 2 ? qBound(0.0f, list[2].toFloat(), 1.0f) : 0.0;
 
-                rgb = QColor::fromRgbF(r, g, b);
+                rgb = QColor::fromRgbF(ConvertLinearToSRGB(float(r)), ConvertLinearToSRGB(float(g)),
+                                       ConvertLinearToSRGB(float(b)));
               }
               else if(vt == QMetaType::UInt || vt == QMetaType::UShort || vt == QMetaType::UChar)
               {
@@ -1091,6 +1093,8 @@ public:
                 uint g = list.size() > 1 ? qBound(0U, list[1].toUInt(), 255U) : 0.0;
                 uint b = list.size() > 2 ? qBound(0U, list[2].toUInt(), 255U) : 0.0;
 
+                // we leave this as assuming it's in sRGB space since most commonly this will be an
+                // 8-bit texture being viewed as a buffer
                 rgb = QColor::fromRgb(r, g, b);
               }
               else if(vt == QMetaType::Int || vt == QMetaType::Short || vt == QMetaType::SChar)
@@ -4259,6 +4263,27 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
 
     RDTreeWidgetItem *n =
         new RDTreeWidgetItem({v.name, VarString(v, c), offsetStr, TypeString(v, c)});
+
+    // display colour swatch for floats with RGB display
+    if((v.flags & ShaderVariableFlags::RGBDisplay) && VarTypeCompType(v.type) == CompType::Float &&
+       v.rows == 1 && v.columns >= 1 && v.members.empty())
+    {
+      QColor swatchColor(0, 0, 0, 255);
+      float rgb[3] = {0.0f, 0.0f, 0.0f};
+      for(uint8_t col = 0; col < v.columns && col < 4; col++)
+      {
+        float fval = 0.0f;
+        if(v.type == VarType::Float)
+          fval = v.value.f32v[col];
+        else if(v.type == VarType::Double)
+          fval = float(v.value.f64v[col]);
+        else if(v.type == VarType::Half)
+          fval = float(v.value.f16v[col]);
+        rgb[col] = ConvertLinearToSRGB(fval);
+      }
+      swatchColor.setRgbF(rgb[0], rgb[1], rgb[2], 1.0f);
+      n->setIcon(1, MakeSwatchIcon(ui->fixedVars, swatchColor));
+    }
 
     n->setTag(QVariant::fromValue(FixedVarTag(v.name, baseOffset + c.byteOffset)));
 

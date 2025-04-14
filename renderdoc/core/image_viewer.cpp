@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -368,6 +368,7 @@ public:
     errors = "Building target shaders is unsupported";
   }
   void ReplaceResource(ResourceId from, ResourceId to) {}
+  void ClearReplayCache() {}
   void RemoveReplacement(ResourceId id) {}
   // these are proxy functions, and will never be used
   ResourceId CreateProxyTexture(const TextureDescription &templateTex)

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -687,10 +687,10 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
                                                                  : VK_VERTEX_INPUT_RATE_VERTEX;
   }
 
-  static VkPipelineVertexInputDivisorStateCreateInfoKHR vertexDivisor = {
-      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR,
+  static VkPipelineVertexInputDivisorStateCreateInfo vertexDivisor = {
+      VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO,
   };
-  static VkVertexInputBindingDivisorDescriptionKHR vibindDivisors[128] = {};
+  static VkVertexInputBindingDivisorDescription vibindDivisors[128] = {};
 
   if(m_pDriver->GetExtensions(GetRecord(m_Device)).ext_EXT_vertex_attribute_divisor ||
      m_pDriver->GetExtensions(GetRecord(m_Device)).ext_KHR_vertex_attribute_divisor)
@@ -832,11 +832,12 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
     rs.pNext = &depthClipState;
   }
 
-  static VkPipelineRasterizationLineStateCreateInfoEXT lineRasterState = {
-      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT,
+  static VkPipelineRasterizationLineStateCreateInfo lineRasterState = {
+      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO,
   };
 
-  if(m_pDriver->GetExtensions(GetRecord(m_Device)).ext_EXT_line_rasterization)
+  if(m_pDriver->GetExtensions(GetRecord(m_Device)).ext_EXT_line_rasterization ||
+     m_pDriver->GetExtensions(GetRecord(m_Device)).ext_KHR_line_rasterization)
   {
     lineRasterState.lineRasterizationMode = pipeInfo.lineRasterMode;
     lineRasterState.stippledLineEnable = pipeInfo.stippleEnabled;
@@ -940,7 +941,7 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
   VkGraphicsPipelineCreateInfo ret = {
       VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
       NULL,
-      pipeInfo.flags,
+      0,
       stageCount,
       stages,
       &vi,
@@ -976,7 +977,9 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
 
       // don't have to handle separate vert/frag layouts as push constant ranges must be identical
       const VulkanCreationInfo::PipelineLayout &pipeLayoutInfo =
-          m_pDriver->m_CreationInfo.m_PipelineLayout[pipeInfo.vertLayout];
+          m_pDriver->m_CreationInfo
+              .m_PipelineLayout[pipeInfo.ownLayout != ResourceId() ? pipeInfo.ownLayout
+                                                                   : pipeInfo.vertLayout];
       const rdcarray<VkPushConstantRange> &push = pipeLayoutInfo.pushRanges;
 
       VkPipelineLayoutCreateInfo pipeLayoutCreateInfo = {
@@ -1055,11 +1058,28 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
     rs.pNext = &provokeSetup;
   }
 
+  uint64_t flags = pipeInfo.flags;
   // never create derivatives
-  ret.flags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
+  flags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
 
-  ret.flags &= ~VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
-  ret.flags &= ~VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+  flags &= ~VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+  flags &= ~VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+
+  static VkPipelineCreateFlags2CreateInfo createFlags = {
+      VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+  };
+
+  if(pipeInfo.useCreateFlags2 && m_pDriver->Maintenance5())
+  {
+    createFlags.flags = flags;
+
+    createFlags.pNext = ret.pNext;
+    ret.pNext = &createFlags;
+  }
+  else
+  {
+    createFlags.flags = (uint32_t)flags;
+  }
 
   pipeCreateInfo = ret;
 }
@@ -1131,15 +1151,32 @@ void VulkanShaderCache::MakeComputePipelineInfo(VkComputePipelineCreateInfo &pip
   VkComputePipelineCreateInfo ret = {
       VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
       NULL,
-      pipeInfo.flags,
+      0,
       stage,
       rm->GetCurrentHandle<VkPipelineLayout>(pipeInfo.compLayout),
       VK_NULL_HANDLE,    // base pipeline handle
       0,                 // base pipeline index
   };
 
+  uint64_t flags = pipeInfo.flags;
   // never create derivatives
-  ret.flags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
+  flags &= ~VK_PIPELINE_CREATE_DERIVATIVE_BIT;
+
+  static VkPipelineCreateFlags2CreateInfo createFlags = {
+      VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
+  };
+
+  if(pipeInfo.useCreateFlags2 && m_pDriver->Maintenance5())
+  {
+    createFlags.flags = flags;
+
+    createFlags.pNext = ret.pNext;
+    ret.pNext = &createFlags;
+  }
+  else
+  {
+    ret.flags = (uint32_t)flags;
+  }
 
   pipeCreateInfo = ret;
 }

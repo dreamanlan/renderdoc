@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -540,7 +540,15 @@
   DeclExt(KHR_ray_query);                              \
   DeclExt(EXT_nested_command_buffer);                  \
   DeclExt(EXT_shader_object);                          \
-  DeclExt(KHR_ray_tracing_pipeline);
+  DeclExt(KHR_ray_tracing_pipeline);                   \
+  DeclExt(EXT_subgroup_size_control);                  \
+  DeclExt(EXT_shader_subgroup_ballot);                 \
+  DeclExt(EXT_shader_subgroup_vote);                   \
+  DeclExt(KHR_shader_subgroup_uniform_control_flow);   \
+  DeclExt(KHR_ray_tracing_maintenance1);               \
+  DeclExt(KHR_maintenance5);                           \
+  DeclExt(EXT_image_compression_control);              \
+  DeclExt(EXT_image_compression_control_swapchain);
 
 // for simplicity and since the check itself is platform agnostic,
 // these aren't protected in platform defines
@@ -670,7 +678,15 @@
   CheckExt(KHR_acceleration_structure, VKXX);                 \
   CheckExt(KHR_ray_query, VKXX);                              \
   CheckExt(EXT_shader_object, VKXX);                          \
-  CheckExt(KHR_ray_tracing_pipeline, VKXX);
+  CheckExt(KHR_ray_tracing_pipeline, VKXX);                   \
+  CheckExt(EXT_subgroup_size_control, VK13);                  \
+  CheckExt(EXT_shader_subgroup_ballot, VK11);                 \
+  CheckExt(EXT_shader_subgroup_vote, VK11);                   \
+  CheckExt(KHR_shader_subgroup_uniform_control_flow, VKXX);   \
+  CheckExt(KHR_ray_tracing_maintenance1, VKXX);               \
+  CheckExt(KHR_maintenance5, VKXX);                           \
+  CheckExt(EXT_image_compression_control, VKXX);              \
+  CheckExt(EXT_image_compression_control_swapchain, VKXX);
 
 #define HookInitVulkanInstanceExts_PhysDev()                                                         \
   HookInitExtension(KHR_surface, GetPhysicalDeviceSurfaceSupportKHR);                                \
@@ -1036,6 +1052,12 @@
   HookInitExtension(KHR_ray_tracing_pipeline, GetRayTracingCaptureReplayShaderGroupHandlesKHR);      \
   HookInitExtension(KHR_ray_tracing_pipeline, GetRayTracingShaderGroupHandlesKHR);                   \
   HookInitExtension(KHR_ray_tracing_pipeline, GetRayTracingShaderGroupStackSizeKHR);                 \
+  HookInitExtension(KHR_ray_tracing_maintenance1, CmdTraceRaysIndirect2KHR);                         \
+  HookInitExtension(KHR_maintenance5, CmdBindIndexBuffer2KHR);                                       \
+  HookInitExtension(KHR_maintenance5, GetDeviceImageSubresourceLayoutKHR);                           \
+  HookInitExtension(KHR_maintenance5, GetImageSubresourceLayout2KHR);                                \
+  HookInitExtension(KHR_maintenance5, GetRenderingAreaGranularityKHR);                               \
+  HookInitExtension(EXT_image_compression_control, GetImageSubresourceLayout2EXT);                   \
   HookInitExtension_Device_Win32();                                                                  \
   HookInitExtension_Device_Linux();                                                                  \
   HookInitExtension_Device_Android();                                                                \
@@ -1748,9 +1770,9 @@
               pRenderingInfo);                                                                       \
   HookDefine1(void, vkCmdEndRendering, VkCommandBuffer, commandBuffer);                              \
   HookDefine2(void, vkCmdSetRenderingAttachmentLocationsKHR, VkCommandBuffer, commandBuffer,         \
-              const VkRenderingAttachmentLocationInfoKHR *, pLocationInfo);                          \
+              const VkRenderingAttachmentLocationInfo *, pLocationInfo);                             \
   HookDefine2(void, vkCmdSetRenderingInputAttachmentIndicesKHR, VkCommandBuffer, commandBuffer,      \
-              const VkRenderingInputAttachmentIndexInfoKHR *, pInputAttachmentIndexInfo);            \
+              const VkRenderingInputAttachmentIndexInfo *, pInputAttachmentIndexInfo);               \
   HookDefine3(void, vkCmdSetFragmentShadingRateKHR, VkCommandBuffer, commandBuffer,                  \
               const VkExtent2D *, pFragmentSize, const VkFragmentShadingRateCombinerOpKHR *,         \
               combinerOps);                                                                          \
@@ -1805,7 +1827,7 @@
   HookDefine2(void, vkCmdSetExtraPrimitiveOverestimationSizeEXT, VkCommandBuffer, commandBuffer,     \
               float, extraPrimitiveOverestimationSize);                                              \
   HookDefine2(void, vkCmdSetLineRasterizationModeEXT, VkCommandBuffer, commandBuffer,                \
-              VkLineRasterizationModeEXT, lineRasterizationMode);                                    \
+              VkLineRasterizationMode, lineRasterizationMode);                                       \
   HookDefine2(void, vkCmdSetLineStippleEnableEXT, VkCommandBuffer, commandBuffer, VkBool32,          \
               stippledLineEnable);                                                                   \
   HookDefine2(void, vkCmdSetLogicOpEnableEXT, VkCommandBuffer, commandBuffer, VkBool32,              \
@@ -1941,6 +1963,18 @@
               pipeline, uint32_t, group, VkShaderGroupShaderKHR, groupShader);                       \
   HookDefine2(void, vkCmdSetRayTracingPipelineStackSizeKHR, VkCommandBuffer, commandBuffer,          \
               uint32_t, pipelineStackSize);                                                          \
+  HookDefine2(void, vkCmdTraceRaysIndirect2KHR, VkCommandBuffer, commandBuffer, VkDeviceAddress,     \
+              indirectDeviceAddress);                                                                \
+  HookDefine5(void, vkCmdBindIndexBuffer2KHR, VkCommandBuffer, commandBuffer, VkBuffer, buffer,      \
+              VkDeviceSize, offset, VkDeviceSize, size, VkIndexType, indexType);                     \
+  HookDefine3(void, vkGetDeviceImageSubresourceLayoutKHR, VkDevice, device,                          \
+              const VkDeviceImageSubresourceInfo *, pInfo, VkSubresourceLayout2 *, pLayout);         \
+  HookDefine4(void, vkGetImageSubresourceLayout2KHR, VkDevice, device, VkImage, image,               \
+              const VkImageSubresource2 *, pSubresource, VkSubresourceLayout2 *, pLayout);           \
+  HookDefine3(void, vkGetRenderingAreaGranularityKHR, VkDevice, device,                              \
+              const VkRenderingAreaInfo *, pRenderingAreaInfo, VkExtent2D *, pGranularity);          \
+  HookDefine4(void, vkGetImageSubresourceLayout2EXT, VkDevice, device, VkImage, image,               \
+              const VkImageSubresource2 *, pSubresource, VkSubresourceLayout2 *, pLayout);           \
   HookDefine_Win32();                                                                                \
   HookDefine_Linux();                                                                                \
   HookDefine_Android();                                                                              \

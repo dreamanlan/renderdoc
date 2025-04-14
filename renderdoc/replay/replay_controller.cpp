@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -2172,6 +2172,13 @@ void ReplayController::RemoveReplacement(ResourceId id)
   for(size_t i = 0; i < m_Outputs.size(); i++)
     if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
       m_Outputs[i]->Display();
+}
+
+void ReplayController::ClearReplayCache()
+{
+  CHECK_REPLAY_THREAD();
+
+  m_pDevice->ClearReplayCache();
 }
 
 RDResult ReplayController::CreateDevice(RDCFile *rdc, const ReplayOptions &opts)

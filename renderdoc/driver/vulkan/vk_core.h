@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -484,6 +484,7 @@ private:
   bool m_ListRestart = false;
   bool m_AccelerationStructures = false;
   bool m_ShaderObject = false;
+  bool m_Maintenance5 = false;
 
   uint32_t m_RTCaptureReplayHandleSize = 0;
 
@@ -1024,6 +1025,7 @@ private:
                        VkSampleCountFlagBits samples);
   void PatchImageViewUsage(VkImageViewUsageCreateInfo *usage, VkFormat imgFormat,
                            VkSampleCountFlagBits samples);
+  void PatchImageCreateInfo(VkImageCreateInfo *pInfo, VkFormat *newViewFormats);
 
   VkIndirectPatchData FetchIndirectData(VkIndirectPatchType type, VkCommandBuffer commandBuffer,
                                         VkBuffer dataBuffer, VkDeviceSize dataOffset, uint32_t count,
@@ -1051,6 +1053,8 @@ private:
   void AddImplicitResolveResourceUsage(uint32_t subpass = 0);
   rdcarray<VkImageMemoryBarrier> GetImplicitRenderPassBarriers(uint32_t subpass = 0);
   rdcstr MakeRenderPassOpString(bool store);
+  void ApplyRPStoreDiscards(VkCommandBuffer commandBuffer, VkRect2D renderArea,
+                            ResourceId currentRP, const rdcarray<ResourceId> &attachments);
   void ApplyRPLoadDiscards(VkCommandBuffer commandBuffer, VkRect2D renderArea);
 
   RDCDriver GetFrameCaptureDriver() { return RDCDriver::Vulkan; }
@@ -1376,6 +1380,7 @@ public:
   bool ListRestart() const { return m_ListRestart; }
   bool AccelerationStructures() const { return m_AccelerationStructures; }
   bool ShaderObject() const { return m_ShaderObject; }
+  bool Maintenance5() const { return m_Maintenance5; }
   VulkanRenderState &GetRenderState() { return m_RenderState; }
   void SetActionCB(VulkanActionCallback *cb) { m_ActionCallback = cb; }
   void SetSubmitChain(void *submitChain) { m_SubmitChain = submitChain; }
@@ -2789,10 +2794,10 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRenderingAttachmentLocationsKHR,
                                 VkCommandBuffer commandBuffer,
-                                const VkRenderingAttachmentLocationInfoKHR *pLocationInfo);
+                                const VkRenderingAttachmentLocationInfo *pLocationInfo);
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRenderingInputAttachmentIndicesKHR,
                                 VkCommandBuffer commandBuffer,
-                                const VkRenderingInputAttachmentIndexInfoKHR *pLocationInfo);
+                                const VkRenderingInputAttachmentIndexInfo *pLocationInfo);
 
   // VK_KHR_fragment_shading_rate
 
@@ -2865,7 +2870,7 @@ public:
                                 VkCommandBuffer commandBuffer,
                                 float extraPrimitiveOverestimationSize);
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLineRasterizationModeEXT, VkCommandBuffer commandBuffer,
-                                VkLineRasterizationModeKHR lineRasterizationMode);
+                                VkLineRasterizationMode lineRasterizationMode);
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLineStippleEnableEXT, VkCommandBuffer commandBuffer,
                                 VkBool32 stippledLineEnable);
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLogicOpEnableEXT, VkCommandBuffer commandBuffer,
@@ -2939,10 +2944,10 @@ public:
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdCopyMemoryToAccelerationStructureKHR,
                                 VkCommandBuffer commandBuffer,
                                 const VkCopyMemoryToAccelerationStructureInfoKHR *pInfo);
-  void vkCmdWriteAccelerationStructuresPropertiesKHR(
-      VkCommandBuffer commandBuffer, uint32_t accelerationStructureCount,
-      const VkAccelerationStructureKHR *pAccelerationStructures, VkQueryType queryType,
-      VkQueryPool queryPool, uint32_t firstQuery);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdWriteAccelerationStructuresPropertiesKHR,
+                                VkCommandBuffer commandBuffer, uint32_t accelerationStructureCount,
+                                const VkAccelerationStructureKHR *pAccelerationStructures,
+                                VkQueryType queryType, VkQueryPool queryPool, uint32_t firstQuery);
   VkResult vkCopyAccelerationStructureKHR(VkDevice device, VkDeferredOperationKHR deferredOperation,
                                           const VkCopyAccelerationStructureInfoKHR *pInfo);
   VkResult vkCopyAccelerationStructureToMemoryKHR(
@@ -3022,4 +3027,27 @@ public:
   VkDeviceSize vkGetRayTracingShaderGroupStackSizeKHR(VkDevice device, VkPipeline pipeline,
                                                       uint32_t group,
                                                       VkShaderGroupShaderKHR groupShader);
+
+  // VK_KHR_ray_tracing_maintenance1
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdTraceRaysIndirect2KHR, VkCommandBuffer commandBuffer,
+                                VkDeviceAddress indirectDeviceAddress);
+
+  // VK_KHR_maintenance5
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindIndexBuffer2KHR, VkCommandBuffer commandBuffer,
+                                VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+                                VkIndexType indexType);
+  void vkGetDeviceImageSubresourceLayoutKHR(VkDevice device,
+                                            const VkDeviceImageSubresourceInfo *pInfo,
+                                            VkSubresourceLayout2 *pLayout);
+  void vkGetImageSubresourceLayout2KHR(VkDevice device, VkImage image,
+                                       const VkImageSubresource2 *pSubresource,
+                                       VkSubresourceLayout2 *pLayout);
+  void vkGetRenderingAreaGranularityKHR(VkDevice device,
+                                        const VkRenderingAreaInfo *pRenderingAreaInfo,
+                                        VkExtent2D *pGranularity);
+
+  // VK_EXT_image_compression_control
+  void vkGetImageSubresourceLayout2EXT(VkDevice device, VkImage image,
+                                       const VkImageSubresource2 *pSubresource,
+                                       VkSubresourceLayout2 *pLayout);
 };

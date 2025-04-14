@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -2044,13 +2044,15 @@ bool D3D11Replay::GetHistogram(ResourceId texid, const Subresource &sub, CompTyp
   int srvOffset = 0;
   int intIdx = 0;
 
-  if(IsUIntFormat(details.texFmt))
+  DXGI_FORMAT fmt = GetTypedFormat(details.texFmt, typeCast);
+
+  if(IsUIntFormat(fmt))
   {
     cdata.HistogramFlags |= TEXDISPLAY_UINT_TEX;
     srvOffset = 10;
     intIdx = 1;
   }
-  if(IsIntFormat(details.texFmt))
+  if(IsIntFormat(fmt))
   {
     cdata.HistogramFlags |= TEXDISPLAY_SINT_TEX;
     srvOffset = 20;
@@ -2712,6 +2714,11 @@ void D3D11Replay::ReplaceResource(ResourceId from, ResourceId to)
 void D3D11Replay::RemoveReplacement(ResourceId id)
 {
   m_pDevice->GetResourceManager()->RemoveReplacement(id);
+  ClearPostVSCache();
+}
+
+void D3D11Replay::ClearReplayCache()
+{
   ClearPostVSCache();
 }
 

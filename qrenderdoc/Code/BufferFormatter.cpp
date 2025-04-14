@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -2511,7 +2511,7 @@ QString BufferFormatter::GetBufferFormatString(Packing::Rules pack, ResourceId s
   {
     const ShaderConstantType &desc = res.variableType;
 
-    if(viewFormat.type == ResourceFormatType::Undefined)
+    if(viewFormat.type == ResourceFormatType::Undefined || viewFormat.compType == CompType::Typeless)
     {
       if(desc.baseType == VarType::Unknown)
       {
@@ -3861,6 +3861,9 @@ QString RowString(const ShaderVariable &v, uint32_t row, VarType type)
     return ToQStr(v.GetPointer());
 
   if(v.type == VarType::Struct)
+    return lit("{ ... }");
+
+  if(!v.members.empty())
     return lit("{ ... }");
 
   switch(type)

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -620,6 +620,39 @@ enum class AtomicBinOpCode : uint32_t
   Invalid    // Must be last.
 };
 
+// WaveOp / WavePrefixOp
+enum class WaveOpCode : uint32_t
+{
+  Sum = 0,
+  Product = 1,
+  Min = 2,
+  Max = 3,
+};
+
+// WaveBitOp
+enum class WaveBitOpCode : uint32_t
+{
+  And = 0,
+  Or = 1,
+  Xor = 2,
+};
+
+// WaveMultiPrefixOp
+enum class WaveMultiPrefixOpCode : uint32_t
+{
+  Sum = 0,
+  And = 1,
+  Or = 2,
+  Xor = 3,
+  Product = 4,
+};
+
+enum class SignedOpKind : uint32_t
+{
+  Signed = 0,      // signed integer or floating-point operands
+  Unsigned = 1,    // unsigned integer operands
+};
+
 enum class QuadOpKind : uint32_t
 {
   ReadAcrossX = 0,           // returns the value from the other lane in the quad in the
@@ -628,6 +661,12 @@ enum class QuadOpKind : uint32_t
                              // vertical direction
   ReadAcrossDiagonal = 2,    // returns the value from the lane across the quad in
                              // horizontal and vertical direction
+};
+
+enum class QuadVoteOpKind : uint32_t
+{
+  All = 1,    // true if all conditions are true in this quad
+  Any = 0,    // true if any condition is true in this quad
 };
 
 // Packing/unpacking intrinsics
@@ -1534,12 +1573,15 @@ struct EntryPointInterface
   struct ResourceBase
   {
     ResourceBase(ResourceClass resourceClass, const Metadata *resourceBase);
+    // lowerBound -> upperBound : is inclusive i.e. 1 -> 1 for a single binding
     bool MatchesBinding(uint32_t lowerBound, uint32_t upperBound, uint32_t spaceID) const
     {
       if(space != spaceID)
         return false;
       if(regBase > lowerBound)
         return false;
+      if(upperBound == UINT_MAX)
+        return true;
       if(regBase + regCount <= upperBound)
         return false;
       return true;
@@ -1616,6 +1658,11 @@ public:
   void FetchComputeProperties(DXBC::Reflection *reflection);
   void FetchEntryPoint();
   DXBC::Reflection *BuildReflection();
+
+  DXBC::ThreadScope GetThreadScope() const { return m_Threadscope; }
+
+  rdcstr GetDefaultCommandLine() const { return "-T " + m_Profile; }
+
   rdcstr GetDebugStatus();
   const DXIL::EntryPointInterface *GetEntryPointInterface() const;
   rdcarray<ShaderEntryPoint> GetEntryPoints();
@@ -1640,10 +1687,13 @@ public:
   void GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo &lineInfo) const override;
   void GetCallstack(size_t instruction, uintptr_t offset, rdcarray<rdcstr> &callstack) const override;
 
-  bool HasSourceMapping() const override;
   void GetLocals(const DXBC::DXBCContainer *dxbc, size_t instruction, uintptr_t offset,
                  rdcarray<SourceVariableMapping> &locals) const override;
   // IDebugInfo interface
+
+  // Source-contents overlaying interface can modify list of files directly, but let it modify
+  // shader compile flags here
+  void SetShaderCompileFlags(ShaderCompileFlags flags) { m_CompileFlags = flags; }
 
   const Metadata *GetMetadataByName(const rdcstr &name) const;
   uint32_t GetDirectHeapAcessCount() const { return m_directHeapAccessCount; }
@@ -1710,6 +1760,7 @@ protected:
 
   rdcstr m_CompilerSig, m_EntryPoint, m_Profile;
   ShaderCompileFlags m_CompileFlags;
+  DXBC::ThreadScope m_Threadscope = DXBC::ThreadScope::Thread;
 
   const Type *m_CurParseType = NULL;
 
@@ -1805,7 +1856,12 @@ void SanitiseName(rdcstr &name);
 DECLARE_REFLECTION_ENUM(DXIL::Attribute);
 DECLARE_STRINGISE_TYPE(DXIL::InstructionFlags);
 DECLARE_STRINGISE_TYPE(DXIL::AtomicBinOpCode);
+DECLARE_STRINGISE_TYPE(DXIL::WaveOpCode);
+DECLARE_STRINGISE_TYPE(DXIL::WaveBitOpCode);
+DECLARE_STRINGISE_TYPE(DXIL::WaveMultiPrefixOpCode);
+DECLARE_STRINGISE_TYPE(DXIL::SignedOpKind);
 DECLARE_STRINGISE_TYPE(DXIL::QuadOpKind);
+DECLARE_STRINGISE_TYPE(DXIL::QuadVoteOpKind);
 DECLARE_STRINGISE_TYPE(DXIL::PackMode);
 DECLARE_STRINGISE_TYPE(DXIL::UnpackMode);
 DECLARE_STRINGISE_TYPE(DXIL::Operation);

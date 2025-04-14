@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -997,6 +997,7 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
         HRESULT hr = m_Device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
                                                        D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                                                        __uuidof(ID3D12Resource), (void **)&copySrc);
+        m_Device->RemoveReplayResource(GetResID(copySrc));
 
         if(SUCCEEDED(hr))
         {
@@ -1067,6 +1068,16 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
           D3D12_HEAP_PROPERTIES heapProps = {};
           if(!m_Device->IsSparseResource(GetResID(liveRes)))
             liveRes->GetHeapProperties(&heapProps, NULL);
+
+          // if the resource is sparse, create on default heap
+          if(sparseBinds)
+          {
+            heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+            heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+            heapProps.CreationNodeMask = 1;
+            heapProps.VisibleNodeMask = 1;
+          }
 
           ID3D12GraphicsCommandList *list = Unwrap(m_Device->GetInitialStateList());
 
@@ -2087,6 +2098,9 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
               RDCMAX(4 * 1024 * 1024ULL, prebuild.ScratchDataSizeInBytes));
         }
 
+        if(m_Device->HasFatalError() || GetRTManager()->ASSerialiseBuffer == NULL)
+          return;
+
         desc.ScratchAccelerationStructureData = GetRTManager()->ASSerialiseBuffer->Address();
       }
 
@@ -2154,6 +2168,9 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live, D3D12Init
         m_GPUBufferAllocator.Alloc(D3D12GpuBufferHeapType::AccStructDefaultHeap,
                                    D3D12GpuBufferHeapMemoryFlag::Default,
                                    prebuild.ResultDataMaxSizeInBytes, 256, &data.cachedBuiltAS);
+
+        if(!data.cachedBuiltAS)
+          return;
 
         ResourceId origId = GetOriginalID(as->GetResourceID());
 

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1835,6 +1835,40 @@ QString GetComponentString(byte mask)
   return ret;
 }
 
+QIcon MakeSwatchIcon(QWidget *parentWidget, QColor swatchColor)
+{
+  int h = parentWidget->fontMetrics().height();
+  QPixmap pm(1, 1);
+  pm.fill(swatchColor);
+  pm = pm.scaled(QSize(h, h));
+
+  {
+    QPainter painter(&pm);
+
+    QPen pen(parentWidget->palette().foreground(), 1.0);
+    painter.setPen(pen);
+    painter.drawLine(QPoint(0, 0), QPoint(h - 1, 0));
+    painter.drawLine(QPoint(h - 1, 0), QPoint(h - 1, h - 1));
+    painter.drawLine(QPoint(h - 1, h - 1), QPoint(0, h - 1));
+    painter.drawLine(QPoint(0, h - 1), QPoint(0, 0));
+  }
+
+  return QIcon(pm);
+}
+
+float ConvertLinearToSRGB(float linear)
+{
+  if(linear <= 0.0031308f)
+    return 12.92f * linear;
+
+  if(linear < 0.0f)
+    linear = 0.0f;
+  else if(linear > 1.0f)
+    linear = 1.0f;
+
+  return 1.055f * powf(linear, 1.0f / 2.4f) - 0.055f;
+}
+
 void CombineUsageEvents(ICaptureContext &ctx, const rdcarray<EventUsage> &usage,
                         std::function<void(uint32_t startEID, uint32_t endEID, ResourceUsage use)> callback)
 {
@@ -2531,6 +2565,18 @@ QString RDDialog::getSaveFileName(QWidget *parent, const QString &caption, const
   }
 
   return QString();
+}
+
+void RDDialog::closeEvent(QCloseEvent *e)
+{
+  emit(aboutToClose(e));
+  QDialog::closeEvent(e);
+}
+
+void RDDialog::keyPressEvent(QKeyEvent *e)
+{
+  emit(keyPress(e));
+  QDialog::keyPressEvent(e);
 }
 
 bool QFileFilterModel::filterAcceptsRow(int source_row, const QModelIndex &source_parent) const

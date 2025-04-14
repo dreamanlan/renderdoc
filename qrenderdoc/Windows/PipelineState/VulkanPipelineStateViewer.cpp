@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -81,15 +81,20 @@ Q_DECLARE_METATYPE(VulkanVBIBTag);
 struct VulkanCBufferTag
 {
   VulkanCBufferTag() { index = DescriptorAccess::NoShaderBinding; }
-  VulkanCBufferTag(uint32_t index, uint32_t arrayElement) : index(index), arrayElement(arrayElement)
+  VulkanCBufferTag(uint32_t index, uint32_t arrayElement, uint32_t dynOffset)
+      : index(index), arrayElement(arrayElement), dynamicOffset(dynOffset)
   {
   }
-  VulkanCBufferTag(Descriptor descriptor)
-      : index(DescriptorAccess::NoShaderBinding), arrayElement(0), descriptor(descriptor)
+  VulkanCBufferTag(Descriptor descriptor, uint32_t dynOffset)
+      : index(DescriptorAccess::NoShaderBinding),
+        arrayElement(0),
+        descriptor(descriptor),
+        dynamicOffset(dynOffset)
   {
   }
 
   Descriptor descriptor;
+  uint32_t dynamicOffset;
   uint32_t index, arrayElement;
 };
 
@@ -98,8 +103,8 @@ Q_DECLARE_METATYPE(VulkanCBufferTag);
 struct VulkanBufferTag
 {
   VulkanBufferTag() {}
-  VulkanBufferTag(const DescriptorAccess &access, const Descriptor &desc)
-      : access(access), descriptor(desc)
+  VulkanBufferTag(const DescriptorAccess &access, const Descriptor &desc, uint32_t dynOffset)
+      : access(access), descriptor(desc), dynamicOffset(dynOffset)
   {
   }
   VulkanBufferTag(ResourceId id, uint64_t offset, uint64_t length)
@@ -108,9 +113,11 @@ struct VulkanBufferTag
     descriptor.resource = id;
     descriptor.byteOffset = offset;
     descriptor.byteSize = length;
+    dynamicOffset = 0;
   }
   DescriptorAccess access;
   Descriptor descriptor;
+  uint32_t dynamicOffset = 0;
 };
 
 Q_DECLARE_METATYPE(VulkanBufferTag);
@@ -774,20 +781,21 @@ bool VulkanPipelineStateViewer::setViewDetails(RDTreeWidgetItem *node, const Des
 }
 
 bool VulkanPipelineStateViewer::setViewDetails(RDTreeWidgetItem *node, const Descriptor &descriptor,
-                                               BufferDescription *buf)
+                                               BufferDescription *buf, uint32_t dynamicOffset)
 {
   if(buf == NULL)
     return false;
 
   QString text;
 
-  if(descriptor.byteOffset > 0 || descriptor.byteSize < buf->length)
+  if(descriptor.byteOffset + dynamicOffset > 0 || descriptor.byteSize < buf->length)
   {
-    text += tr("The view covers bytes %1-%2.\nThe buffer is %3 bytes in length.\n")
-                .arg(Formatter::HumanFormat(descriptor.byteOffset, Formatter::OffsetSize))
-                .arg(Formatter::HumanFormat(descriptor.byteOffset + descriptor.byteSize,
-                                            Formatter::OffsetSize))
-                .arg(Formatter::HumanFormat(buf->length, Formatter::OffsetSize));
+    text +=
+        tr("The view covers bytes %1-%2.\nThe buffer is %3 bytes in length.\n")
+            .arg(Formatter::HumanFormat(descriptor.byteOffset + dynamicOffset, Formatter::OffsetSize))
+            .arg(Formatter::HumanFormat(descriptor.byteOffset + dynamicOffset + descriptor.byteSize,
+                                        Formatter::OffsetSize))
+            .arg(Formatter::HumanFormat(buf->length, Formatter::OffsetSize));
   }
   else
   {
@@ -1294,7 +1302,7 @@ void VulkanPipelineStateViewer::addResourceRow(const ShaderResource *shaderRes,
         a = 0;
         restype = TextureType::Buffer;
 
-        tag = QVariant::fromValue(VulkanBufferTag(used.access, used.descriptor));
+        tag = QVariant::fromValue(VulkanBufferTag(used.access, used.descriptor, dynamicOffset));
 
         isbuf = true;
       }
@@ -1541,7 +1549,7 @@ void VulkanPipelineStateViewer::addResourceRow(const ShaderResource *shaderRes,
     }
     else if(buf)
     {
-      setViewDetails(node, descriptor, buf);
+      setViewDetails(node, descriptor, buf, dynamicOffset);
     }
 
     resources->addTopLevelItem(node);
@@ -1557,7 +1565,7 @@ void VulkanPipelineStateViewer::addConstantBlockRow(const ConstantBlock *cblock,
 {
   const Descriptor &descriptor = used.descriptor;
 
-  VulkanCBufferTag tag(used.access.index, used.access.arrayElement);
+  VulkanCBufferTag tag(used.access.index, used.access.arrayElement, dynamicOffset);
 
   bool filledSlot = (descriptor.resource != ResourceId());
   // Vulkan does not report unused elements at all because we enumerate exclusively from the
@@ -1794,6 +1802,8 @@ void VulkanPipelineStateViewer::setState()
       raster = false;
     }
 
+    setOldMeshPipeFlow();
+
     if(state.geometryShader.resourceId == ResourceId() && xfbActive)
     {
       ui->pipeFlow->setStageName(4, lit("XFB"), tr("Transform Feedback"));
@@ -1803,7 +1813,6 @@ void VulkanPipelineStateViewer::setState()
       ui->pipeFlow->setStageName(4, lit("GS"), tr("Geometry Shader"));
     }
 
-    setOldMeshPipeFlow();
     ui->pipeFlow->setStagesEnabled(
         {true, true, state.tessControlShader.resourceId != ResourceId(),
          state.tessEvalShader.resourceId != ResourceId(),
@@ -1910,7 +1919,7 @@ void VulkanPipelineStateViewer::setState()
         BufferDescription *buf = m_Ctx.GetBuffer(state.inputAssembly.indexBuffer.resourceId);
 
         if(buf)
-          length = buf->length;
+          length = qMin(state.inputAssembly.indexBuffer.byteSize, buf->length);
 
         RDTreeWidgetItem *node = new RDTreeWidgetItem(
             {tr("Index"), state.inputAssembly.indexBuffer.resourceId, tr("Index"), lit("-"),
@@ -3084,8 +3093,9 @@ void VulkanPipelineStateViewer::resource_itemActivated(RDTreeWidgetItem *item, i
 
     if(buf.descriptor.resource != ResourceId())
     {
-      IBufferViewer *viewer = m_Ctx.ViewBuffer(buf.descriptor.byteOffset, buf.descriptor.byteSize,
-                                               buf.descriptor.resource, format);
+      IBufferViewer *viewer =
+          m_Ctx.ViewBuffer(buf.descriptor.byteOffset + buf.dynamicOffset, buf.descriptor.byteSize,
+                           buf.descriptor.resource, format);
 
       m_Ctx.AddDockWindow(viewer->Widget(), DockReference::AddTo, this);
     }
@@ -3138,8 +3148,8 @@ void VulkanPipelineStateViewer::ubo_itemActivated(RDTreeWidgetItem *item, int co
   {
     if(cb.descriptor.resource != ResourceId())
     {
-      IBufferViewer *viewer =
-          m_Ctx.ViewBuffer(cb.descriptor.byteOffset, cb.descriptor.byteSize, cb.descriptor.resource);
+      IBufferViewer *viewer = m_Ctx.ViewBuffer(cb.descriptor.byteOffset + cb.dynamicOffset,
+                                               cb.descriptor.byteSize, cb.descriptor.resource);
 
       m_Ctx.AddDockWindow(viewer->Widget(), DockReference::AddTo, this);
     }
@@ -3493,7 +3503,7 @@ void VulkanPipelineStateViewer::exportHTML(QXmlStreamWriter &xml, const VKPipe::
     if(ib)
     {
       name = m_Ctx.GetResourceName(ia.indexBuffer.resourceId);
-      length = ib->length;
+      length = qMin(ib->length, ia.indexBuffer.byteSize);
     }
 
     QString ifmt = lit("UNKNOWN");
@@ -4612,7 +4622,7 @@ void VulkanPipelineStateViewer::AddFossilizeNexts(QVariantMap &info, const SDObj
     {
       QVariant v = ConvertSDObjectToFossilizeJSON(
           next, {
-                    // VkPipelineVertexInputDivisorStateCreateInfoEXT
+                    // VkPipelineVertexInputDivisorStateCreateInfo
                     {"pVertexBindingDivisors", "vertexBindingDivisors"},
                     // VkRenderPassMultiviewCreateInfo
                     {"subpassCount", ""},

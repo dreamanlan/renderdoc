@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -238,6 +238,8 @@ void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, u
   VkResult vkr = ObjDisp(dev)->CreateBuffer(Unwrap(dev), &bufInfo, NULL, &buf);
   CHECK_VKR(driver, vkr);
 
+  NameUnwrappedVulkanObject(buf, "Unnamed GPUBuffer");
+
   VkMemoryRequirements mrq = {};
   ObjDisp(dev)->GetBufferMemoryRequirements(Unwrap(dev), buf, &mrq);
 
@@ -267,6 +269,20 @@ void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, u
 
   vkr = ObjDisp(dev)->BindBufferMemory(Unwrap(dev), buf, mem, 0);
   CHECK_VKR(driver, vkr);
+
+  if(flags & eGPUBufferAddressable)
+  {
+    RDCCOMPILE_ASSERT(VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO ==
+                          VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO_EXT,
+                      "KHR and EXT buffer_device_address should be interchangeable here.");
+    VkBufferDeviceAddressInfo getAddressInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL,
+                                                buf};
+
+    if(useBufferAddressKHR)
+      addr = ObjDisp(dev)->GetBufferDeviceAddress(Unwrap(dev), &getAddressInfo);
+    else
+      addr = ObjDisp(dev)->GetBufferDeviceAddressEXT(Unwrap(dev), &getAddressInfo);
+  }
 }
 
 void GPUBuffer::FillDescriptor(VkDescriptorBufferInfo &desc)
@@ -283,6 +299,12 @@ void GPUBuffer::Destroy()
     ObjDisp(device)->DestroyBuffer(Unwrap(device), buf, NULL);
     ObjDisp(device)->FreeMemory(Unwrap(device), mem, NULL);
   }
+  addr = 0;
+}
+
+void GPUBuffer::Name(const rdcstr &str)
+{
+  NameUnwrappedVulkanObject(buf, str);
 }
 
 void *GPUBuffer::Map(uint32_t *bindoffset, VkDeviceSize usedsize)
@@ -362,6 +384,30 @@ void GPUBuffer::Unmap()
   }
 
   ObjDisp(device)->UnmapMemory(Unwrap(device), mem);
+}
+
+void GPUBuffer::WriteDescriptor(VkDescriptorSet unwrappedDescSet, uint32_t destBinding,
+                                uint32_t destArrayElement)
+{
+  // vkUpdateDescriptorSet desc set to point to buffer
+  VkDescriptorBufferInfo desc = {0};
+
+  FillDescriptor(desc);
+
+  VkWriteDescriptorSet write = {
+      VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      NULL,
+      unwrappedDescSet,
+      destBinding,
+      destArrayElement,
+      1,
+      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      NULL,
+      &desc,
+      NULL,
+  };
+
+  ObjDisp(device)->UpdateDescriptorSets(Unwrap(device), 1, &write, 0, NULL);
 }
 
 bool VkInitParams::IsSupportedVersion(uint64_t ver)
@@ -926,7 +972,7 @@ rdcstr HumanDriverName(VkDriverId driverId)
     case VK_DRIVER_ID_MESA_NVK: return "Mesa NVK";
     case VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA: return "Imagination Open-source";
     case VK_DRIVER_ID_MESA_HONEYKRISP: return "Mesa Honeykrisp";
-    case VK_DRIVER_ID_RESERVED_27: return "<Unknown>";
+    case VK_DRIVER_ID_VULKAN_SC_EMULATION_ON_VULKAN: return "Vulkan SC Emulation on Vulkan";
     case VK_DRIVER_ID_MAX_ENUM: break;
   }
 
@@ -1370,17 +1416,17 @@ void DescriptorSetSlot::AccumulateBindRefs(DescriptorBindRefs &refs, VulkanResou
 
 void DynamicRenderingLocalRead::Init(const VkBaseInStructure *infoStruct)
 {
-  const VkRenderingAttachmentLocationInfoKHR *attachmentLocationInfo =
-      (const VkRenderingAttachmentLocationInfoKHR *)FindNextStruct(
-          infoStruct, VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR);
+  const VkRenderingAttachmentLocationInfo *attachmentLocationInfo =
+      (const VkRenderingAttachmentLocationInfo *)FindNextStruct(
+          infoStruct, VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO);
   if(attachmentLocationInfo != NULL)
   {
     UpdateLocations(*attachmentLocationInfo);
   }
 
-  const VkRenderingInputAttachmentIndexInfoKHR *inputAttachmentIndexInfo =
-      (const VkRenderingInputAttachmentIndexInfoKHR *)FindNextStruct(
-          infoStruct, VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR);
+  const VkRenderingInputAttachmentIndexInfo *inputAttachmentIndexInfo =
+      (const VkRenderingInputAttachmentIndexInfo *)FindNextStruct(
+          infoStruct, VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO);
   if(inputAttachmentIndexInfo != NULL)
   {
     UpdateInputIndices(*inputAttachmentIndexInfo);
@@ -1388,10 +1434,10 @@ void DynamicRenderingLocalRead::Init(const VkBaseInStructure *infoStruct)
 }
 
 void DynamicRenderingLocalRead::UpdateLocations(
-    const VkRenderingAttachmentLocationInfoKHR &attachmentLocationInfo)
+    const VkRenderingAttachmentLocationInfo &attachmentLocationInfo)
 {
   // If NULL is given, an identity mapping is assumed.  This is indicated by an empty
-  // array.  This works out because not providing VkRenderingAttachmentLocationInfoKHR has the
+  // array.  This works out because not providing VkRenderingAttachmentLocationInfo has the
   // same meaning.
   if(attachmentLocationInfo.pColorAttachmentLocations == NULL)
   {
@@ -1405,10 +1451,10 @@ void DynamicRenderingLocalRead::UpdateLocations(
 }
 
 void DynamicRenderingLocalRead::UpdateInputIndices(
-    const VkRenderingInputAttachmentIndexInfoKHR &inputAttachmentIndexInfo)
+    const VkRenderingInputAttachmentIndexInfo &inputAttachmentIndexInfo)
 {
   // If NULL is given, an identity mapping is assumed.  This is indicated by an empty
-  // array.  This works out because not providing VkRenderingInputAttachmentIndexInfoKHR has the
+  // array.  This works out because not providing VkRenderingInputAttachmentIndexInfo has the
   // same meaning.
   if(inputAttachmentIndexInfo.pColorAttachmentInputIndices == NULL)
   {
@@ -1448,8 +1494,8 @@ void DynamicRenderingLocalRead::CopyInputIndices(const DynamicRenderingLocalRead
 
 void DynamicRenderingLocalRead::SetLocations(VkCommandBuffer cmd)
 {
-  VkRenderingAttachmentLocationInfoKHR attachmentLocations = {};
-  attachmentLocations.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR;
+  VkRenderingAttachmentLocationInfo attachmentLocations = {};
+  attachmentLocations.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO;
   attachmentLocations.colorAttachmentCount = colorAttachmentLocations.count();
   attachmentLocations.pColorAttachmentLocations = colorAttachmentLocations.data();
 
@@ -1458,8 +1504,8 @@ void DynamicRenderingLocalRead::SetLocations(VkCommandBuffer cmd)
 
 void DynamicRenderingLocalRead::SetInputIndices(VkCommandBuffer cmd)
 {
-  VkRenderingInputAttachmentIndexInfoKHR inputIndices = {};
-  inputIndices.sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR;
+  VkRenderingInputAttachmentIndexInfo inputIndices = {};
+  inputIndices.sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO;
   inputIndices.colorAttachmentCount = colorAttachmentInputIndices.count();
   inputIndices.pColorAttachmentInputIndices = colorAttachmentInputIndices.data();
   inputIndices.pDepthInputAttachmentIndex =

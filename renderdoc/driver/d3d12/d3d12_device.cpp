@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2024 Baldur Karlsson
+ * Copyright (c) 2019-2025 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1613,6 +1613,7 @@ ID3D12Resource *WrappedID3D12Device::GetUploadBuffer(uint64_t chunkOffset, uint6
   HRESULT hr = CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &soBufDesc,
                                        D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                                        __uuidof(ID3D12Resource), (void **)&buf);
+  RemoveReplayResource(GetResID(buf));
 
   m_UploadBuffers[chunkOffset] = buf;
 

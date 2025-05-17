@@ -491,7 +491,7 @@ std::vector<uint32_t> CompileShaderToSpv(const std::string &source_text, SPIRVTa
     return ret;
   }
 
-  msleep(100);
+  msleep(400);
 
   int code = pclose(pipe);
 
@@ -530,6 +530,12 @@ void GraphicsTest::Prepare(int argc, char **argv)
   // nothing to do per-test if we've already prepared
   if(prepared)
     return;
+
+#if USE_LINKED_SHADERC
+  TEST_LOG("Using linked shaderc");
+#else
+  TEST_LOG("Requires glslc/shaderc for Vulkan tests");
+#endif
 
   prepared = true;
 

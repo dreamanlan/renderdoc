@@ -2415,7 +2415,7 @@ void WrappedVulkan::StartFrameCapture(DeviceOwnedWindow devWnd)
     GetResourceManager()->MarkMemoryFrameReferenced((*it)->baseResourceMem, (*it)->memOffset,
                                                     (*it)->memSize, eFrameRef_ReadBeforeWrite);
     // and sparse memory (yuck yuck yuck)
-    if((*it)->resInfo)
+    if((*it)->resType == eResBuffer && (*it)->resInfo)
       GetResourceManager()->MarkSparseMapReferenced((*it)->resInfo);
   }
 }
@@ -3214,6 +3214,17 @@ RDResult WrappedVulkan::ReadLogInitialisation(RDCFile *rdc, bool storeStructured
 
     if((SystemChunk)context == SystemChunk::CaptureScope)
     {
+      // create most internal resources now, after having created all application resources. This
+      // means that in a self-capture scenario we don't risk screwing up BDA allocations by having a
+      // non-BDA buffer that's then promoted to BDA during self capture and steals some application
+      // reserved addresses.
+      if(m_Device != VK_NULL_HANDLE)
+      {
+        m_DebugManager = new VulkanDebugManager(this);
+
+        m_Replay->CreateResources();
+      }
+
       GetReplay()->WriteFrameRecord().frameInfo.fileOffset = offsetStart;
 
       // read the remaining data into memory and pass to immediate context

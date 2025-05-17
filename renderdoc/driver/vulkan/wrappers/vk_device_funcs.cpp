@@ -1044,6 +1044,8 @@ void WrappedVulkan::Shutdown()
   for(size_t i = 0; i < m_ReplayPhysicalDevices.size(); i++)
     GetResourceManager()->ReleaseWrappedResource(m_ReplayPhysicalDevices[i]);
 
+  m_ASManager->Cleanup();
+
   m_Replay->DestroyResources();
 
   m_IndirectBuffer.Destroy();
@@ -1897,8 +1899,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     }
     else
     {
-      VkPhysicalDeviceMeshShaderFeaturesEXT *meshFeats =
-          (VkPhysicalDeviceMeshShaderFeaturesEXT *)FindNextStruct(
+      const VkPhysicalDeviceMeshShaderFeaturesEXT *meshFeats =
+          (const VkPhysicalDeviceMeshShaderFeaturesEXT *)FindNextStruct(
               &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
 
       if(meshFeats && meshFeats->meshShader)
@@ -4296,10 +4298,6 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
     m_ShaderCache = new VulkanShaderCache(this);
 
-    m_DebugManager = new VulkanDebugManager(this);
-
-    m_Replay->CreateResources();
-
     SetDebugMessageSink(sink);
   }
 
@@ -4839,6 +4837,8 @@ void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
   SAFE_DELETE(m_DebugManager);
   SAFE_DELETE(m_ShaderCache);
   SAFE_DELETE(m_TextRenderer);
+
+  m_ASManager->Cleanup();
 
   // since we didn't create proper registered resources for our command buffers,
   // they won't be taken down properly with the pool. So we release them (just our

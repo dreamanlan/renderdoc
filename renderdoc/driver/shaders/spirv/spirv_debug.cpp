@@ -371,13 +371,21 @@ void ThreadState::WritePointerValue(Id pointer, const ShaderVariable &val)
 
     // for every other pointer, evaluate its value now before
     for(size_t i = 0; i < pointers.size(); i++)
-      changes[i].before = debugger.GetPointerValue(ids[pointers[i]]);
+    {
+      Id id = pointers[i];
+      if(id != ptrid && live.contains(id))
+        changes[i].before = debugger.GetPointerValue(ids[id]);
+    }
 
     debugger.WriteThroughPointer(var, val);
 
     // now evaluate the value after
     for(size_t i = 0; i < pointers.size(); i++)
-      changes[i].after = debugger.GetPointerValue(ids[pointers[i]]);
+    {
+      Id id = pointers[i];
+      if(id != ptrid && live.contains(id))
+        changes[i].after = debugger.GetPointerValue(ids[id]);
+    }
 
     // if the pointer we're writing is one of the aliased pointers, be sure we add it even if
     // it's a no-op change
@@ -385,8 +393,11 @@ void ThreadState::WritePointerValue(Id pointer, const ShaderVariable &val)
 
     if(ptrIdx >= 0)
     {
-      m_State->changes.push_back(changes[ptrIdx]);
-      changes.erase(ptrIdx);
+      if(pointer != ptrid)
+      {
+        m_State->changes.push_back(changes[ptrIdx]);
+        changes.erase(ptrIdx);
+      }
     }
 
     // remove any no-op changes. Some pointers might point to the same ID but a child that
@@ -403,7 +414,7 @@ void ThreadState::WritePointerValue(Id pointer, const ShaderVariable &val)
     // if this is the first local write, mark this variable as becoming alive here, instead of at
     // its declaration
     if(firstLocalWrite)
-      basechange.before.name = "";
+      basechange.before = {};
 
     m_State->changes.push_back(basechange);
 
@@ -439,8 +450,14 @@ void ThreadState::SetDst(Id id, const ShaderVariable &val)
 
   lastWrite[id] = m_State ? m_State->stepIndex : nextInstruction;
 
-  auto it = std::lower_bound(live.begin(), live.end(), id);
-  live.insert(it - live.begin(), id);
+  bool wasLive = false;
+  if(m_State)
+  {
+    auto it = std::lower_bound(live.begin(), live.end(), id);
+    wasLive = (it != live.end() && *it == id);
+    if(!wasLive)
+      live.insert(it - live.begin(), id);
+  }
 
   if(val.type == VarType::GPUPointer && !debugger.IsPhysicalPointer(val))
   {
@@ -455,7 +472,8 @@ void ThreadState::SetDst(Id id, const ShaderVariable &val)
   if(m_State)
   {
     ShaderVariableChange change;
-    change.before = debugger.GetPointerValue(prev);
+    if(wasLive)
+      change.before = debugger.GetPointerValue(prev);
     change.after = debugger.GetPointerValue(ids[id]);
     m_State->changes.push_back(change);
   }
@@ -739,6 +757,26 @@ void ThreadState::EnterEntryPoint(ShaderDebugState *state)
   EnterFunction({});
 
   m_State = NULL;
+  currentInstruction = nextInstruction;
+}
+
+bool ThreadState::WorkgroupIsDiverged(const rdcarray<ThreadState> &workgroup)
+{
+  uint32_t instr0 = ~0U;
+  for(size_t i = 0; i < workgroup.size(); i++)
+  {
+    if(workgroup[i].Finished())
+      continue;
+    if(instr0 == ~0U)
+    {
+      instr0 = workgroup[i].currentInstruction;
+      continue;
+    }
+    // not executing the same instruction
+    if(workgroup[i].currentInstruction != instr0)
+      return true;
+  }
+  return false;
 }
 
 void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> &workgroup,
@@ -2661,6 +2699,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       const uint32_t firstLaneInSub = workgroupIndex - subgroupId;
       for(uint32_t lane = firstLaneInSub; lane < firstLaneInSub + debugger.GetSubgroupSize(); lane++)
       {
+        RDCASSERT(lane < activeMask.size(), lane, activeMask.size());
         if(activeMask[lane])
         {
           activeLanes.push_back(lane - firstLaneInSub);
@@ -2771,6 +2810,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       const uint32_t firstLaneInSub = workgroupIndex - subgroupId;
       for(uint32_t lane = firstLaneInSub; lane < firstLaneInSub + debugger.GetSubgroupSize(); lane++)
       {
+        RDCASSERT(lane < activeMask.size(), lane, activeMask.size());
         if(activeMask[lane])
         {
           firstActiveLane = lane;
@@ -2778,9 +2818,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         }
       }
 
-      RDCASSERT(firstActiveLane < debugger.GetSubgroupSize(), firstActiveLane,
-                debugger.GetSubgroupSize());
-
+      RDCASSERT(firstActiveLane < workgroup.size(), firstActiveLane, workgroup.size());
       SetDst(opdata.result, workgroup[firstActiveLane].GetSrc(value));
       break;
     }
@@ -2951,6 +2989,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         lane = firstLaneInSub + uintComp(GetSrc(group.index), 0);
       }
 
+      RDCASSERT(lane < workgroup.size(), lane, workgroup.size());
       SetDst(opdata.result, workgroup[lane].GetSrc(value));
       break;
     }
@@ -3159,6 +3198,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       const uint32_t firstLaneInSub = workgroupIndex - subgroupId;
       for(uint32_t lane = firstLaneInSub; lane < firstLaneInSub + debugger.GetSubgroupSize(); lane++)
       {
+        RDCASSERT(lane < activeMask.size(), lane, activeMask.size());
         if(activeMask[lane])
         {
           // if this is in our cluster (or we're not clustering)
@@ -3188,6 +3228,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
             break;
           }
 
+          RDCASSERT(lane < workgroup.size(), lane, workgroup.size());
           ShaderVariable x = workgroup[lane].GetSrc(valueId);
 
           switch(opdata.op)
@@ -3353,6 +3394,8 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
           if(groupOp == GroupOperation::ExclusiveScan && lane == workgroupIndex)
             break;
 
+          RDCASSERT(lane < workgroup.size(), lane, workgroup.size());
+
           uint32_t c = (lane - firstLaneInSub) / 32;
           uint32_t bit = 1U << ((lane - firstLaneInSub) % 32U);
 
@@ -3383,6 +3426,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
           uint32_t c = (lane - firstLaneInSub) / 32;
           uint32_t bit = 1U << ((lane - firstLaneInSub) % 32U);
 
+          RDCASSERT(lane < workgroup.size(), lane, workgroup.size());
           ShaderVariable x = workgroup[lane].GetSrc(valueId);
 
           if(x.value.u32v[0])
@@ -3735,9 +3779,14 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       //////////////////////////////////////////////////////////////////////////////
 
     case Op::MemoryBarrier:
-    case Op::ControlBarrier:
     {
       // do nothing for now
+      break;
+    }
+    case Op::ControlBarrier:
+    {
+      // For thread barriers the threads must be converged
+      RDCASSERT(!WorkgroupIsDiverged(workgroup));
       break;
     }
     case Op::Label:

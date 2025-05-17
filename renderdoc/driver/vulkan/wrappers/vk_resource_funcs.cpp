@@ -318,8 +318,19 @@ bool WrappedVulkan::Serialise_vkAllocateMemory(SerialiserType &ser, VkDevice dev
 
         if(mrq.size != AllocateInfo.allocationSize)
         {
-          RDCDEBUG("Removing dedicated allocation for incompatible size");
-          RemoveNextStruct(&patched, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+          RDCDEBUG("Patching dedicated allocation for incompatible size");
+
+          // if acceleration structures are used, we promote all non-dedicated memory to be BDA as
+          // we can't know if it will be used for an AS or not during capture. That means that
+          // during self-capture if we just remove the dedicated allocation structure here without
+          // any other changes the self-capture layer will promote it to BDA and potentially cause
+          // clashes with reserved addresses elsewhere.
+          // instead we do the more dangerous thing of adjusting the allocation size to match the
+          // image's memory requirements and keep the dedicated allocation.
+          if(AccelerationStructures())
+            patched.allocationSize = mrq.size;
+          else
+            RemoveNextStruct(&patched, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
         }
       }
     }
@@ -500,6 +511,7 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   VkMemoryAllocateInfo unwrapped = info;
 
   byte *tempMem = GetTempMemory(GetNextPatchSize(unwrapped.pNext));
+  byte *reusedTempMem = tempMem;
 
   UnwrapNextChain(m_State, "VkMemoryAllocateInfo", tempMem, (VkBaseInStructure *)&unwrapped);
 
@@ -519,8 +531,9 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   bool forceBDA = false;
   if(IsCaptureMode(m_State) && AccelerationStructures())
   {
-    VkMemoryDedicatedAllocateInfo *dedicated = (VkMemoryDedicatedAllocateInfo *)FindNextStruct(
-        pAllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    const VkMemoryDedicatedAllocateInfo *dedicated =
+        (const VkMemoryDedicatedAllocateInfo *)FindNextStruct(
+            pAllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
     if(dedicated == NULL || dedicated->image == VK_NULL_HANDLE)
     {
       // force BDA flag when creating, by adding the struct if needed
@@ -549,8 +562,9 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
 
   // remove dedicated memory struct if it is not allowed
   {
-    VkMemoryDedicatedAllocateInfo *dedicated = (VkMemoryDedicatedAllocateInfo *)FindNextStruct(
-        pAllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    const VkMemoryDedicatedAllocateInfo *dedicated =
+        (const VkMemoryDedicatedAllocateInfo *)FindNextStruct(
+            pAllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
     if(dedicated && dedicated->image != VK_NULL_HANDLE)
     {
       VkResourceRecord *imageRecord = GetRecord(dedicated->image);
@@ -572,15 +586,16 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   {
     ResourceId id = GetResourceManager()->WrapResource(Unwrap(device), *pMemory);
 
-    VkMemoryDedicatedAllocateInfo *dedicated = (VkMemoryDedicatedAllocateInfo *)FindNextStruct(
-        pAllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    const VkMemoryDedicatedAllocateInfo *dedicated =
+        (const VkMemoryDedicatedAllocateInfo *)FindNextStruct(
+            pAllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
     if(dedicated && dedicated->buffer == VK_NULL_HANDLE && dedicated->image == VK_NULL_HANDLE)
     {
       dedicated = NULL;
     }
 
-    VkDedicatedAllocationMemoryAllocateInfoNV *dedicatedNV =
-        (VkDedicatedAllocationMemoryAllocateInfoNV *)FindNextStruct(
+    const VkDedicatedAllocationMemoryAllocateInfoNV *dedicatedNV =
+        (const VkDedicatedAllocationMemoryAllocateInfoNV *)FindNextStruct(
             pAllocateInfo, VK_STRUCTURE_TYPE_DEDICATED_ALLOCATION_MEMORY_ALLOCATE_INFO_NV);
     if(dedicatedNV && dedicatedNV->buffer == VK_NULL_HANDLE && dedicatedNV->image == VK_NULL_HANDLE)
     {
@@ -688,6 +703,9 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
       Chunk *chunk = NULL;
 
       VkMemoryAllocateInfo serialisedInfo = info;
+      CopyNextChainForPatching("VkMemoryAllocateInfo", reusedTempMem,
+                               (VkBaseInStructure *)&serialisedInfo);
+
       VkMemoryOpaqueCaptureAddressAllocateInfo memoryDeviceAddress = {
           VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO,
       };
@@ -2506,8 +2524,9 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
   // reserve space for a patched view format list if necessary
   if(createInfo_adjusted.samples != VK_SAMPLE_COUNT_1_BIT)
   {
-    VkImageFormatListCreateInfo *formatListInfo = (VkImageFormatListCreateInfo *)FindNextStruct(
-        &createInfo_adjusted, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+    const VkImageFormatListCreateInfo *formatListInfo =
+        (const VkImageFormatListCreateInfo *)FindNextStruct(
+            &createInfo_adjusted, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
 
     if(formatListInfo)
       tempMemSize += sizeof(VkFormat) * (formatListInfo->viewFormatCount + 1);
@@ -3176,38 +3195,73 @@ bool WrappedVulkan::Serialise_vkBindImageMemory2(SerialiserType &ser, VkDevice d
       VkMemoryRequirements mrq = {};
       ObjDisp(device)->GetImageMemoryRequirements(Unwrap(device), Unwrap(bindInfo.image), &mrq);
 
-      bool ok = CheckMemoryRequirements(GetResourceDesc(resOrigId).name.c_str(),
-                                        GetResID(bindInfo.memory), bindInfo.memoryOffset, mrq,
-                                        imgInfo.external, imgInfo.mrq);
+      VkBindImageMemorySwapchainInfoKHR *swapBind =
+          (VkBindImageMemorySwapchainInfoKHR *)FindNextStruct(
+              &bindInfo, VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
 
-      if(!ok)
-        return false;
-
+      // can't reconstruct this on replay as we don't have the swapchain handle anymore, so just
+      // assume that a NULL memory object was valid if the structure was at least present...
+      if(swapBind && bindInfo.memory == VK_NULL_HANDLE)
       {
-        ResourceId id = GetResID(bindInfo.image);
-        LockedImageStateRef state = FindImageState(id);
-        if(!state)
+        MemoryAllocation all = AllocateMemoryForResource(
+            bindInfo.image, MemoryScope::ImmutableReplayDebug, MemoryType::GPULocal);
+
+        VkBindImageMemoryInfo &patchBindInfo = (VkBindImageMemoryInfo &)pBindInfos[i];
+        patchBindInfo.memory = all.mem;
+        patchBindInfo.memoryOffset = all.offs;
+
         {
-          RDCERR("Binding memory for unknown image %s", ToStr(id).c_str());
+          ResourceId id = GetResID(bindInfo.image);
+          LockedImageStateRef state = FindImageState(id);
+          if(!state)
+          {
+            RDCERR("Binding memory for unknown image %s", ToStr(id).c_str());
+          }
+          else
+          {
+            state->isMemoryBound = true;
+          }
         }
-        else
+      }
+      else
+      {
+        bool ok = CheckMemoryRequirements(GetResourceDesc(resOrigId).name.c_str(),
+                                          GetResID(bindInfo.memory), bindInfo.memoryOffset, mrq,
+                                          imgInfo.external, imgInfo.mrq);
+
+        if(!ok)
+          return false;
+
         {
-          state->isMemoryBound = true;
-          state->boundMemory = GetResID(bindInfo.memory);
-          state->boundMemoryOffset = bindInfo.memoryOffset;
-          state->boundMemorySize = mrq.size;
+          ResourceId id = GetResID(bindInfo.image);
+          LockedImageStateRef state = FindImageState(id);
+          if(!state)
+          {
+            RDCERR("Binding memory for unknown image %s", ToStr(id).c_str());
+          }
+          else
+          {
+            state->isMemoryBound = true;
+            state->boundMemory = GetResID(bindInfo.memory);
+            state->boundMemoryOffset = bindInfo.memoryOffset;
+            state->boundMemorySize = mrq.size;
+          }
         }
       }
 
-      GetResourceDesc(memOrigId).derivedResources.push_back(resOrigId);
-      GetResourceDesc(resOrigId).parentResources.push_back(memOrigId);
-
-      AddResourceCurChunk(memOrigId);
       AddResourceCurChunk(resOrigId);
 
-      m_CreationInfo.m_Memory[GetResID(bindInfo.memory)].BindMemory(
-          bindInfo.memoryOffset, mrq.size,
-          imgInfo.linear ? VulkanCreationInfo::Memory::Linear : VulkanCreationInfo::Memory::Tiled);
+      if(memOrigId != ResourceId())
+      {
+        GetResourceDesc(memOrigId).derivedResources.push_back(resOrigId);
+        GetResourceDesc(resOrigId).parentResources.push_back(memOrigId);
+
+        AddResourceCurChunk(memOrigId);
+
+        m_CreationInfo.m_Memory[GetResID(bindInfo.memory)].BindMemory(
+            bindInfo.memoryOffset, mrq.size,
+            imgInfo.linear ? VulkanCreationInfo::Memory::Linear : VulkanCreationInfo::Memory::Tiled);
+      }
     }
 
     VkBindImageMemoryInfo *unwrapped = UnwrapInfos(m_State, pBindInfos, bindInfoCount);
@@ -3291,13 +3345,28 @@ VkResult WrappedVulkan::vkBindImageMemory2(VkDevice device, uint32_t bindInfoCou
       // to memory mid-frame
       imgrecord->AddChunk(chunk);
 
-      imgrecord->AddParent(memrecord);
+      const VkBindImageMemorySwapchainInfoKHR *swapBind =
+          (const VkBindImageMemorySwapchainInfoKHR *)FindNextStruct(
+              &pBindInfos[i], VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
 
-      // images are a base resource but we want to track where their memory comes from.
-      // Anything that looks up a baseResource for an image knows not to chase further
-      // than the image.
-      imgrecord->baseResourceMem = imgrecord->baseResource = memrecord->GetResourceID();
-      imgrecord->dedicated = memrecord->memMapState->dedicated;
+      if(swapBind && swapBind->swapchain != VK_NULL_HANDLE)
+      {
+        VkResourceRecord *swaprecord = GetRecord(swapBind->swapchain);
+
+        imgrecord->InternalResource = true;
+
+        imgrecord->AddParent(swaprecord);
+      }
+      else
+      {
+        imgrecord->AddParent(memrecord);
+
+        // images are a base resource but we want to track where their memory comes from.
+        // Anything that looks up a baseResource for an image knows not to chase further
+        // than the image.
+        imgrecord->baseResourceMem = imgrecord->baseResource = memrecord->GetResourceID();
+        imgrecord->dedicated = memrecord->memMapState->dedicated;
+      }
     }
   }
   else

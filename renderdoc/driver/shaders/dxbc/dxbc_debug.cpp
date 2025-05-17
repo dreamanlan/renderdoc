@@ -1247,6 +1247,43 @@ void ThreadState::SetDst(ShaderDebugState *state, const Operand &dstoper, const 
   }
 }
 
+void ThreadState::GetGroupsharedSrc(uint32_t gsmIndex, const uint32_t byteOffset,
+                                    const uint32_t countBytes, uint32_t *data) const
+{
+  const uint32_t gsmStride = global.groupshared[gsmIndex].bytestride;
+
+  const uint32_t regIndex = byteOffset / gsmStride;
+  const uint32_t component = AlignUp4(byteOffset % gsmStride) / 4;
+  RDCASSERT((component + countBytes / sizeof(uint32_t)) < 4, component, countBytes);
+
+  uint32_t idx = program->GetRegisterIndex(TYPE_THREAD_GROUP_SHARED_MEMORY, gsmIndex);
+  if(idx < variables.size())
+  {
+    const ShaderVariable &var = variables[idx].members[regIndex];
+    if(gsmStride <= 16)
+    {
+      // if the stride is less than a float4, the groupshared storage is a simple array of N
+      // float4 registers so we can just assign
+      for(uint32_t i = 0; i < countBytes / sizeof(uint32_t); i++)
+        data[i] = var.value.u32v[component + i];
+    }
+    else
+    {
+      // otherwise each entry in the groupshared storage array is a series of N component-sized registers
+      for(uint32_t i = 0; i < countBytes / sizeof(uint32_t); i++)
+        data[i] = var.members[component + i].value.u32v[0];
+    }
+  }
+  else
+  {
+    RDCERR("Couldn't find groupshared register %u", gsmIndex);
+    data[0] = 0U;
+    data[1] = 0U;
+    data[2] = 0U;
+    data[3] = 0U;
+  }
+}
+
 void ThreadState::SetGroupsharedDst(ShaderDebugState *state, uint32_t gsmIndex,
                                     const uint32_t byteOffset, ShaderVariable &val)
 {
@@ -1285,8 +1322,10 @@ void ThreadState::SetGroupsharedDst(ShaderDebugState *state, uint32_t gsmIndex,
     {
       // otherwise each entry in the groupshared storage array is a series of N
       // component-sized registers so unroll that here and assign to the first component
+      RDCASSERT(component + val.columns <= v->members.size(), component + val.columns,
+                v->members.size());
       for(uint32_t i = 0; i < val.columns; i++)
-        v->members[component + i].members[0].value.u32v[0] = val.value.u32v[i];
+        v->members[component + i].value.u32v[0] = val.value.u32v[i];
     }
 
     change.after = *changeVar;
@@ -2627,6 +2666,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           ShaderVariableChange change = {*changeVar};
 
           byte *data = global.groupshared[gsmIndex].data.data();
+          RDCASSERT(global.groupshared[gsmIndex].count <= v->members.size(),
+                    global.groupshared[gsmIndex].count, v->members.size());
           for(uint32_t i = 0; i < global.groupshared[gsmIndex].count; i++)
           {
             if(gsmStride <= 16)
@@ -2640,6 +2681,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
             {
               // otherwise each entry in the groupshared storage array is a series of N
               // component-sized registers so unroll that here and copy into each's first component
+              RDCASSERT(gsmStride <= v->members[i].members.size(), gsmStride,
+                        v->members[i].members.size());
               for(uint32_t c = 0; c < gsmStride; c += sizeof(uint32_t))
               {
                 memcpy(v->members[i].members[c].value.u32v.data(), data, sizeof(uint32_t));
@@ -3449,7 +3492,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           fmt.byteWidth = 4;
 
           fmt.numComps = 4;
-          boundsClampedComps = int((stride - structOffset) / sizeof(uint32_t));
+          boundsClampedComps =
+              RDCMIN(boundsClampedComps, int((stride - structOffset) / sizeof(uint32_t)));
           fmt.numComps = RDCMIN(fmt.numComps, boundsClampedComps);
 
           if(op.operands[0].comps[0] != 0xff && op.operands[0].comps[1] == 0xff &&
@@ -3472,7 +3516,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
             fmt.numComps = 4;
 
           // do not allow writing beyond the stride (we don't expect fxc to emit writes like this anyway)
-          boundsClampedComps = int((stride - structOffset) / sizeof(uint32_t));
+          boundsClampedComps =
+              RDCMIN(boundsClampedComps, int((stride - structOffset) / sizeof(uint32_t)));
           fmt.numComps = RDCMIN(fmt.numComps, boundsClampedComps);
 
           for(int c = 0; c < 4; c++)
@@ -3494,7 +3539,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           fmt.numComps = 4;
 
           // clamp to out of bounds based on numElems
-          boundsClampedComps = int(numElems - elemIdx) / 4;
+          boundsClampedComps = RDCMIN(boundsClampedComps, int(numElems - elemIdx) / 4);
           fmt.numComps = RDCMIN(fmt.numComps, boundsClampedComps);
 
           if(op.operands[0].comps[0] != 0xff && op.operands[0].comps[1] == 0xff &&
@@ -3516,7 +3561,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
             fmt.numComps = 4;
 
           // clamp to out of bounds based on numElems
-          boundsClampedComps = int(numElems - elemIdx) / 4;
+          boundsClampedComps = RDCMIN(boundsClampedComps, int(numElems - elemIdx) / 4);
           fmt.numComps = RDCMIN(fmt.numComps, boundsClampedComps);
 
           for(int c = 0; c < boundsClampedComps; c++)
@@ -3532,6 +3577,14 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
         if(load)
         {
+          uint32_t gsmData[4];
+          if(gsm && state)
+          {
+            // The active thread reads GSM data from the local GSM cache
+            GetGroupsharedSrc(resIndex, uint32_t(data - gsm_base), fmt.numComps * fmt.byteWidth,
+                              gsmData);
+            data = (byte *)gsmData;
+          }
           ShaderVariable result = TypedUAVLoad(fmt, data);
 
           // clamp the result to any out of bounds loads so that we don't fill in with w=1
@@ -4549,6 +4602,7 @@ BindingSlot GetBindingSlotForIdentifier(const Program &program, OperandType decl
   // register space (which can be any value, as specified in HLSL and the root signature).
 
   // TODO: Need to test resource arrays to ensure correct behavior with SM 5.1 here
+  // TODO: writes to GSM could update local GSM and then the global cache (currently the other way around)
 
   if(program.IsShaderModel51())
   {
@@ -4589,8 +4643,8 @@ void GlobalState::PopulateGroupshared(const DXBCBytecode::Program *pBytecode)
         }
         else
         {
-          mem.count = decl.tgsmCount;
-          mem.bytestride = 4;    // raw groupshared is implicitly uint32s
+          mem.count = decl.tgsmCount / 4;    // convert from bytes to elements
+          mem.bytestride = 4;                // raw groupshared is implicitly uint32s
         }
 
         mem.data.resize(mem.bytestride * mem.count);

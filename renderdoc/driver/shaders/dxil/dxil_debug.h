@@ -103,6 +103,7 @@ struct FunctionInfo
   rdcarray<uint32_t> uniformBlocks;
   rdcarray<uint32_t> divergentBlocks;
   rdcarray<DXIL::ConvergentBlockData> convergentBlocks;
+  rdcarray<DXIL::PartialConvergentBlockData> partialConvergentBlocks;
   DXIL::ControlFlow controlFlow;
   std::map<uint32_t, Callstack> callstacks;
   rdcarray<uint32_t> instructionToBlock;
@@ -250,9 +251,7 @@ struct ThreadState
   bool ExecuteInstruction(DebugAPIWrapper *apiWrapper, const rdcarray<ThreadState> &workgroup,
                           const rdcarray<bool> &activeMask);
 
-  void MarkResourceAccess(const rdcstr &name, const ResourceReferenceInfo &resRefInfo,
-                          bool directAccess, const ShaderDirectAccess &access,
-                          const ShaderBindIndex &bindIndex);
+  void MarkResourceAccess(const ShaderVariable &var);
   void SetResult(const Id &id, ShaderVariable &result, DXIL::Operation op, DXIL::DXOp dxOpCode,
                  ShaderEvents flags);
   rdcstr GetArgumentName(uint32_t i) const;
@@ -302,9 +301,9 @@ struct ThreadState
   bool IsVariableAssigned(const Id id) const;
 
   ShaderVariable GetBuiltin(ShaderBuiltin builtin);
-  void GetSubgroupActiveLanes(const rdcarray<bool> &activeMask,
-                              const rdcarray<ThreadState> &workgroup,
-                              rdcarray<uint32_t> &activeLanes) const;
+  uint32_t GetSubgroupActiveLanes(const rdcarray<bool> &activeMask,
+                                  const rdcarray<ThreadState> &workgroup,
+                                  rdcarray<uint32_t> &activeLanes) const;
 
   struct AnnotationProperties
   {
@@ -361,14 +360,12 @@ struct ThreadState
   // true if executed an operation which could trigger divergence
   bool m_Diverged;
   // list of potential convergence points that were entered in a single step (used for tracking thread convergence)
-  rdcarray<uint32_t> m_EnteredPoints;
+  DXIL::BlockArray m_EnteredPoints;
   uint32_t m_ConvergencePoint;
+  DXIL::BlockArray m_PartialConvergencePoints;
 
   // SSA Ids guaranteed to be greater than 0 and less than this value
   uint32_t m_MaxSSAId;
-
-  rdcarray<BindingSlot> m_accessedSRVs;
-  rdcarray<BindingSlot> m_accessedUAVs;
 
   // quad ID (arbitrary, just used to find neighbours for derivatives)
   uint32_t m_QuadId = 0;

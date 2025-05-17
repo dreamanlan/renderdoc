@@ -45,6 +45,67 @@
 #include "toolwindowmanager/ToolWindowManagerArea.h"
 #include "ui_ShaderViewer.h"
 
+#if defined(RELEASE)
+#define SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS 0
+#else
+#define SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS 1
+
+bool ShaderVariableEqual(const ShaderVariable &a, const ShaderVariable &b)
+{
+  if(a.rows != b.rows)
+    return false;
+  if(a.columns != b.columns)
+    return false;
+  if(a.name != b.name)
+    return false;
+  if(a.type != b.type)
+    return false;
+  if(a.flags != b.flags)
+    return false;
+  if(a.members.size() != b.members.size())
+    return false;
+
+  for(int i = 0; i < a.rows * a.columns; ++i)
+  {
+    switch(a.type)
+    {
+      case VarType::UByte:
+      case VarType::SByte:
+        if(a.value.u8v[i] != b.value.u8v[i])
+          return false;
+        break;
+      case VarType::Half:
+      case VarType::UShort:
+      case VarType::SShort:
+        if(a.value.u16v[i] != b.value.u16v[i])
+          return false;
+        break;
+      case VarType::Float:
+      case VarType::UInt:
+      case VarType::SInt:
+      case VarType::Bool:
+      case VarType::Enum:
+        if(a.value.u32v[i] != b.value.u32v[i])
+          return false;
+        break;
+      case VarType::Double:
+      case VarType::ULong:
+      case VarType::SLong:
+      case VarType::GPUPointer:
+      default:
+        if(a.value.u64v[i] != b.value.u64v[i])
+          return false;
+        break;
+    }
+  }
+  for(size_t m = 0; m < a.members.size(); ++m)
+    if(!ShaderVariableEqual(a.members[m], b.members[m]))
+      return false;
+
+  return true;
+}
+#endif    // #if defined(RELEASE)
+
 static bool ResourceReferencesMatch(const ShaderVariable &a, const ShaderVariable &b)
 {
   if(a.IsDirectAccess() == b.IsDirectAccess())
@@ -2630,8 +2691,18 @@ void ShaderViewer::applyBackwardsChange()
   if(IsFirstState())
     return;
 
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+  QSet<rdcstr> changedVariables;
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+  const ShaderVariable nullChange;
   for(const ShaderVariableChange &c : GetCurrentState().changes)
   {
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+    rdcstr varName = c.before.name.empty() ? c.after.name : c.before.name;
+    if(changedVariables.contains(varName))
+      qCritical("Multiple ShaderVariableChange's for '%s'", varName.c_str());
+    changedVariables.insert(varName);
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
     // if the before name is empty, this is a variable that came into scope/was created
     if(c.before.name.empty())
     {
@@ -2639,14 +2710,21 @@ void ShaderViewer::applyBackwardsChange()
       m_VariableLastUpdate[c.after.name] = m_UpdateID;
 
       // delete the matching variable (should only be one)
+      bool found = false;
       for(int i = 0; i < m_Variables.count(); i++)
       {
         if(c.after.name == m_Variables[i].name)
         {
           m_Variables.removeAt(i);
+          found = true;
           break;
         }
       }
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+      if(!found)
+        qCritical("ShaderVariableChange for '%s' not found in existing variables",
+                  c.after.name.c_str());
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
     }
     else
     {
@@ -2664,9 +2742,22 @@ void ShaderViewer::applyBackwardsChange()
       }
 
       if(v)
+      {
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+        if(!ShaderVariableEqual(c.after, *v))
+          qCritical("ShaderVariableChange for '%s' after does not match existing entry",
+                    c.before.name.c_str());
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
         *v = c.before;
+      }
       else
+      {
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+        if(!(c.after == nullChange))
+          qCritical("ShaderVariableChange for '%s' does not have NULL after", c.before.name.c_str());
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
         m_Variables.insert(0, c.before);
+      }
     }
   }
 
@@ -2684,8 +2775,18 @@ void ShaderViewer::applyForwardsChange()
 
   rdcarray<AccessedResourceData> newAccessedResources;
 
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+  QSet<rdcstr> changedVariables;
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+  const ShaderVariable nullChange;
   for(const ShaderVariableChange &c : GetCurrentState().changes)
   {
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+    rdcstr varName = c.after.name.empty() ? c.before.name : c.after.name;
+    if(changedVariables.contains(varName))
+      qCritical("Multiple ShaderVariableChange's for '%s'", varName.c_str());
+    changedVariables.insert(varName);
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
     // if the after name is empty, this is a variable going out of scope/being deleted
     if(c.after.name.empty())
     {
@@ -2693,14 +2794,21 @@ void ShaderViewer::applyForwardsChange()
       m_VariableLastUpdate[c.before.name] = m_UpdateID;
 
       // delete the matching variable (should only be one)
+      bool found = false;
       for(int i = 0; i < m_Variables.count(); i++)
       {
         if(c.before.name == m_Variables[i].name)
         {
           m_Variables.removeAt(i);
+          found = true;
           break;
         }
       }
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+      if(!found)
+        qCritical("ShaderVariableChange for '%s' not found in existing variables",
+                  c.before.name.c_str());
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
     }
     else
     {
@@ -2718,9 +2826,22 @@ void ShaderViewer::applyForwardsChange()
       }
 
       if(v)
+      {
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+        if(!ShaderVariableEqual(c.before, *v))
+          qCritical("ShaderVariableChange for '%s' before does not match existing entry",
+                    c.after.name.c_str());
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
         *v = c.after;
+      }
       else
+      {
+#if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
+        if(!(c.before == nullChange))
+          qCritical("ShaderVariableChange for '%s' does not have NULL before", c.after.name.c_str());
+#endif    // #if SHADER_VARIABLE_CHANGE_CONSISTENCY_CHECKS
         m_Variables.insert(0, c.after);
+      }
 
       if(c.after.type == VarType::ReadOnlyResource || c.after.type == VarType::ReadWriteResource)
       {

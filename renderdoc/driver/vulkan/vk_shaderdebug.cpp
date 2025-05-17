@@ -195,56 +195,51 @@ public:
     {
       const VulkanRenderState &state = m_pDriver->GetRenderState();
 
-      const rdcarray<VulkanStatePipeline::DescriptorAndOffsets> *srcs[] = {
-          &state.graphics.descSets,
-          &state.compute.descSets,
-      };
+      const rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &src =
+          (stage == ShaderStage::Compute ? state.compute.descSets : state.graphics.descSets);
 
-      for(size_t p = 0; p < ARRAY_COUNT(srcs); p++)
+      for(size_t i = 0; i < src.size(); i++)
       {
-        for(size_t i = 0; i < srcs[p]->size(); i++)
-        {
-          const VulkanStatePipeline::DescriptorAndOffsets &srcData = srcs[p]->at(i);
-          ResourceId sourceSet = srcData.descSet;
-          const uint32_t *srcOffset = srcData.offsets.begin();
+        const VulkanStatePipeline::DescriptorAndOffsets &srcData = src[i];
+        ResourceId sourceSet = srcData.descSet;
+        const uint32_t *srcOffset = srcData.offsets.begin();
 
-          if(sourceSet == ResourceId())
+        if(sourceSet == ResourceId())
+          continue;
+
+        const VulkanCreationInfo::PipelineLayout &pipeLayoutInfo =
+            m_Creation.m_PipelineLayout[srcData.pipeLayout];
+
+        ResourceId setOrig = m_pDriver->GetResourceManager()->GetOriginalID(sourceSet);
+
+        const BindingStorage &bindStorage =
+            m_pDriver->GetCurrentDescSetBindingStorage(srcData.descSet);
+        const DescriptorSetSlot *first = bindStorage.binds.empty() ? NULL : bindStorage.binds[0];
+        for(size_t b = 0; b < bindStorage.binds.size(); b++)
+        {
+          const DescSetLayout::Binding &layoutBind =
+              m_Creation.m_DescSetLayout[pipeLayoutInfo.descSetLayouts[i]].bindings[b];
+
+          if(layoutBind.layoutDescType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+             layoutBind.layoutDescType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
             continue;
 
-          const VulkanCreationInfo::PipelineLayout &pipeLayoutInfo =
-              m_Creation.m_PipelineLayout[srcData.pipeLayout];
+          uint64_t descriptorByteOffset = bindStorage.binds[b] - first;
 
-          ResourceId setOrig = m_pDriver->GetResourceManager()->GetOriginalID(sourceSet);
-
-          const BindingStorage &bindStorage =
-              m_pDriver->GetCurrentDescSetBindingStorage(srcData.descSet);
-          const DescriptorSetSlot *first = bindStorage.binds.empty() ? NULL : bindStorage.binds[0];
-          for(size_t b = 0; b < bindStorage.binds.size(); b++)
+          // inline UBOs aren't dynamic and variable size can't be used with dynamic buffers, so
+          // the count is what it is at definition time
+          for(uint32_t a = 0; a < layoutBind.descriptorCount; a++)
           {
-            const DescSetLayout::Binding &layoutBind =
-                m_Creation.m_DescSetLayout[pipeLayoutInfo.descSetLayouts[i]].bindings[b];
+            uint32_t dynamicBufferByteOffset = *srcOffset;
+            srcOffset++;
 
-            if(layoutBind.layoutDescType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
-               layoutBind.layoutDescType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
-              continue;
-
-            uint64_t descriptorByteOffset = bindStorage.binds[b] - first;
-
-            // inline UBOs aren't dynamic and variable size can't be used with dynamic buffers, so
-            // the count is what it is at definition time
-            for(uint32_t a = 0; a < layoutBind.descriptorCount; a++)
+            for(size_t accIdx = 0; accIdx < m_Access.size(); accIdx++)
             {
-              uint32_t dynamicBufferByteOffset = *srcOffset;
-              srcOffset++;
-
-              for(size_t accIdx = 0; accIdx < m_Access.size(); accIdx++)
+              if(m_Access[accIdx].descriptorStore == setOrig &&
+                 m_Access[accIdx].byteOffset == descriptorByteOffset + a)
               {
-                if(m_Access[accIdx].descriptorStore == setOrig &&
-                   m_Access[accIdx].byteOffset == descriptorByteOffset + a)
-                {
-                  m_Descriptors[accIdx].byteOffset += dynamicBufferByteOffset;
-                  break;
-                }
+                m_Descriptors[accIdx].byteOffset += dynamicBufferByteOffset;
+                break;
               }
             }
           }
@@ -5955,9 +5950,6 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   apiWrapper->thread_builtins.resize(numThreads);
   apiWrapper->thread_props.resize(numThreads);
 
-  apiWrapper->thread_props[0][(size_t)rdcspv::ThreadProperty::Active] = 1;
-  apiWrapper->thread_props[0][(size_t)rdcspv::ThreadProperty::SubgroupId] = 0;
-
   std::unordered_map<ShaderBuiltin, ShaderVariable> &global_builtins = apiWrapper->global_builtins;
   global_builtins[ShaderBuiltin::DispatchSize] =
       ShaderVariable(rdcstr(), action->dispatchDimension[0], action->dispatchDimension[1],
@@ -6119,11 +6111,12 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
     byte *LaneData = (byte *)(winner + 1);
 
     numThreads = 4;
+    const uint32_t subgroupSize = winner->subgroupSize;
 
     if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Subgroup)
     {
-      RDCASSERTNOTEQUAL(winner->subgroupSize, 0);
-      numThreads = RDCMAX(numThreads, winner->subgroupSize);
+      RDCASSERTNOTEQUAL(subgroupSize, 0);
+      numThreads = RDCMAX(numThreads, subgroupSize);
     }
 
     if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Workgroup)
@@ -6140,7 +6133,7 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
 
     laneIndex = ~0U;
 
-    for(uint32_t t = 0; t < winner->subgroupSize; t++)
+    for(uint32_t t = 0; t < subgroupSize; t++)
     {
       byte *value = LaneData + t * structStride;
 
@@ -6163,7 +6156,6 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
         laneIndex = lane;
 
       apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::Active] = subgroupData->isActive;
-      RDCASSERT(subgroupData->isActive);
       apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::Elected] = subgroupData->elect;
       apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::SubgroupId] = t;
 
@@ -6203,6 +6195,11 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
             std::unordered_map<ShaderBuiltin, ShaderVariable> &thread_builtins =
                 apiWrapper->thread_builtins[i];
 
+            thread_builtins[ShaderBuiltin::GroupThreadIndex] =
+                ShaderVariable(rdcstr(), tx, ty, tz, 0U);
+            thread_builtins[ShaderBuiltin::GroupFlatIndex] = ShaderVariable(
+                rdcstr(), tz * threadDim[0] * threadDim[1] + ty * threadDim[0] + tx, 0U, 0U, 0U);
+
             if(apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::Active])
             {
               // assert that this is the thread we expect it to be
@@ -6214,25 +6211,23 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
                              groupid[2] * threadDim[2] + tz);
 
               RDCASSERTEQUAL(thread_builtins[ShaderBuiltin::IndexInSubgroup].value.u32v[0],
-                             i % winner->subgroupSize);
+                             i % subgroupSize);
               RDCASSERTEQUAL(thread_builtins[ShaderBuiltin::SubgroupIndexInWorkgroup].value.u32v[0],
-                             i / winner->subgroupSize);
+                             i / subgroupSize);
             }
             else
             {
               thread_builtins[ShaderBuiltin::DispatchThreadIndex] =
                   ShaderVariable(rdcstr(), groupid[0] * threadDim[0] + tx,
                                  groupid[1] * threadDim[1] + ty, groupid[2] * threadDim[2] + tz, 0U);
-              thread_builtins[ShaderBuiltin::GroupThreadIndex] =
-                  ShaderVariable(rdcstr(), tx, ty, tz, 0U);
-              thread_builtins[ShaderBuiltin::GroupFlatIndex] = ShaderVariable(
-                  rdcstr(), tz * threadDim[0] * threadDim[1] + ty * threadDim[0] + tx, 0U, 0U, 0U);
               // tightly wrap subgroups, this is likely not how the GPU actually assigns them
               thread_builtins[ShaderBuiltin::IndexInSubgroup] =
-                  ShaderVariable(rdcstr(), i % winner->subgroupSize, 0U, 0U, 0U);
+                  ShaderVariable(rdcstr(), i % subgroupSize, 0U, 0U, 0U);
               thread_builtins[ShaderBuiltin::SubgroupIndexInWorkgroup] =
-                  ShaderVariable(rdcstr(), i / winner->subgroupSize, 0U, 0U, 0U);
+                  ShaderVariable(rdcstr(), i / subgroupSize, 0U, 0U, 0U);
               apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::Active] = 1;
+              apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::SubgroupId] =
+                  i % subgroupSize;
             }
 
             i++;
@@ -6241,12 +6236,37 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
       }
     }
 
-    apiWrapper->global_builtins[ShaderBuiltin::SubgroupSize] =
-        ShaderVariable(rdcstr(), winner->subgroupSize, 0U, 0U, 0U);
+    // Add inactive padding lanes to round up to the subgroup size
+    const uint32_t numPaddingThreads = AlignUp(numThreads, subgroupSize) - numThreads;
+    if(numPaddingThreads > 0)
+    {
+      uint32_t newNumThreads = numThreads + numPaddingThreads;
+      apiWrapper->thread_props.resize(newNumThreads);
+      apiWrapper->thread_builtins.resize(newNumThreads);
+      for(uint32_t i = numThreads; i < newNumThreads; ++i)
+      {
+        std::unordered_map<ShaderBuiltin, ShaderVariable> &thread_builtins =
+            apiWrapper->thread_builtins[i];
 
-    ShaderDebugTrace *ret = debugger->BeginDebug(
-        apiWrapper, stage, entryPoint, spec, shadRefl.instructionLines, shadRefl.patchData,
-        winner->laneIndex, numThreads, winner->subgroupSize);
+        thread_builtins[ShaderBuiltin::DispatchThreadIndex] =
+            ShaderVariable(rdcstr(), -1, -1, -1, -1);
+        thread_builtins[ShaderBuiltin::GroupThreadIndex] = ShaderVariable(rdcstr(), -1, -1, -1, -1);
+        thread_builtins[ShaderBuiltin::GroupFlatIndex] = ShaderVariable(rdcstr(), -1, -1, -1, -1);
+        thread_builtins[ShaderBuiltin::IndexInSubgroup] =
+            ShaderVariable(rdcstr(), i % subgroupSize, 0U, 0U, 0U);
+        thread_builtins[ShaderBuiltin::SubgroupIndexInWorkgroup] =
+            ShaderVariable(rdcstr(), i / subgroupSize, 0U, 0U, 0U);
+        apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::Active] = 0;
+        apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::SubgroupId] = i % subgroupSize;
+      }
+      numThreads = newNumThreads;
+    }
+    apiWrapper->global_builtins[ShaderBuiltin::SubgroupSize] =
+        ShaderVariable(rdcstr(), subgroupSize, 0U, 0U, 0U);
+
+    ShaderDebugTrace *ret =
+        debugger->BeginDebug(apiWrapper, stage, entryPoint, spec, shadRefl.instructionLines,
+                             shadRefl.patchData, laneIndex, numThreads, subgroupSize);
     apiWrapper->ResetReplay();
 
     return ret;
@@ -6290,6 +6310,9 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
     else
     {
       // simple single-thread case
+      apiWrapper->thread_props[0][(size_t)rdcspv::ThreadProperty::Active] = 1;
+      apiWrapper->thread_props[0][(size_t)rdcspv::ThreadProperty::SubgroupId] = 0;
+
       std::unordered_map<ShaderBuiltin, ShaderVariable> &thread_builtins =
           apiWrapper->thread_builtins[0];
 

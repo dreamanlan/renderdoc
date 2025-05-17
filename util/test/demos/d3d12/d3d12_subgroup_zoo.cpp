@@ -57,7 +57,7 @@ RWStructuredBuffer<float4> outbuf : register(u0);
 
 static uint3 tid;
 
-void SetOuput(float4 data)
+void SetOutput(float4 data)
 {
   outbuf[root_test * 1024 + tid.y * GROUP_SIZE_X + tid.x] = data;
 }
@@ -173,46 +173,6 @@ float4 main(IN input) : SV_Target0
 
   const std::string comp = compCommon + R"EOSHADER(
 
-float4 funcD(uint id)
-{
-  return WaveActiveSum(id/2).xxxx;
-}
-
-float4 nestedFunc(uint id)
-{
-  float4 ret = funcD(id/3);
-  ret.w = WaveActiveSum(id);
-  return ret;
-}
-
-float4 funcA(uint id)
-{
-   return nestedFunc(id*2);
-}
-
-float4 funcB(uint id)
-{
-   return nestedFunc(id*4);
-}
-
-float4 funcTest(uint id)
-{
-  if ((id % 2) == 0)
-  {
-    return 0.xxxx;
-  }
-  else
-  {
-    float value = WaveActiveSum(id);
-    if (id < 10)
-    {
-      return value.xxxx;
-    }
-    value += WaveActiveSum(id/2);
-    return value.xxxx;
-  }
-}
-
 [numthreads(GROUP_SIZE_X, GROUP_SIZE_Y, 1)]
 void main(uint3 inTid : SV_DispatchThreadID)
 {
@@ -221,103 +181,16 @@ void main(uint3 inTid : SV_DispatchThreadID)
 
   uint id = WaveGetLaneIndex();
 
-  SetOuput(id);
+  SetOutput(id);
 
   if(IsTest(0))
-  {
-    data.x = id;
-  }
-  else if(IsTest(1))
-  {
-    data.x = WaveActiveSum(id);
-  }
-  else if(IsTest(2))
-  {
-    // Diverged threads which reconverge 
-    if (id < 10)
-    {
-        // active threads 0-9
-        data.x = WaveActiveSum(id);
-
-        if ((id % 2) == 0)
-          data.y = WaveActiveSum(id);
-        else
-          data.y = WaveActiveSum(id);
-
-        data.x += WaveActiveSum(id);
-    }
-    else
-    {
-        // active threads 10...
-        data.x = WaveActiveSum(id);
-    }
-    data.y = WaveActiveSum(id);
-  }
-  else if(IsTest(3))
-  {
-    // Converged threads calling a function 
-    data = funcTest(id);
-    data.y = WaveActiveSum(id);
-  }
-  else if(IsTest(4))
-  {
-    // Converged threads calling a function which has a nested function call in it
-    data = nestedFunc(id);
-    data.y = WaveActiveSum(id);
-  }
-  else if(IsTest(5))
-  {
-    // Diverged threads calling the same function
-    if (id < 10)
-    {
-      data = funcD(id);
-    }
-    else
-    {
-      data = funcD(id);
-    }
-    data.y = WaveActiveSum(id);
-  }
-  else if(IsTest(6))
-  {
-    // Diverged threads calling the same function which has a nested function call in it
-    if (id < 10)
-    {
-      data = funcA(id);
-    }
-    else
-    {
-      data = funcB(id);
-    }
-    data.y = WaveActiveSum(id);
-  }
-  else if(IsTest(7))
-  {
-    // Diverged threads which early exit
-    if (id < 10)
-    {
-      data.x = WaveActiveSum(id+10);
-      SetOuput(data);
-      return;
-    }
-    data.x = WaveActiveSum(id);
-  }
-  else if(IsTest(8))
-  {
-     // Loops with different number of iterations per thread
-    for (uint i = 0; i < id; i++)
-    {
-      data.x += WaveActiveSum(id);
-    }
-  }
-  else if(IsTest(9))
   {
     // Query functions : unit tests
     data.x = float(WaveGetLaneCount());
     data.y = float(WaveGetLaneIndex());
     data.z = float(WaveIsFirstLane());
   }
-  else if(IsTest(10))
+  else if(IsTest(1))
   {
     // Vote functions : unit tests
     data.x = float(WaveActiveAnyTrue(id*2 > id+10));
@@ -335,7 +208,7 @@ void main(uint3 inTid : SV_DispatchThreadID)
       data.w = countbits(ballot.x) + countbits(ballot.y) + countbits(ballot.z) + countbits(ballot.w);
     }
   }
-  else if(IsTest(11))
+  else if(IsTest(2))
   {
     // Broadcast functions : unit tests
     if (id >= 2 && id <= 20)
@@ -346,7 +219,7 @@ void main(uint3 inTid : SV_DispatchThreadID)
       data.w = WaveReadLaneAt(data.x, 2+id%3);
     }
   }
-  else if(IsTest(12))
+  else if(IsTest(3))
   {
     // Scan and Prefix functions : unit tests
     if (id >= 2 && id <= 20)
@@ -356,8 +229,15 @@ void main(uint3 inTid : SV_DispatchThreadID)
       data.z = WavePrefixSum(data.x);
       data.w = WavePrefixProduct(1 + data.y);
     }
+    else
+    {
+      data.x = WavePrefixCountBits(id > 23);
+      data.y = WavePrefixCountBits(id < 1);
+      data.z = WavePrefixSum(data.x);
+      data.w = WavePrefixSum(data.y);
+    }
   }
-  else if(IsTest(13))
+  else if(IsTest(4))
   {
     // Reduction functions : unit tests
     if (id >= 2 && id <= 20)
@@ -368,7 +248,7 @@ void main(uint3 inTid : SV_DispatchThreadID)
       data.w = float(WaveActiveSum(id));
     }
   }
-  else if(IsTest(14))
+  else if(IsTest(5))
   {
     // Reduction functions : unit tests
     if (id >= 2 && id <= 20)
@@ -379,7 +259,7 @@ void main(uint3 inTid : SV_DispatchThreadID)
       data.w = float(WaveActiveBitXor(id));
     }
   }
-  else if(IsTest(15))
+  else if(IsTest(6))
   {
     // Reduction functions : unit tests
     if (id > 13)
@@ -395,7 +275,7 @@ void main(uint3 inTid : SV_DispatchThreadID)
       data.w = float(WaveActiveAllEqual(test4).w);
     }
   }
-  SetOuput(data);
+  SetOutput(data);
 }
 
 )EOSHADER";
@@ -410,7 +290,7 @@ void main(uint3 inTid : SV_DispatchThreadID)
 
   uint id = WaveGetLaneIndex();
 
-  SetOuput(id);
+  SetOutput(id);
 
   if(IsTest(0))
   {
@@ -432,7 +312,7 @@ void main(uint3 inTid : SV_DispatchThreadID)
 		data.z = WaveMultiPrefixBitOr(id, mask);
 		data.w = WaveMultiPrefixBitXor(id, mask);
   }
-  SetOuput(data);
+  SetOutput(data);
 }
 
 )EOSHADER";
@@ -541,12 +421,7 @@ void main(uint3 inTid : SV_DispatchThreadID)
     ID3D12PipelineStatePtr comppipe65[ARRAY_COUNT(compsize)];
 
     std::string defines60;
-    defines60 += fmt::format("#define COMP_TESTS {}\n", numCompTests60);
-    defines60 += "\n";
-
     std::string defines65;
-    defines65 += fmt::format("#define COMP_TESTS {}\n", numCompTests65);
-    defines65 += "\n";
 
     bool supportSM65 = (m_HighestShaderModel >= D3D_SHADER_MODEL_6_5) && m_DXILSupport;
     bool supportSM67 = (m_HighestShaderModel >= D3D_SHADER_MODEL_6_7) && m_DXILSupport;

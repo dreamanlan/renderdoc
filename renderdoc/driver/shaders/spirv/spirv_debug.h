@@ -202,6 +202,7 @@ struct ThreadState
 
   bool Finished() const;
 
+  uint32_t currentInstruction;
   uint32_t nextInstruction;
 
   const GlobalState &global;
@@ -268,6 +269,8 @@ private:
 
   void SkipIgnoredInstructions();
   void SetConvergencePoint(Id block);
+
+  static bool WorkgroupIsDiverged(const rdcarray<ThreadState> &workgroup);
 
   ShaderDebugState *m_State = NULL;
 };
@@ -434,6 +437,8 @@ private:
   virtual void PostParse();
   virtual void RegisterOp(Iter it);
 
+  void SetDebugTypeMember(const OpShaderDbg &member, TypeData &resultType, size_t memberIndex);
+
   template <typename ShaderVarType, bool allocate>
   uint32_t WalkVariable(const Decorations &curDecorations, const DataType &type,
                         uint64_t offsetOrLocation, ShaderVarType &var, const rdcstr &accessSuffix,
@@ -511,6 +516,8 @@ private:
   struct
   {
     bool valid = false;
+
+    rdcarray<std::function<void()>> deferredMembers;
 
     SparseIdMap<TypeData> types;
     SparseIdMap<ScopeData> scopes;

@@ -892,3 +892,14 @@ class TestCase:
                     data += self.decode_task_data(self.controller, mesh, shader.taskPayload, taskIdx)
                     taskIdx += 1
         return data
+
+    def check_renderdoc_log_asserts(self):
+        countAsserts = 0
+        rdlog = rd.GetLogFile()
+        with open(rdlog, 'r') as f:
+            for line in f:
+                if 'Assertion' in line:
+                    log.error(line)
+                    countAsserts += 1
+        if countAsserts > 0:
+            raise TestFailureException(f'Renderdoc log file contains {countAsserts} Asserts')

@@ -1272,8 +1272,14 @@ ShaderDebugTrace *Debugger::BeginDebug(DebugAPIWrapper *api, const ShaderStage s
                                                 var.value.u8v.data());
 
               if(type.type == DataType::PointerType)
+              {
                 var.SetTypedPointer(var.value.u64v[0], this->apiWrapper->GetShaderID(),
                                     idToPointerType[type.InnerType()]);
+
+                const Decorations &dec = decorations[type.id];
+                if(dec.flags & Decorations::HasArrayStride)
+                  setArrayStride(var, dec.arrayStride);
+              }
             }
             else
             {
@@ -2585,9 +2591,8 @@ rdcarray<ShaderDebugState> Debugger::ContinueDebug()
         ++countActiveThreads;
 
         ThreadState &thread = workgroup[lane];
-        const uint32_t currentPC = thread.nextInstruction;
         const uint32_t threadId = lane;
-        if(currentPC >= instructionOffsets.size())
+        if(thread.nextInstruction >= instructionOffsets.size())
         {
           if(lane == activeLaneIndex)
             ret.emplace_back();
@@ -2600,7 +2605,7 @@ rdcarray<ShaderDebugState> Debugger::ContinueDebug()
         {
           ShaderDebugState state;
 
-          size_t instOffs = instructionOffsets[currentPC];
+          size_t instOffs = instructionOffsets[thread.nextInstruction];
 
           // see if we're retiring any IDs at this state
           for(size_t l = 0; l < thread.live.size();)
@@ -2639,7 +2644,7 @@ rdcarray<ShaderDebugState> Debugger::ContinueDebug()
 
           if(m_DebugInfo.valid)
           {
-            size_t endOffs = instructionOffsets[currentPC - 1];
+            size_t endOffs = instructionOffsets[thread.nextInstruction - 1];
 
             // append any inlined functions to the top of the stack
             InlineData *inlined = m_DebugInfo.lineInline[endOffs];
@@ -2727,6 +2732,11 @@ rdcarray<ShaderDebugState> Debugger::ContinueDebug()
 
         if(thread.diverged)
           ++countDivergedThreads;
+      }
+      for(size_t lane = 0; lane < workgroup.size(); lane++)
+      {
+        if(activeMask[lane])
+          workgroup[lane].currentInstruction = workgroup[lane].nextInstruction;
       }
       if(countConvergePointThreads)
       {
@@ -3762,6 +3772,10 @@ void Debugger::PostParse()
 {
   Processor::PostParse();
 
+  for(std::function<void()> &f : m_DebugInfo.deferredMembers)
+    f();
+  m_DebugInfo.deferredMembers.clear();
+
   // declare pointerTypes for all declared physical pointer types. This will match the reflection
   for(auto it = dataTypes.begin(); it != dataTypes.end(); ++it)
   {
@@ -3812,6 +3826,31 @@ void Debugger::PostParse()
   }
 
   memberNames.clear();
+}
+
+void Debugger::SetDebugTypeMember(const OpShaderDbg &member, TypeData &resultType, size_t memberIndex)
+{
+  rdcstr memberName;
+  Id memberType;
+  uint32_t memberOffset = 0;
+
+  switch(member.inst)
+  {
+    case ShaderDbg::TypeMember:
+      memberName = strings[member.arg<Id>(0)];
+      memberType = member.arg<Id>(1);
+      memberOffset = EvaluateConstant(member.arg<Id>(5), {}).value.u32v[0];
+      break;
+    case ShaderDbg::Function:
+      memberName = strings[member.arg<Id>(0)];
+      memberType = member.arg<Id>(1);
+      break;
+    case ShaderDbg::TypeInheritance: memberName = "Inheritence"; break;
+    default: RDCERR("Unhandled DebugTypeComposite entry %u", member.inst);
+  }
+
+  resultType.structMembers[memberIndex] = {memberName, memberType};
+  resultType.memberOffsets[memberIndex] = memberOffset;
 }
 
 void Debugger::RegisterOp(Iter it)
@@ -4010,30 +4049,28 @@ void Debugger::RegisterOp(Iter it)
           // ignore arg 7 size
           // ignore arg 8 flags
 
+          TypeData &resultType = m_DebugInfo.types[dbg.result];
           for(uint32_t i = 9; i < dbg.params.size(); i++)
           {
-            OpShaderDbg member(GetID(dbg.arg<Id>(i)));
+            resultType.structMembers.push_back({});
+            resultType.memberOffsets.push_back(0);
+            size_t memberIndex = resultType.structMembers.size() - 1;
 
-            rdcstr memberName;
-            Id memberType;
-            uint32_t memberOffset = 0;
-            switch(member.inst)
+            Id memberId = dbg.arg<Id>(i);
+            ConstIter memberIt = GetID(memberId);
+
+            if(!memberIt)
             {
-              case ShaderDbg::TypeMember:
-                memberName = strings[member.arg<Id>(0)];
-                memberType = member.arg<Id>(1);
-                memberOffset = EvaluateConstant(member.arg<Id>(5), {}).value.u32v[0];
-                break;
-              case ShaderDbg::TypeFunction:
-                memberName = strings[member.arg<Id>(0)];
-                memberType = member.arg<Id>(1);
-                break;
-              case ShaderDbg::TypeInheritance: memberName = "Inheritence"; break;
-              default: RDCERR("Unhandled DebugTypeComposite entry %u", member.inst);
+              m_DebugInfo.deferredMembers.push_back(
+                  [this, resultId = dbg.result, memberIndex, memberId]() {
+                    SetDebugTypeMember(OpShaderDbg(GetID(memberId)), m_DebugInfo.types[resultId],
+                                       memberIndex);
+                  });
+
+              continue;
             }
 
-            m_DebugInfo.types[dbg.result].structMembers.push_back({memberName, memberType});
-            m_DebugInfo.types[dbg.result].memberOffsets.push_back(memberOffset);
+            SetDebugTypeMember(OpShaderDbg(memberIt), resultType, memberIndex);
           }
 
           name = tagString[tag % 3] + name;

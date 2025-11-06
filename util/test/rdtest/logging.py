@@ -29,6 +29,7 @@ class TestLogger:
         self.outputs = [sys.stdout]
         self.failed = False
         self.section_failed = False
+        self.logged_exception = False
 
     def subprocess_print(self, line: str):
         for o in self.outputs:
@@ -87,12 +88,29 @@ class TestLogger:
         self.rawprint(">> Section {}".format(name))
         self.indent()
         self.section_failed = False
+        self.logged_exception = False
 
     def end_section(self, name: str):
         if self.section_failed:
             self.rawprint("$$ FAILED")
         self.dedent()
         self.rawprint("<< Section {}".format(name))
+
+    def auto_section(self, name: str):
+        class ScopedSection():
+            def __init__(self, logger: TestLogger, name: str):
+                self.name = name
+                self.logger = logger
+
+            def __enter__(self):
+                self.logger.begin_section(name)
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                if exc_value is not None:
+                    self.logger.failure(exc_value)
+                self.logger.end_section(name)
+            
+        return ScopedSection(self, name)
 
     def inline_file(self, name: str, path: str, with_stdout: bool = False):
         self.rawprint(">> Raw {}".format(name))
@@ -113,6 +131,10 @@ class TestLogger:
         self.rawprint("!! " + message)
 
     def failure(self, ex):
+        if self.logged_exception:
+            return
+
+        self.logged_exception = True
         self.failed = self.section_failed = True
 
         if ex is TestFailureException:

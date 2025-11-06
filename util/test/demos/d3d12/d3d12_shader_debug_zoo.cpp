@@ -45,15 +45,15 @@ struct v2f { float4 pos : SV_Position; float4 col : COL; };
 
 v2f main(uint vid : SV_VertexID)
 {
-	float2 positions[] = {
-		float2(-1.0f,  1.0f),
-		float2( 1.0f,  1.0f),
-		float2(-1.0f, -1.0f),
-		float2( 1.0f, -1.0f),
-	};
+  float2 positions[] = {
+    float2(-1.0f,  1.0f),
+    float2( 1.0f,  1.0f),
+    float2(-1.0f, -1.0f),
+    float2( 1.0f, -1.0f),
+  };
 
   v2f ret = (v2f)0;
-	ret.pos = float4(positions[vid], 0, 1);
+  ret.pos = float4(positions[vid], 0, 1);
   ret.col = intex.Load(float3(0,0,0));
   return ret;
 }
@@ -66,7 +66,7 @@ struct v2f { float4 pos : SV_Position; float4 col : COL; };
 
 float4 main(v2f IN) : SV_Target0
 {
-	return IN.col;
+  return IN.col;
 }
 
 )EOSHADER";
@@ -82,7 +82,7 @@ Texture2D<float4> intex : register(t0);
 
 float4 main(float4 pos : SV_Position) : SV_Target0
 {
-	return intex.Load(float3(pos.x, pos.y - offset, 0));
+  return intex.Load(float3(pos.x, pos.y - offset, 0));
 }
 
 )EOSHADER";
@@ -1000,7 +1000,7 @@ float4 main(v2f IN) : SV_Target0
     // idx = 0
     int idx = intval - IN.tri - 7;
     int prev = gInt;
-    gInt += (idx+1);
+    gInt += (idx+1) + IN.s.x + IN.s.y;
     gIntArray[idx] = gInt;
     return float4(prev, gInt, gIntArray[idx], gIntArray[idx+1]);
   }
@@ -1010,6 +1010,32 @@ float4 main(v2f IN) : SV_Target0
     int2 uv = int2(31,37);
     floattex2rwtest[uv] = value;
     return floattex2rwtest[uv];
+  }
+  if(IN.tri == 108)
+  {
+    float4 Color = float4(0,0,0,0);
+    // this is intended to test triggering a mixture of GPU math and GPU sample ops
+    float2 coord = float2(zero + 0.5, zero + 0.15);
+    if (IN.s.x % 2 == 0)
+    {
+      Color = smiley.SampleLevel(linearclamp, coord, float(0));
+      for (int i = 0; i < 100; i++)
+      {
+        Color += smiley.SampleLevel(linearclamp, coord, float(i));
+      }
+    }
+    else
+    {
+      Color = float4(pow(abs(posone*2.5f), posone*1.3f), pow(abs(posone*2.5f), posone*0.45f),
+                     pow(abs(posone*2.5f), posone*0.9f), pow(abs(posone*0.9f), posone*8.5f));
+      for (int i = 0; i < 100; i++)
+      {
+        float4 value = float4(pow(abs(posone*2.5f+float(i)), posone*1.3f), pow(abs(posone*2.5f), posone*0.45f),
+                              pow(abs(posone*2.5f), posone*0.9f), pow(abs(posone*1.3), posone*8.5f));
+        Color += value / 100.0;
+      }
+    }
+    return Color;
   }
 
   return float4(0.4f, 0.4f, 0.4f, 0.4f);
@@ -1064,9 +1090,9 @@ float4 main(v2f IN) : SV_Target0
 
 struct v2f
 {
-	float4 pos : SV_POSITION;
-	float4 col : COLOR0;
-	float2 uv : TEXCOORD0;
+  float4 pos : SV_POSITION;
+  float4 col : COLOR0;
+  float2 uv : TEXCOORD0;
 };
 
 float4 main(v2f IN, uint samp : SV_SampleIndex) : SV_Target0 
@@ -1104,6 +1130,12 @@ cbuffer consts : register(b0)
   double doubleX;
 };
 
+cbuffer packed_consts : register(b1)
+{
+  uint col1z : packoffset(c1.z);
+  uint col2w : packoffset(c2.w);
+};
+
 RWStructuredBuffer<uint4> bufIn : register(u0);
 RWStructuredBuffer<uint4> bufOut : register(u1);
 
@@ -1116,6 +1148,7 @@ struct TestStruct
 groupshared int gsmInt;
 groupshared TestStruct gsmStruct[8];
 groupshared int gsmIntArray[128];
+groupshared int gsmInt2DArray[2][1024];
 
 [numthreads(1,1,1)]
 void main(int3 inTestIndex : SV_GroupID)
@@ -1144,14 +1177,43 @@ void main(int3 inTestIndex : SV_GroupID)
     gsmStruct[gsmInt*4].a = inTestIndex;
     int idx = 128 - gsmInt - 1;
     gsmIntArray[idx] = testIndex;
+    gsmInt2DArray[ZERO][idx] = testIndex;
+    gsmInt2DArray[ONE][idx] = testIndex;
     testResult.x = gsmIntArray[idx + ZERO];
     testResult.y = testIndex;
     testResult.z = gsmStruct[gsmInt * 4].a.y;
+    testResult.w = gsmInt2DArray[ZERO][idx] + gsmInt2DArray[ONE][idx];
+  }
+  else if (testIndex == 2)
+  {
+    testResult = bufOut[0];
+    testResult.x += bufIn[0].x * (uint)col1z;
+    testResult.y += bufIn[0].y * (uint)col2w;
+  }
+  else if (testIndex == 3)
+  {
+    float floatA = bufIn[0].x/100.0 + 1.5f;
+    float floatB = bufIn[0].y/100.0 + 1.7f;
+    float floatC = bufIn[0].z/100.0 + 2.5f;
+    double doubleA = (double)floatA; 
+    double doubleB = (double)floatB;
+    double doubleC = (double)floatC;
+    half halfA = (half)floatA;
+    half halfB = (half)1.0;
+    half halfC = (half)floatC;
+
+    half halfFma = mad(halfA, halfB, halfC);
+    float floatFma = mad(floatA, floatB, floatC);
+    double doubleFma = mad(doubleA, doubleB, doubleC);
+    testResult.x = floatFma * 1000.0;
+    testResult.y = (float)halfFma * 1000.0;
+    testResult.z = (float)doubleFma * 1000.0;
   }
   else
   {
     testResult.x = inTestIndex.x;
   }
+  GroupMemoryBarrierWithGroupSync();
   bufOut[gsmInt] = testResult;
 }
 
@@ -1195,6 +1257,10 @@ void main(int3 inTestIndex : SV_GroupID)
     lastTest = noResourcesPixel.rfind("IN.tri == ");
     lastTest += sizeof("IN.tri == ") - 1;
     const uint32_t numNoResTests = atoi(noResourcesPixel.c_str() + lastTest) + 1;
+
+    lastTest = compute.rfind("testIndex == ");
+    lastTest += sizeof("testIndex == ") - 1;
+    const uint32_t numComputeTests = atoi(compute.c_str() + lastTest) + 1;
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> inputLayout;
     inputLayout.reserve(4);
@@ -1885,6 +1951,7 @@ void main(int3 inTestIndex : SV_GroupID)
         uavParam(D3D12_SHADER_VISIBILITY_ALL, 0, 0),
         uavParam(D3D12_SHADER_VISIBILITY_ALL, 0, 1),
         constParam(D3D12_SHADER_VISIBILITY_ALL, 0, 0, 4),
+        constParam(D3D12_SHADER_VISIBILITY_ALL, 0, 1, 12),
         tableParam(D3D12_SHADER_VISIBILITY_ALL, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 2, 1, 3),
     });
 
@@ -1902,7 +1969,7 @@ void main(int3 inTestIndex : SV_GroupID)
 
     if(supportSM66)
     {
-      csblob = Compile(compute, "main", "cs_6_6");
+      csblob = Compile(compute, "main", "cs_6_6", compileOptions);
       computePSOs[2] = MakePSO().RootSig(sigCompute).CS(csblob);
     }
 
@@ -2118,11 +2185,13 @@ void main(int3 inTestIndex : SV_GroupID)
         cmd->SetComputeRoot32BitConstant(2, 6, 1);
         cmd->SetComputeRoot32BitConstant(2, 7, 2);
         cmd->SetComputeRoot32BitConstant(2, 8, 3);
-        cmd->SetComputeRootDescriptorTable(3, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
+        cmd->SetComputeRoot32BitConstant(3, 10, 4 + 2);    // col1z
+        cmd->SetComputeRoot32BitConstant(3, 11, 8 + 3);    // col2w
+        cmd->SetComputeRootDescriptorTable(4, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
 
         cmd->SetPipelineState(computePSOs[i]);
         setMarker(cmd, computeSMs[i]);
-        cmd->Dispatch(3, 2, 1);
+        cmd->Dispatch(numComputeTests, 2, 1);
       }
       popMarker(cmd);
 

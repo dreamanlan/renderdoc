@@ -25,6 +25,7 @@
 #include "glsl_shaders.h"
 #include "common/common.h"
 #include "common/formatting.h"
+#include "common/threading.h"
 #include "driver/shaders/spirv/glslang_compile.h"
 #include "glslang/glslang/Public/ResourceLimits.h"
 #include "glslang/glslang/Public/ShaderLang.h"
@@ -136,6 +137,9 @@ rdcstr GenerateGLSLShader(const rdcstr &shader, ShaderType type, int version, co
   bool success;
 
   {
+    static Threading::CriticalSection *lock = new Threading::CriticalSection();
+    SCOPED_LOCK(*lock);
+
     std::string outstr;
     success =
         sh.preprocess(GetDefaultResources(), 100, ENoProfile, false, false, flags, &outstr, incl);
@@ -663,7 +667,7 @@ void main() {
     {
       CHECK(refl.debugInfo.files[0].filename == "source0.glsl");
 
-      REQUIRE(refl.debugInfo.compileFlags.flags.size() == 2);
+      REQUIRE(refl.debugInfo.compileFlags.flags.size() == 3);
 
       CHECK(refl.debugInfo.compileFlags.flags[0].name == "@cmdline");
 
@@ -676,6 +680,9 @@ void main() {
 
       CHECK(refl.debugInfo.compileFlags.flags[1].name == "@spirver");
       CHECK(refl.debugInfo.compileFlags.flags[1].value == "spirv1.0");
+
+      CHECK(refl.debugInfo.compileFlags.flags[2].name == "preferSourceDebug");
+      CHECK(refl.debugInfo.compileFlags.flags[2].value == "1");
     }
   };
 

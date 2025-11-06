@@ -163,7 +163,7 @@ RDResult D3D12Replay::FatalErrorCheck()
 IReplayDriver *D3D12Replay::MakeDummyDriver()
 {
   // gather up the shaders we've allocated to pass to the dummy driver
-  rdcarray<ShaderReflection *> shaders;
+  rdcarray<const ShaderReflection *> shaders;
   WrappedID3D12Shader::GetReflections(shaders);
 
   IReplayDriver *dummy = new DummyDriver(this, shaders, m_pDevice->DetachStructuredFile());
@@ -530,13 +530,13 @@ rdcarray<ShaderEntryPoint> D3D12Replay::GetShaderEntryPoints(ResourceId shader)
 
   WrappedID3D12Shader *sh = (WrappedID3D12Shader *)res;
 
-  ShaderReflection &ret = sh->GetDetails();
+  const ShaderReflection &ret = sh->GetDetails();
 
   return {{"main", ret.stage}};
 }
 
-ShaderReflection *D3D12Replay::GetShader(ResourceId pipeline, ResourceId shader,
-                                         ShaderEntryPoint entry)
+const ShaderReflection *D3D12Replay::GetShader(ResourceId pipeline, ResourceId shader,
+                                               ShaderEntryPoint entry)
 {
   WrappedID3D12Shader *sh =
       m_pDevice->GetResourceManager()->GetCurrentAs<WrappedID3D12Shader>(shader);
@@ -594,13 +594,11 @@ rdcstr D3D12Replay::DisassembleShader(ResourceId pipeline, const ShaderReflectio
   if(!sh)
     return "; Invalid Shader Specified";
 
-  DXBC::DXBCContainer *dxbc = sh->GetDXBC();
-
   if(target == DXBCDXILDisassemblyTarget || target.empty())
-    return dxbc->GetDisassembly(false);
+    return sh->GetWriteableDXBC()->GetDisassembly(false);
 
   if(target == DXCDXILDisassemblyTarget)
-    return dxbc->GetDisassembly(true);
+    return sh->GetWriteableDXBC()->GetDisassembly(true);
 
   if(target == LiveDriverDisassemblyTarget)
   {
@@ -734,6 +732,11 @@ ResourceId D3D12Replay::GetLiveID(ResourceId id)
 
 rdcarray<EventUsage> D3D12Replay::GetUsage(ResourceId id)
 {
+  if(m_pDevice->GetResourceList().find(id) == m_pDevice->GetResourceList().end())
+  {
+    return {EventUsage(0, ResourceUsage::Unused)};
+  }
+
   return m_pDevice->GetQueue()->GetUsage(id);
 }
 
@@ -752,6 +755,7 @@ void D3D12Replay::FillDescriptor(Descriptor &dst, const D3D12Descriptor *src)
     return;
   }
 
+  dst = {};
   dst.resource = rm->GetOriginalID(src->GetResResourceId());
 
   if(dst.resource == ResourceId())
@@ -1409,6 +1413,8 @@ void D3D12Replay::SavePipelineState(uint32_t eventId)
           case D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS:
           {
             dst.constants.resize(src.Constants.Num32BitValues * 4);
+            dst.space = src.Constants.RegisterSpace;
+            dst.reg = src.Constants.ShaderRegister;
 
             if(i < rootElems.size())
             {
@@ -1421,27 +1427,32 @@ void D3D12Replay::SavePipelineState(uint32_t eventId)
           case D3D12_ROOT_PARAMETER_TYPE_CBV:
           {
             dst.descriptor.type = DescriptorType::ConstantBuffer;
+            dst.space = src.Descriptor.RegisterSpace;
+            dst.reg = src.Descriptor.ShaderRegister;
 
             if(i < rootElems.size())
               FillRootDescriptor(dst.descriptor, rootElems[i]);
             break;
+          }
+          case D3D12_ROOT_PARAMETER_TYPE_SRV:
+          {
+            dst.descriptor.type = DescriptorType::Buffer;
+            dst.space = src.Descriptor.RegisterSpace;
+            dst.reg = src.Descriptor.ShaderRegister;
 
-            case D3D12_ROOT_PARAMETER_TYPE_SRV:
-            {
-              dst.descriptor.type = DescriptorType::Buffer;
+            if(i < rootElems.size())
+              FillRootDescriptor(dst.descriptor, rootElems[i]);
+            break;
+          }
+          case D3D12_ROOT_PARAMETER_TYPE_UAV:
+          {
+            dst.descriptor.type = DescriptorType::ReadWriteBuffer;
+            dst.space = src.Descriptor.RegisterSpace;
+            dst.reg = src.Descriptor.ShaderRegister;
 
-              if(i < rootElems.size())
-                FillRootDescriptor(dst.descriptor, rootElems[i]);
-              break;
-            }
-            case D3D12_ROOT_PARAMETER_TYPE_UAV:
-            {
-              dst.descriptor.type = DescriptorType::ReadWriteBuffer;
-
-              if(i < rootElems.size())
-                FillRootDescriptor(dst.descriptor, rootElems[i]);
-              break;
-            }
+            if(i < rootElems.size())
+              FillRootDescriptor(dst.descriptor, rootElems[i]);
+            break;
           }
         }
 
@@ -3819,6 +3830,13 @@ void D3D12Replay::GetTextureData(ResourceId tex, const Subresource &sub,
   if(wasms && (isDepth || isStencil))
     resolve = false;
 
+  // don't resolve integer textures.
+  if(resolve && (IsIntFormat(resDesc.Format) || IsUIntFormat(resDesc.Format)))
+  {
+    resolve = false;
+    s.sample = 0;
+  }
+
   uint32_t slice3DCopy = 0;
 
   // arrayIdx isn't used for anything except copying the slice out at the end, so save the index we
@@ -4277,22 +4295,6 @@ void D3D12Replay::GetTextureData(ResourceId tex, const Subresource &sub,
 
         byte *src = pData + layouts[0].Footprint.RowPitch * row;
         byte *dst = data.data() + dstRowPitch * row;
-
-        memcpy(dst, src, dstRowPitch);
-      }
-    }
-
-    // for 3D textures if we wanted a particular slice (slice3DCopy > 0) copy it into the beginning.
-    if(layouts[0].Footprint.Depth > 1 && slice3DCopy > 0 &&
-       (int)slice3DCopy < layouts[0].Footprint.Depth)
-    {
-      for(UINT y = 0; y < rowcount; y++)
-      {
-        UINT srcrow = y + slice3DCopy * rowcount;
-        UINT dstrow = y;
-
-        byte *src = pData + layouts[0].Footprint.RowPitch * srcrow;
-        byte *dst = data.data() + dstRowPitch * dstrow;
 
         memcpy(dst, src, dstRowPitch);
       }
@@ -4791,7 +4793,7 @@ RDResult D3D12_CreateReplayDevice(RDCFile *rdc, const ReplayOptions &opts, IRepl
       RETURN_ERROR_RESULT(
           ResultCode::APIHardwareUnsupported,
           "This capture needs AGS extensions to replay, but device selected for replay can't "
-          "support nvapi extensions");
+          "support AGS extensions");
     }
   }
 

@@ -1724,12 +1724,7 @@ rdcstr Program::DisassembleGlobalVars(int &instructionLine) const
   {
     const GlobalVar &g = *m_GlobalVars[i];
 
-    rdcstr n = g.name;
-    if(!m_DXCStyle)
-    {
-      n = DXBC::BasicDemangle(g.name);
-      DXIL::SanitiseName(n);
-    }
+    rdcstr n = !m_DXCStyle ? DXIL::GetGlobalVarName(&g) : g.name;
     ret += StringFormat::Fmt("@%s = ", escapeStringIfNeeded(n).c_str());
     switch(g.flags & GlobalFlags::LinkageMask)
     {
@@ -1772,6 +1767,7 @@ rdcstr Program::DisassembleGlobalVars(int &instructionLine) const
     if(g.section >= 0)
       ret += StringFormat::Fmt(", section %s", escapeString(m_Sections[g.section]).c_str());
 
+    ret += " // " + escapeString(g.name);
     ret += "\n";
     instructionLine++;
   }
@@ -3254,7 +3250,8 @@ void Program::MakeRDDisassemblyString(const DXBC::Reflection *reflection)
                   m_Disassembly += " " + cbVar.name;
                   if(cbType.elements > 1)
                     m_Disassembly += "[" + ToStr(cbType.elements) + "]";
-                  m_Disassembly += ";";
+                  m_Disassembly += ": packoffset(" + ToStr(cbVar.offset) + ")";
+                  m_Disassembly += "; ";
                   DisassemblyAddNewLine();
                 }
                 m_Disassembly += "};";
@@ -4692,99 +4689,69 @@ void Program::MakeRDDisassemblyString(const DXBC::Reflection *reflection)
           }
           case Operation::GetElementPtr:
           {
-            bool fallbackOutput = true;
             if(!inst.type->isVoid())
             {
-              // type "float addrspace(3)*" : addrspace(3) is DXIL specific, see DXIL::Type::PointerAddrSpace
-              rdcstr typeStr = inst.type->toString(dxcStyleFormatting);
-              int start = typeStr.find(" addrspace(");
-              if(start > 0)
+              switch(inst.type->addrSpace)
               {
-                rdcstr scalarType = typeStr.substr(0, start);
-                scalarType.trim();
+                case DXIL::Type::PointerAddrSpace::Default: resultTypeStr = ""; break;
+                case DXIL::Type::PointerAddrSpace::DeviceMemory:
+                  resultTypeStr = "DeviceMemory";
+                  break;
+                case DXIL::Type::PointerAddrSpace::CBuffer: resultTypeStr = "CBuffer"; break;
+                case DXIL::Type::PointerAddrSpace::GroupShared:
+                  resultTypeStr = "GroupShared";
+                  break;
+                case DXIL::Type::PointerAddrSpace::GenericPointer: resultTypeStr = ""; break;
+                case DXIL::Type::PointerAddrSpace::ImmediateCBuffer:
+                  resultTypeStr = "ImmediateCBuffer";
+                  break;
+              };
 
-                start += 11;
-                int end = typeStr.find(')', start);
-                if(end > start)
+              resultTypeStr += " ";
+              resultTypeStr += inst.type->inner->toString(true);
+              resultTypeStr += "* ";
+
+              // arg[0] : ptr
+              if(cast<GlobalVar>(inst.args[0]))
+              {
+                lineStr += DXIL::GetGlobalVarName(cast<GlobalVar>(inst.args[0]));
+              }
+              else
+              {
+                lineStr += GetArgId(0);
+              }
+              // arg[1] : index 0
+              bool first = true;
+              if(inst.args.size() > 1)
+              {
+                uint32_t v = 0;
+                if(!getival<uint32_t>(inst.args[1], v) || (v > 0))
                 {
-                  // Example output:
-                  // DXC:
-                  // %3 = getelementptr [6 x float], [6 x float] addrspace(3)*
-                  // @"\01?s_x@@3@$$A.1dim", i32 0, i32 %9
+                  lineStr += "[";
+                  lineStr += GetArgId(inst, 1);
+                  lineStr += "]";
+                  first = false;
+                }
+              }
 
-                  // RD: GroupShared float* _3 = s_x[_9];
-                  fallbackOutput = false;
+              // arg[2..] : index 1...N
+              for(uint32_t a = 2; a < inst.args.size(); ++a)
+              {
+                if(first)
+                  lineStr += "[";
+                else
+                  lineStr += " + ";
 
-                  rdcstr addrspaceStr(typeStr.substr(start, end - start));
-                  int32_t value = atoi(addrspaceStr.c_str());
-                  DXIL::Type::PointerAddrSpace addrspace = (DXIL::Type::PointerAddrSpace)value;
+                lineStr += GetArgId(inst, a);
 
-                  switch(addrspace)
-                  {
-                    case DXIL::Type::PointerAddrSpace::Default: resultTypeStr = ""; break;
-                    case DXIL::Type::PointerAddrSpace::DeviceMemory:
-                      resultTypeStr = "DeviceMemory";
-                      break;
-                    case DXIL::Type::PointerAddrSpace::CBuffer: resultTypeStr = "CBuffer"; break;
-                    case DXIL::Type::PointerAddrSpace::GroupShared:
-                      resultTypeStr = "GroupShared";
-                      break;
-                    case DXIL::Type::PointerAddrSpace::GenericPointer: resultTypeStr = ""; break;
-                    case DXIL::Type::PointerAddrSpace::ImmediateCBuffer:
-                      resultTypeStr = "ImmediateCBuffer";
-                      break;
-                  };
-
-                  resultTypeStr += " ";
-                  resultTypeStr += scalarType;
-                  resultTypeStr += "* ";
-
-                  // arg[0] : ptr
-                  rdcstr ptrStr = GetArgId(inst, 0);
-                  // Simple demangle take string between first "?" and next "@"
-                  int nameStart = ptrStr.indexOf('?');
-                  if(nameStart > 0)
-                  {
-                    nameStart++;
-                    int nameEnd = ptrStr.indexOf('@', nameStart);
-                    if(nameEnd > nameStart)
-                      ptrStr = ptrStr.substr(nameStart, nameEnd - nameStart);
-                  }
-                  lineStr += ptrStr;
-                  // arg[1] : index 0
-                  bool first = true;
-                  if(inst.args.size() > 1)
-                  {
-                    uint32_t v = 0;
-                    if(!getival<uint32_t>(inst.args[1], v) || (v > 0))
-                    {
-                      lineStr += "[";
-                      lineStr += GetArgId(inst, 1);
-                      lineStr += "]";
-                      first = false;
-                    }
-                  }
-
-                  // arg[2..] : index 1...N
-                  for(uint32_t a = 2; a < inst.args.size(); ++a)
-                  {
-                    if(first)
-                      lineStr += "[";
-                    else
-                      lineStr += " + ";
-
-                    lineStr += GetArgId(inst, a);
-
-                    if(first)
-                    {
-                      lineStr += "]";
-                      first = false;
-                    }
-                  }
+                if(first)
+                {
+                  lineStr += "]";
+                  first = false;
                 }
               }
             }
-            if(fallbackOutput)
+            else
             {
               lineStr += "getelementptr ";
               bool first = true;
@@ -5515,7 +5482,7 @@ void Program::ParseReferences(const DXBC::Reflection *reflection)
                 {
                   RDCASSERT(!GetResourceReference(resultId));
                   ResourceReference resRef(resultIdStr, *resourceBase, resIndex);
-                  m_ResourceByIdHandles[resultId] = m_ResourceByIdHandles.size();
+                  m_ResourceByIdHandles[resultId] = m_ResourceReferences.size();
                   m_ResourceReferences.push_back(resRef);
                   resName = resourceBase->name;
                   uint32_t arrayIndex = 0;
@@ -5578,7 +5545,7 @@ void Program::ParseReferences(const DXBC::Reflection *reflection)
                 {
                   const ResourceReference resRef = *pResRef;
                   resBaseName = resRef.resourceBase.name;
-                  m_ResourceByIdHandles[resultId] = m_ResourceByIdHandles.size();
+                  m_ResourceByIdHandles[resultId] = m_ResourceReferences.size();
                   m_ResourceReferences.push_back(resRef);
                 }
                 uint32_t annotateHandleCount = m_ResourceAnnotateCounts[resBaseName];
@@ -6279,12 +6246,26 @@ DXILDebug::Id Program::GetResultSSAId(const DXIL::Instruction &inst)
   return inst.slot;
 }
 
-void Program::MakeResultId(const DXIL::Instruction &inst, rdcstr &resultId)
+void Program::MakeResultId(const DXIL::Instruction &inst, rdcstr &resultId) const
 {
+  DXILDebug::Id id = inst.slot;
+  if(id != ~0U)
+  {
+    auto it = m_ResultNames.find(id);
+    if(it != m_ResultNames.end())
+    {
+      resultId = it->second;
+      return;
+    }
+  }
+
   if(!inst.getName().empty())
-    resultId = StringFormat::Fmt("%c%s", '_', escapeStringIfNeeded(inst.getName()).c_str());
-  else if(inst.slot != ~0U)
-    resultId = StringFormat::Fmt("%c%s", '_', ToStr(inst.slot).c_str());
+    resultId = StringFormat::Fmt("_%s", escapeStringIfNeeded(inst.getName()).c_str());
+  else if(id != ~0U)
+    resultId = StringFormat::Fmt("_%s", ToStr(id).c_str());
+
+  if(id != ~0U)
+    m_ResultNames[id] = resultId;
 }
 
 rdcpair<int32_t, int32_t> Program::ParseDIExpressionMD(const Metadata *expressionMD) const
@@ -6361,14 +6342,12 @@ SourceMappingInfo Program::ParseDbgOpDeclare(const DXIL::Instruction &inst) cons
   if(const Instruction *varInst = cast<Instruction>(value))
   {
     ret.dbgVarId = Program::GetResultSSAId(*varInst);
-    Program::MakeResultId(*varInst, ret.dbgVarName);
+    MakeResultId(*varInst, ret.dbgVarName);
   }
   else if(const GlobalVar *gv = cast<GlobalVar>(value))
   {
     ret.dbgVarId = gv->ssaId;
-    rdcstr n = DXBC::BasicDemangle(gv->name);
-    DXIL::SanitiseName(n);
-    ret.dbgVarName = n;
+    ret.dbgVarName = DXIL::GetGlobalVarName(gv);
   }
   else if(const Constant *c = cast<Constant>(value))
   {
@@ -6393,6 +6372,15 @@ SourceMappingInfo Program::ParseDbgOpDeclare(const DXIL::Instruction &inst) cons
   ret.srcCountBytes = srcMapping.second;
 
   return ret;
+}
+
+rdcstr GetGlobalVarName(const GlobalVar *gv)
+{
+  rdcstr n = DXBC::BasicDemangle(gv->name);
+  DXIL::SanitiseName(n);
+  n += "_";
+  n += ToStr(gv->ssaId);
+  return n;
 }
 
 };    // namespace DXIL

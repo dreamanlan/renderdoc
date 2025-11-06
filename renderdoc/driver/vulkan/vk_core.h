@@ -24,8 +24,10 @@
 
 #pragma once
 
+#include "common/formatting.h"
 #include "common/timing.h"
 #include "core/gpu_address_range_tracker.h"
+#include "core/rdcbytetrie.h"
 #include "serialise/serialiser.h"
 #include "vk_acceleration_structure.h"
 #include "vk_common.h"
@@ -51,11 +53,15 @@ struct VkInitParams
   rdcarray<rdcstr> Extensions;
   ResourceId InstanceID;
 
+  // indicates that the 'application' has pre-reserved our descriptors - for self-capture. Prevents
+  // us from getting into a loop of ever-increasing reservations and failing to allocate.
+  bool DescriptorsReserved = false;
+
   // remember to update this function if you add more members
   uint64_t GetSerialiseSize();
 
   // check if a frame capture section version is supported
-  static const uint64_t CurrentVersion = 0x16;
+  static const uint64_t CurrentVersion = 0x17;
   static bool IsSupportedVersion(uint64_t ver);
 };
 
@@ -136,6 +142,15 @@ struct VulkanActionTreeNode
   rdcarray<rdcpair<ResourceId, EventUsage>> resourceUsage;
 
   rdcarray<ResourceId> executedCmds;
+
+  struct DeferredResourceUsage
+  {
+    uint32_t descBufVersionIdx;
+    ResourceId pipeline;
+    ResourceId shaderObjects[NumShaderStages];
+    rdcarray<VulkanStatePipeline::DescriptorAndOffsets> descSets;
+  };
+  rdcarray<DeferredResourceUsage> deferredResourceUsage;
 
   VulkanActionTreeNode &operator=(const ActionDescription &a)
   {
@@ -279,6 +294,19 @@ struct UserDebugUtilsCallbackData
   bool muteWarned;
 
   VkDebugUtilsMessengerEXT realObject;
+};
+
+struct DescriptorTrieNode : DescriptorSetSlot
+{
+  DescriptorTrieNode() = default;
+  DescriptorTrieNode(const DescriptorSetSlot &slot) : DescriptorSetSlot(slot), _trie(0) {}
+  uint16_t _trie;
+
+  // this equality operator allows a tolerance of range to account for implementations that drop
+  // lower bits off sizes (the alignment requirements on offsets takes care of that)
+  bool operator==(const DescriptorTrieNode &o) const;
+
+  static uint64_t rangeToleranceMask;
 };
 
 class WrappedVulkan : public IFrameCapturer
@@ -447,6 +475,80 @@ private:
     VkQueueFamilyProperties queueProps[16] = {};
   };
 
+  VkPhysicalDeviceDescriptorBufferPropertiesEXT m_DescriptorBufferProperties;
+
+  Threading::CriticalSection m_ASLookupByAddrLock;
+  rdcflatmap<VkDeviceAddress, ResourceId> m_ASLookupByAddr;
+
+  struct DescriptorLookups
+  {
+    BufferDescriptorFormat uniformBuffer = BufferDescriptorFormat::UnknownBufferDescriptor;
+    BufferDescriptorFormat storageBuffer = BufferDescriptorFormat::UnknownBufferDescriptor;
+    BufferDescriptorFormat uniformTexelBuffer = BufferDescriptorFormat::UnknownBufferDescriptor;
+    BufferDescriptorFormat storageTexelBuffer = BufferDescriptorFormat::UnknownBufferDescriptor;
+
+    BufferDescriptorFormat accelStructure = BufferDescriptorFormat::UnknownBufferDescriptor;
+
+    ImageDescriptorFormat sampled = ImageDescriptorFormat::UnknownImageDescriptor;
+    ImageDescriptorFormat storage = ImageDescriptorFormat::UnknownImageDescriptor;
+
+    uint32_t combinedSamplerOffset = 0;
+
+    bytebuf nullPatterns[size_t(DescriptorSlotType::Count)];
+
+    // overall lookup of all descriptors by bytes, fallback in case any others don't work - we
+    // expect this to always hit
+    rdcbytetrie<DescriptorTrieNode> fallback;
+
+    // lookup with only samplers, as we expect for non-indexed descriptors this will be hit often
+    rdcbytetrie<DescriptorTrieNode> samplers;
+
+    // for implementations where image descriptors are expected to contain a pointer to the image.
+    // We use a _range_ tracker here because some descriptors like depth/stencil or planar formats
+    // can contain base addresses different to the simple base of the image
+    GPUAddressRangeTracker imageAddresses;
+
+    // for NV-style palettised sampler/image view descriptors. These will be resized to the max size
+    // (0xfff / 0xfffff respectively) and can be used for direct indexed lookup
+    rdcarray<ResourceId> samplerPalette;
+    rdcarray<ResourceId> imageViewPalette;
+
+    // unique texel formats. So that if we fast identify a buffer via address+size we can iterate
+    // over all of these if we know it's a texel buffer. The expectation is this is short so we
+    // don't have to store this per-buffer but globally and can just try different possibilities.
+    rdcarray<VkFormat> texelFormats;
+
+    // unique image layouts. In case image layout affects the descriptor bits
+    rdcarray<VkImageLayout> generalImageLayouts;
+    rdcarray<VkImageLayout> depthImageLayouts;
+
+    Threading::CriticalSection lock;
+  };
+  DescriptorLookups m_DescriptorLookup;
+
+  void EstimateDescriptorFormats();
+  BufferDescriptorFormat EstimateBufferDescriptor(VkDescriptorType type, VkDeviceAddress addr,
+                                                  VkFormat texelFormat = VK_FORMAT_UNDEFINED);
+
+  void RegisterDescriptor(const bytebuf &key, const DescriptorSetSlot &data);
+  void LookupDescriptor(byte *descriptorBytes, size_t descriptorSize, DescriptorType type,
+                        DescriptorSetSlot &data);
+  ResourceId GetSamplerForDescriptor(byte *descriptorBytes, size_t descriptorSize);
+  ResourceId GetImageViewForDescriptor(byte *descriptorBytes, size_t descriptorSize,
+                                       DescriptorType type);
+  void GetPointerAndSizeForDescriptor(byte *descriptorBytes, size_t descriptorSize,
+                                      DescriptorType type, VkDeviceAddress &address,
+                                      VkDeviceSize &size);
+  void GetFinalBufferParameters(byte *descriptorBytes, size_t descriptorSize, DescriptorType type,
+                                VkFormat texelFormat, VkDeviceAddress inAddress, VkDeviceSize inSize,
+                                VkDeviceAddress &outAddress, VkDeviceSize &outSize);
+
+  bool m_NULLDescriptorPatternSaved = false;
+  bool m_IgnoreLayoutForDescriptors = false;
+  uint32_t m_ResourceDescriptorBufferReserveSize = 0;
+  rdcarray<ResourceId> m_ResourceDescBuffers;
+  std::unordered_map<ResourceId, ResourceId> m_InlineBuffers;
+
   bool m_SeparateDepthStencil = false;
   bool m_NULLDescriptorsAllowed = false;
   bool m_ExtendedDynState = false;
@@ -485,6 +587,9 @@ private:
   bool m_AccelerationStructures = false;
   bool m_ShaderObject = false;
   bool m_Maintenance5 = false;
+  bool m_Maintenance6 = false;
+  bool m_Maintenance9 = false;
+  bool m_DescriptorBuffers = false;
 
   uint32_t m_RTCaptureReplayHandleSize = 0;
 
@@ -750,6 +855,18 @@ private:
     uint32_t eventCount;             // how many events are in this cmd buffer, for quick skipping
     uint32_t curEventID;             // current event ID while reading or executing
     uint32_t actionCount;            // similar to above
+
+    // the index in m_DescriptorBufferVersions for the current GPUBuffer containing the descriptor buffer snapshot
+    uint32_t descBufVersionIdx = ~0U;
+    // when multiple buffers are bound, the offsets of each in the single GPUBuffer where they are
+    rdcarray<uint64_t> descBufOffsets;
+
+    struct DeferredDescBufCopy
+    {
+      VkBuffer unwrappedDstBuffer;
+      rdcarray<rdcpair<VkDeviceAddress, uint64_t>> copyOffsets;
+    };
+    rdcarray<DeferredDescBufCopy> descBufDeferredCopies;
   };
 
   uint64_t m_FakePushSetID = 0;
@@ -922,6 +1039,10 @@ private:
     rdcarray<VkDeviceMemory> DeadMemories;
     rdcarray<VkBuffer> DeadBuffers;
     rdcarray<ResourceId> IDs;
+
+    // with descriptor buffers, we also need to hold onto images and image views
+    rdcarray<VkImage> DeadImages;
+    rdcarray<VkImageView> DeadImageViews;
   } m_DeviceAddressResources;
   Threading::CriticalSection m_DeviceAddressResourcesLock;
 
@@ -980,6 +1101,11 @@ private:
   std::map<ResourceId, BakedCmdBufferInfo> m_BakedCmdBufferInfo;
   // immutable creation data
   VulkanCreationInfo m_CreationInfo;
+
+  rdcarray<GPUBuffer> m_DescriptorBufferVersions;
+  void VersionDescriptorBuffers(VkCommandBuffer cmd);
+  void CopyVersionedDescriptorBuffer(VkCommandBuffer cmdBuf, VkBuffer unwrappedDstBuf,
+                                     const rdcarray<rdcpair<VkDeviceAddress, uint64_t>> &copyOffsets);
 
   std::map<ResourceId, rdcarray<EventUsage>> m_ResourceUses;
   std::map<uint32_t, EventFlags> m_EventFlags;
@@ -1120,6 +1246,8 @@ private:
   void CaptureQueueSubmit(VkQueue queue, const rdcarray<VkCommandBuffer> &commandBuffers,
                           VkFence fence);
 
+  void CopyInternalDescriptor(VkCommandBuffer unwrappedCmdBuf, VkBuffer unwrappedSrc, uint32_t size);
+
   CommandBufferNode *BuildSubmitTree(ResourceId cmdId, uint32_t curEvent,
                                      CommandBufferNode *rootNode = NULL);
 
@@ -1147,8 +1275,23 @@ private:
   void AddEvent();
 
   void AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMessage> &debugMessages);
-  void AddUsageForBind(VulkanActionTreeNode &actionNode, rdcarray<DebugMessage> &debugMessages,
-                       uint32_t bindset, uint32_t bind, ResourceUsage usage);
+
+  void AddUsageForDescriptorSets(VulkanActionTreeNode &actionNode,
+                                 rdcarray<DebugMessage> &debugMessages);
+  void AddUsageForDescriptorSetBind(VulkanActionTreeNode &actionNode,
+                                    rdcarray<DebugMessage> &debugMessages, uint32_t bindset,
+                                    uint32_t bind, ResourceUsage usage);
+  void AddUsageForDescriptorBuffers(VulkanActionTreeNode &actionNode,
+                                    rdcarray<DebugMessage> &debugMessages,
+                                    const VulkanActionTreeNode::DeferredResourceUsage &def);
+  void AddUsageForDescriptorBufferBind(VulkanActionTreeNode &actionNode,
+                                       rdcarray<DebugMessage> &debugMessages,
+                                       const VulkanActionTreeNode::DeferredResourceUsage &def,
+                                       byte *descriptorBytes, size_t descriptorSize,
+                                       DescriptorType type, uint32_t bindset, uint32_t bind,
+                                       ResourceUsage usage);
+  void AddUsageForDescriptor(VulkanActionTreeNode &actionNode, const DescriptorSetSlot &slot,
+                             ResourceUsage usage);
 
   void AddFramebufferUsage(VulkanActionTreeNode &actionNode, const VulkanRenderState &renderState);
   void AddFramebufferUsageAllChildren(VulkanActionTreeNode &actionNode,
@@ -1280,8 +1423,12 @@ public:
   void ChooseMemoryIndices();
 
   void TrackBufferAddress(VkDevice device, VkBuffer buffer);
+  void TrackReplayBufferAddress(VkDevice device, VkBuffer buffer, VkDeviceMemory memory,
+                                VkDeviceSize memoryOffset);
   void UntrackBufferAddress(VkDevice device, VkBuffer buffer);
   void GetResIDFromAddr(GPUAddressRange::Address addr, ResourceId &id, uint64_t &offs);
+
+  ResourceId GetASFromAddr(VkDeviceAddress addr);
 
   EventFlags GetEventFlags(uint32_t eid) { return m_EventFlags[eid]; }
   rdcarray<EventUsage> GetUsage(ResourceId id) { return m_ResourceUses[id]; }
@@ -1385,6 +1532,9 @@ public:
   bool AccelerationStructures() const { return m_AccelerationStructures; }
   bool ShaderObject() const { return m_ShaderObject; }
   bool Maintenance5() const { return m_Maintenance5; }
+  bool Maintenance6() const { return m_Maintenance6; }
+  bool Maintenance9() const { return m_Maintenance9; }
+  bool DescriptorBuffers() const { return m_DescriptorBuffers; }
   VulkanRenderState &GetRenderState() { return m_RenderState; }
   void SetActionCB(VulkanActionCallback *cb) { m_ActionCallback = cb; }
   void SetSubmitChain(void *submitChain) { m_SubmitChain = submitChain; }
@@ -1401,6 +1551,25 @@ public:
                                                        VkExtensionProperties *pProperties);
   static VkResult GetProvidedInstanceExtensionProperties(uint32_t *pPropertyCount,
                                                          VkExtensionProperties *pProperties);
+
+  uint32_t DescriptorDataSize(VkDescriptorType type);
+
+  VkBufferCreateFlags DefaultBufferCreateFlags()
+  {
+    return DescriptorBuffers() ? VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT : 0;
+  }
+  VkImageCreateFlags DefaultImageCreateFlags()
+  {
+    return DescriptorBuffers() ? VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT : 0;
+  }
+  VkImageViewCreateFlags DefaultImageViewCreateFlags()
+  {
+    return DescriptorBuffers() ? VK_IMAGE_VIEW_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT : 0;
+  }
+  VkSamplerCreateFlags DefaultSamplerCreateFlags()
+  {
+    return DescriptorBuffers() ? VK_SAMPLER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT : 0;
+  }
 
   const VkPhysicalDeviceFeatures &GetDeviceEnabledFeatures()
   {
@@ -1587,9 +1756,17 @@ public:
   IMPLEMENT_FUNCTION_SERIALISED(void, vkFreeMemory, VkDevice device, VkDeviceMemory memory,
                                 const VkAllocationCallbacks *);
 
+  void ProcessMap(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, void **ppData,
+                  byte *realData, VkDeviceSize misalignedOffset);
+
   IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkMapMemory, VkDevice device, VkDeviceMemory memory,
                                 VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags,
                                 void **ppData);
+
+  template <typename SerialiserType>
+  bool SerialiseUnmap(SerialiserType &ser, VkDeviceMemory memory, uint64_t MapOffset,
+                      uint64_t MapSize, byte *MapData);
+  void ProcessUnmap(VkDevice device, VkDeviceMemory mem, const VkMemoryUnmapInfo *info);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkUnmapMemory, VkDevice device, VkDeviceMemory memory);
 
@@ -2281,12 +2458,12 @@ public:
                                  uint32_t set, uint32_t descriptorWriteCount,
                                  const VkWriteDescriptorSet *pDescriptorWrites);
 
-  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdPushDescriptorSetKHR, VkCommandBuffer commandBuffer,
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdPushDescriptorSet, VkCommandBuffer commandBuffer,
                                 VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
                                 uint32_t set, uint32_t descriptorWriteCount,
                                 const VkWriteDescriptorSet *pDescriptorWrites);
 
-  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdPushDescriptorSetWithTemplateKHR,
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdPushDescriptorSetWithTemplate,
                                 VkCommandBuffer commandBuffer,
                                 VkDescriptorUpdateTemplate descriptorUpdateTemplate,
                                 VkPipelineLayout layout, uint32_t set, const void *pData);
@@ -2534,6 +2711,18 @@ public:
                                         const VkCalibratedTimestampInfoKHR *pTimestampInfos,
                                         uint64_t *pTimestamps, uint64_t *pMaxDeviation);
 
+  // VK_EXT_host_image_copy
+
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCopyImageToImage, VkDevice device,
+                                const VkCopyImageToImageInfo *pCopyImageToImageInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCopyImageToMemory, VkDevice device,
+                                const VkCopyImageToMemoryInfo *pCopyImageToMemoryInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkCopyMemoryToImage, VkDevice device,
+                                const VkCopyMemoryToImageInfo *pCopyMemoryToImageInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkTransitionImageLayout, VkDevice device,
+                                uint32_t transitionCount,
+                                const VkHostImageLayoutTransitionInfo *pTransitions);
+
   // VK_EXT_host_query_reset
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkResetQueryPool, VkDevice device, VkQueryPool queryPool,
@@ -2598,7 +2787,7 @@ public:
 
   // VK_KHR_line_rasterization
 
-  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLineStippleKHR, VkCommandBuffer commandBuffer,
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetLineStipple, VkCommandBuffer commandBuffer,
                                 uint32_t lineStippleFactor, uint16_t lineStipplePattern);
 
   // VK_GOOGLE_display_timing
@@ -2793,13 +2982,15 @@ public:
                                 const VkRenderingInfo *pRenderingInfo);
 
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdEndRendering, VkCommandBuffer commandBuffer);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdEndRendering2EXT, VkCommandBuffer commandBuffer,
+                                const VkRenderingEndInfoEXT *pRenderingEndInfo);
 
   // VK_KHR_dynamic_rendering_local_read
 
-  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRenderingAttachmentLocationsKHR,
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRenderingAttachmentLocations,
                                 VkCommandBuffer commandBuffer,
                                 const VkRenderingAttachmentLocationInfo *pLocationInfo);
-  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRenderingInputAttachmentIndicesKHR,
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetRenderingInputAttachmentIndices,
                                 VkCommandBuffer commandBuffer,
                                 const VkRenderingInputAttachmentIndexInfo *pLocationInfo);
 
@@ -2826,7 +3017,11 @@ public:
 
   // VK_EXT_swapchain_maintenance1
   VkResult vkReleaseSwapchainImagesEXT(VkDevice device,
-                                       const VkReleaseSwapchainImagesInfoEXT *pReleaseInfo);
+                                       const VkReleaseSwapchainImagesInfoKHR *pReleaseInfo);
+
+  // VK_KHR_swapchain_maintenance1
+  VkResult vkReleaseSwapchainImagesKHR(VkDevice device,
+                                       const VkReleaseSwapchainImagesInfoKHR *pReleaseInfo);
 
   // VK_EXT_attachment_feedback_loop_dynamic_state
   IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetAttachmentFeedbackLoopEnableEXT,
@@ -3037,21 +3232,81 @@ public:
                                 VkDeviceAddress indirectDeviceAddress);
 
   // VK_KHR_maintenance5
-  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindIndexBuffer2KHR, VkCommandBuffer commandBuffer,
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindIndexBuffer2, VkCommandBuffer commandBuffer,
                                 VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
                                 VkIndexType indexType);
-  void vkGetDeviceImageSubresourceLayoutKHR(VkDevice device,
-                                            const VkDeviceImageSubresourceInfo *pInfo,
-                                            VkSubresourceLayout2 *pLayout);
-  void vkGetImageSubresourceLayout2KHR(VkDevice device, VkImage image,
-                                       const VkImageSubresource2 *pSubresource,
-                                       VkSubresourceLayout2 *pLayout);
-  void vkGetRenderingAreaGranularityKHR(VkDevice device,
-                                        const VkRenderingAreaInfo *pRenderingAreaInfo,
-                                        VkExtent2D *pGranularity);
+  void vkGetDeviceImageSubresourceLayout(VkDevice device, const VkDeviceImageSubresourceInfo *pInfo,
+                                         VkSubresourceLayout2 *pLayout);
+  void vkGetImageSubresourceLayout2(VkDevice device, VkImage image,
+                                    const VkImageSubresource2 *pSubresource,
+                                    VkSubresourceLayout2 *pLayout);
+  void vkGetRenderingAreaGranularity(VkDevice device, const VkRenderingAreaInfo *pRenderingAreaInfo,
+                                     VkExtent2D *pGranularity);
 
-  // VK_EXT_image_compression_control
+  // VK_EXT_image_compression_control, VK_EXT_host_image_copy
   void vkGetImageSubresourceLayout2EXT(VkDevice device, VkImage image,
                                        const VkImageSubresource2 *pSubresource,
                                        VkSubresourceLayout2 *pLayout);
+
+  // VK_EXT_descriptor_buffer
+  void vkGetDescriptorSetLayoutSizeEXT(VkDevice device, VkDescriptorSetLayout layout,
+                                       VkDeviceSize *pLayoutSizeInBytes);
+  void vkGetDescriptorSetLayoutBindingOffsetEXT(VkDevice device, VkDescriptorSetLayout layout,
+                                                uint32_t binding, VkDeviceSize *pOffset);
+  VkResult vkGetBufferOpaqueCaptureDescriptorDataEXT(VkDevice device,
+                                                     const VkBufferCaptureDescriptorDataInfoEXT *pInfo,
+                                                     void *pData);
+  VkResult vkGetImageOpaqueCaptureDescriptorDataEXT(VkDevice device,
+                                                    const VkImageCaptureDescriptorDataInfoEXT *pInfo,
+                                                    void *pData);
+  VkResult vkGetImageViewOpaqueCaptureDescriptorDataEXT(
+      VkDevice device, const VkImageViewCaptureDescriptorDataInfoEXT *pInfo, void *pData);
+  VkResult vkGetSamplerOpaqueCaptureDescriptorDataEXT(
+      VkDevice device, const VkSamplerCaptureDescriptorDataInfoEXT *pInfo, void *pData);
+  VkResult vkGetAccelerationStructureOpaqueCaptureDescriptorDataEXT(
+      VkDevice device, const VkAccelerationStructureCaptureDescriptorDataInfoEXT *pInfo, void *pData);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkGetDescriptorEXT, VkDevice device,
+                                const VkDescriptorGetInfoEXT *pDescriptorInfo, size_t dataSize,
+                                void *pDescriptor);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindDescriptorBuffersEXT, VkCommandBuffer commandBuffer,
+                                uint32_t bufferCount,
+                                const VkDescriptorBufferBindingInfoEXT *pBindingInfos);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdSetDescriptorBufferOffsetsEXT,
+                                VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
+                                VkPipelineLayout layout, uint32_t firstSet, uint32_t setCount,
+                                const uint32_t *pBufferIndices, const VkDeviceSize *pOffsets);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindDescriptorBufferEmbeddedSamplersEXT,
+                                VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
+                                VkPipelineLayout layout, uint32_t set);
+
+  // VK_KHR_map_memory2
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkMapMemory2, VkDevice device,
+                                const VkMemoryMapInfo *pMemoryMapInfo, void **ppData);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkUnmapMemory2, VkDevice device,
+                                const VkMemoryUnmapInfo *pMemoryUnmapInfo);
+
+  // VK_KHR_present_wait2
+
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkWaitForPresent2KHR, VkDevice device,
+                                VkSwapchainKHR swapchain,
+                                const VkPresentWait2InfoKHR *pPresentWait2Info);
+
+  // VK_KHR_maintenance5
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindDescriptorSets2, VkCommandBuffer commandBuffer,
+                                const VkBindDescriptorSetsInfo *pBindDescriptorSetsInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdPushConstants2, VkCommandBuffer commandBuffer,
+                                const VkPushConstantsInfo *pPushConstantsInfo);
+  // VK_KHR_maintenance5+VK_EXT_descriptor_buffer
+  IMPLEMENT_FUNCTION_SERIALISED(
+      void, vkCmdBindDescriptorBufferEmbeddedSamplers2EXT, VkCommandBuffer commandBuffer,
+      const VkBindDescriptorBufferEmbeddedSamplersInfoEXT *pBindDescriptorBufferEmbeddedSamplersInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(
+      void, vkCmdSetDescriptorBufferOffsets2EXT, VkCommandBuffer commandBuffer,
+      const VkSetDescriptorBufferOffsetsInfoEXT *pSetDescriptorBufferOffsetsInfo);
+  // VK_KHR_maintenance5+VK_KHR_push_descriptor
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdPushDescriptorSet2, VkCommandBuffer commandBuffer,
+                                const VkPushDescriptorSetInfo *pPushDescriptorSetInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(
+      void, vkCmdPushDescriptorSetWithTemplate2, VkCommandBuffer commandBuffer,
+      const VkPushDescriptorSetWithTemplateInfo *pPushDescriptorSetWithTemplateInfo);
 };

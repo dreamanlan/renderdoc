@@ -57,6 +57,12 @@ struct VkXfbQueryResult
   uint64_t numPrimitivesGenerated;
 };
 
+struct VertexAttributeInfo
+{
+  uint32_t divisor;
+  bool valid = false;
+};
+
 static const char *PatchedMeshOutputEntryPoint = "rdc";
 static const uint32_t MeshOutputDispatchWidth = 128;
 static uint32_t MeshOutputBufferArraySize = 64;
@@ -69,12 +75,13 @@ static uint32_t MeshOutputOutputSpecConstant = MeshOutputIBufferSpecConstant + 1
 // 2 = vbuffers
 static const uint32_t MeshOutputReservedBindings = 3;
 
-static void ConvertToMeshOutputCompute(const ShaderReflection &refl,
-                                       const SPIRVPatchData &patchData, const rdcstr &entryName,
-                                       BufferStorageMode storageMode, rdcarray<uint32_t> instDivisor,
+static void ConvertToMeshOutputCompute(const ShaderReflection &refl, const SPIRVPatchData &patchData,
+                                       const rdcstr &entryName, BufferStorageMode storageMode,
+                                       rdcarray<VertexAttributeInfo> vertexAttrInfo,
                                        const ActionDescription *action, uint32_t numVerts,
                                        uint32_t numViews, uint32_t baseSpecConstant,
-                                       rdcarray<uint32_t> &modSpirv, uint32_t &bufStride)
+                                       rdcarray<uint32_t> &modSpirv, uint32_t &bufStride,
+                                       int defaultVertexAttributeValue)
 {
   rdcspv::Editor editor(modSpirv);
 
@@ -1182,9 +1189,9 @@ static void ConvertToMeshOutputCompute(const ShaderReflection &refl,
           rdcspv::Id idx = vertexLookupID;
 
           // maybe idx = instanceIndex / someDivisor
-          if(location < instDivisor.size())
+          if(location < vertexAttrInfo.size())
           {
-            uint32_t divisor = instDivisor[location];
+            uint32_t divisor = vertexAttrInfo[location].divisor;
 
             if(divisor == ~0U)
             {
@@ -1223,29 +1230,85 @@ static void ConvertToMeshOutputCompute(const ShaderReflection &refl,
           // when we're using buffer device address we have one variable per vbuffer and it's a
           // plain uvec4*
 
-          // uvec4 *vertex = &vbuffers[reg].member0[idx]
-          if(IsBinding(storageMode))
-            ptrId =
-                ops.add(rdcspv::OpAccessChain(uvec4PtrType, editor.MakeId(), vbuffersBindVar.second,
-                                              {idxs[refl.inputSignature[i].regIndex], zero, idx}));
+          rdcspv::Id result;
+          if(refl.inputSignature[i].regIndex >= vertexAttrInfo.size() ||
+             !vertexAttrInfo[refl.inputSignature[i].regIndex].valid)
+          {
+            VarType varType = refl.inputSignature[i].varType;
+
+            // input variables were already expanded to 32-bit, so do the same here
+            if(varType == VarType::Half)
+              varType = VarType::Float;
+            else if(varType == VarType::SShort || varType == VarType::SByte)
+              varType = VarType::SInt;
+            else if(varType == VarType::UShort || varType == VarType::UByte)
+              varType = VarType::UInt;
+
+            rdcspv::Id v4TypeId = editor.DeclareType(rdcspv::Vector(rdcspv::scalar(varType), 4));
+
+            rdcspv::Id constZero, constOne;
+            switch(varType)
+            {
+              default: RDCERR("Unexpected input type"); DELIBERATE_FALLTHROUGH();
+              case VarType::Float:
+                constZero = editor.AddConstantImmediate(0.0f);
+                constOne = editor.AddConstantImmediate(1.0f);
+                break;
+              case VarType::Double:
+                constZero = editor.AddConstantImmediate(0.0);
+                constOne = editor.AddConstantImmediate(1.0);
+                break;
+              case VarType::SInt:
+                constZero = editor.AddConstantImmediate(0);
+                constOne = editor.AddConstantImmediate(1);
+                break;
+              case VarType::SLong:
+                constZero = editor.AddConstantImmediate<int64_t>(0);
+                constOne = editor.AddConstantImmediate<int64_t>(1);
+                break;
+              case VarType::UInt:
+                constZero = editor.AddConstantImmediate<uint32_t>(0);
+                constOne = editor.AddConstantImmediate<uint32_t>(1);
+                break;
+              case VarType::ULong:
+                constZero = editor.AddConstantImmediate<uint64_t>(0);
+                constOne = editor.AddConstantImmediate<uint64_t>(1);
+                break;
+            }
+
+            // baseTypeN result = driverDefaultVertexValue;
+            result = editor.AddConstant(rdcspv::Operation(rdcspv::OpConstantComposite(
+                v4TypeId, editor.MakeId(),
+                {constZero, constZero, constZero,
+                 defaultVertexAttributeValue == 0 ? constZero : constOne})));
+          }
           else
-            // uvec4 *vertex = &vbufferN.member0[idx]
-            ptrId = ops.add(rdcspv::OpAccessChain(uvec4PtrType, editor.MakeId(),
-                                                  vbufferVars[refl.inputSignature[i].regIndex],
-                                                  {zero, idx}));
+          {
+            // uvec4 *vertex = &vbuffers[reg].member0[idx]
+            if(IsBinding(storageMode))
+              ptrId = ops.add(
+                  rdcspv::OpAccessChain(uvec4PtrType, editor.MakeId(), vbuffersBindVar.second,
+                                        {idxs[refl.inputSignature[i].regIndex], zero, idx}));
+            else
+              // uvec4 *vertex = &vbufferN.member0[idx]
+              ptrId = ops.add(rdcspv::OpAccessChain(uvec4PtrType, editor.MakeId(),
+                                                    vbufferVars[refl.inputSignature[i].regIndex],
+                                                    {zero, idx}));
 
-          // uvec4 result = *vertex
-          rdcspv::Id result =
-              ops.add(rdcspv::OpLoad(uvec4Type, editor.MakeId(), ptrId, memoryAccess));
+            // uvec4 result = *vertex
+            result = ops.add(rdcspv::OpLoad(uvec4Type, editor.MakeId(), ptrId, memoryAccess));
 
-          // if we want this as ivec4 or vec4, bitcast now
-          if(ins[i].fetchVec4Type != uvec4Type)
-            result = ops.add(rdcspv::OpBitcast(ins[i].fetchVec4Type, editor.MakeId(), result));
+            // if we want this as ivec4 or vec4, bitcast now
+            if(ins[i].fetchVec4Type != uvec4Type)
+              result = ops.add(rdcspv::OpBitcast(ins[i].fetchVec4Type, editor.MakeId(), result));
+          }
 
           uint32_t firstComp =
               Bits::CountTrailingZeroes(uint32_t(refl.inputSignature[i].regChannelMask));
 
-          if(vType == VarType::Double || vType == VarType::ULong || vType == VarType::SLong)
+          if(refl.inputSignature[i].regIndex < vertexAttrInfo.size() &&
+             vertexAttrInfo[refl.inputSignature[i].regIndex].valid &&
+             (vType == VarType::Double || vType == VarType::ULong || vType == VarType::SLong))
           {
             // since 64-bit values are packed into two uints, we now need to fetch more data and do
             // packing. We can fetch the data unconditionally since it's harmless to read out of the
@@ -1446,6 +1509,55 @@ struct OutMeshletLayout
 static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConstant> &specInfo,
                                 rdcspv::SparseIdMap<rdcspv::Id> &outputTypeReplacements,
                                 const rdcspv::DataType &type, rdcspv::Id &structType,
+                                uint32_t &byteSize);
+
+static rdcspv::Id GetArraySizeAndAlign(rdcspv::Editor &editor, const rdcarray<SpecConstant> &specInfo,
+                                       rdcspv::SparseIdMap<rdcspv::Id> &outputTypeReplacements,
+                                       const rdcspv::DataType &type, uint32_t &size)
+{
+  const rdcspv::DataType &arrayInnerType = editor.GetDataType(type.InnerType());
+
+  rdcspv::Id innerId;
+
+  // handle arrays-of-arrays and arrays-of-struts
+  if(arrayInnerType.type == rdcspv::DataType::StructType)
+  {
+    innerId = arrayInnerType.InnerType();
+    LayOutStorageStruct(editor, specInfo, outputTypeReplacements,
+                        editor.GetDataType(arrayInnerType.InnerType()), innerId, size);
+  }
+  else if(arrayInnerType.type == rdcspv::DataType::ArrayType)
+  {
+    innerId = GetArraySizeAndAlign(editor, specInfo, outputTypeReplacements,
+                                   editor.GetDataType(arrayInnerType.InnerType()), size);
+  }
+  else
+  {
+    size = VarTypeByteSize(arrayInnerType.scalar().Type());
+    if(arrayInnerType.type == rdcspv::DataType::VectorType)
+      size *= arrayInnerType.vector().count;
+
+    // use the same type, nothing changed
+    innerId = type.InnerType();
+  }
+
+  // make a new array type so we can decorate it with a stride
+  rdcspv::Id memberTypeId =
+      editor.AddType(rdcspv::OpTypeArray(editor.MakeId(), innerId, type.length));
+  outputTypeReplacements[type.id] = memberTypeId;
+  editor.SetName(memberTypeId, StringFormat::Fmt("stridedArray%d", type.id.value()));
+
+  editor.AddDecoration(rdcspv::OpDecorate(
+      memberTypeId, rdcspv::DecorationParam<rdcspv::Decoration::ArrayStride>(size)));
+
+  size *= editor.EvaluateConstant(type.length, specInfo).value.u32v[0];
+
+  return memberTypeId;
+}
+
+static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConstant> &specInfo,
+                                rdcspv::SparseIdMap<rdcspv::Id> &outputTypeReplacements,
+                                const rdcspv::DataType &type, rdcspv::Id &structType,
                                 uint32_t &byteSize)
 {
   rdcarray<rdcspv::Id> members;
@@ -1468,9 +1580,6 @@ static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConst
     uint32_t size = 1;
     const rdcspv::DataType &childType = editor.GetDataType(type.children[i].type);
 
-    if(childType.type == rdcspv::DataType::ArrayType)
-      memberTypeId = childType.InnerType();
-
     if(childType.type == rdcspv::DataType::StructType)
     {
       offset = AlignUp16(offset);
@@ -1485,11 +1594,9 @@ static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConst
     }
     else if(childType.type == rdcspv::DataType::ArrayType)
     {
-      const rdcspv::DataType &arrayInnerType = editor.GetDataType(childType.InnerType());
-      size = VarTypeByteSize(arrayInnerType.scalar().Type());
-      offset = AlignUp(offset, size);
-      if(arrayInnerType.type == rdcspv::DataType::VectorType)
-        size *= arrayInnerType.vector().count;
+      memberTypeId = GetArraySizeAndAlign(editor, specInfo, outputTypeReplacements, childType, size);
+
+      offset = AlignUp16(offset);
     }
     else
     {
@@ -1504,24 +1611,7 @@ static void LayOutStorageStruct(rdcspv::Editor &editor, const rdcarray<SpecConst
 
     offsets.push_back(offset);
 
-    if(childType.type == rdcspv::DataType::ArrayType)
-    {
-      // make a new array type so we can decorate it with a stride
-      memberTypeId =
-          editor.AddType(rdcspv::OpTypeArray(editor.MakeId(), memberTypeId, childType.length));
-      outputTypeReplacements[type.children[i].type] = memberTypeId;
-      editor.SetName(memberTypeId,
-                     StringFormat::Fmt("stridedArray%d", type.children[i].type.value()));
-
-      editor.AddDecoration(rdcspv::OpDecorate(
-          memberTypeId, rdcspv::DecorationParam<rdcspv::Decoration::ArrayStride>(size)));
-
-      offset += size * editor.EvaluateConstant(childType.length, specInfo).value.u32v[0];
-    }
-    else
-    {
-      offset += size;
-    }
+    offset += size;
 
     members.push_back(memberTypeId);
   }
@@ -2290,9 +2380,43 @@ static void AddMeshShaderOutputStores(const ShaderReflection &refl,
           stride,
       };
     }
+    else if(type.type == rdcspv::DataType::ArrayType)
+    {
+      // handle arrays-of-arrays and arrays-of-structs here
+      arrayInnerType = GetArraySizeAndAlign(editor, specInfo, outputTypeReplacements, type, byteSize);
+
+      stride = byteSize;
+
+      outputTypeReplacements[type.id] = arrayInnerType;
+
+      uint32_t offset = 0;
+      bool perPrim = false;
+
+      if(d.others.contains(rdcspv::Decoration::PerPrimitiveEXT))
+      {
+        primOutByteCount = AlignUp16(primOutByteCount);
+        offset = primOutByteCount;
+        perPrim = true;
+        primOutByteCount += byteSize * arrayLength;
+      }
+      else
+      {
+        vertOutByteCount = AlignUp16(vertOutByteCount);
+        offset = vertOutByteCount;
+        perPrim = false;
+        vertOutByteCount += byteSize * arrayLength;
+      }
+
+      outputGlobals[var.id] = {
+          offset,
+          perPrim,
+          false,
+          byteSize,
+      };
+    }
     else
     {
-      // loose variable
+      // loose variable, vector/matrix/scalar
       const uint32_t scalarAlign = VarTypeByteSize(type.scalar().Type());
       byteSize = scalarAlign;
       if(type.type == rdcspv::DataType::VectorType)
@@ -2816,7 +2940,7 @@ void VulkanReplay::FetchMeshOut(uint32_t eventId, VulkanRenderState &state)
                                   : pipeInfo.shaders[(size_t)ShaderStage::Mesh];
 
   const VulkanCreationInfo::ShaderModule &meshInfo = creationInfo.m_ShaderModule[meshShad.module];
-  ShaderReflection *meshrefl = meshShad.refl;
+  const ShaderReflection *meshrefl = meshShad.refl;
 
   VulkanPostVSData &ret = m_PostVS.Data[eventId];
 
@@ -4192,7 +4316,7 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
 
   const VulkanCreationInfo::ShaderModule &moduleInfo = creationInfo.m_ShaderModule[vertShad.module];
 
-  ShaderReflection *refl = vertShad.refl;
+  const ShaderReflection *refl = vertShad.refl;
 
   VulkanPostVSData &ret = m_PostVS.Data[eventId];
 
@@ -4234,6 +4358,24 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
 
     MeshOutputBufferArraySize =
         m_pDriver->GetDeviceProps().limits.maxPerStageDescriptorStorageBuffers - 2;
+  }
+
+  // the default value of vertex input variables when no vertex attribute is provided
+  // 0 = (0,0,0,0), 1 = (0,0,0,1)
+  int defaultVertexAttributeValue = 1;
+
+  // if maintenance 9 is enabled, emulate the driver's default value
+  if(m_pDriver->Maintenance9())
+  {
+    VkPhysicalDeviceMaintenance9PropertiesKHR maintenance9Props = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_9_PROPERTIES_KHR};
+
+    VkPhysicalDeviceProperties2 propBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    propBase.pNext = &maintenance9Props;
+
+    m_pDriver->vkGetPhysicalDeviceProperties2(m_pDriver->GetPhysDev(), &propBase);
+
+    defaultVertexAttributeValue = maintenance9Props.defaultVertexAttributeValue;
   }
 
   for(size_t i = 0; i < refl->inputSignature.size(); i++)
@@ -4351,7 +4493,6 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
     uint32_t *idx32 = NULL;
 
     // fetch ibuffer
-    if(state.ibuffer.buf != ResourceId())
     {
       uint64_t readSizeBytes = uint64_t(action->numIndices) * state.ibuffer.bytewidth;
       // clamp to handle subrange bound via vkCmdBindIndexBuffer2
@@ -4364,8 +4505,11 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
         readSizeBytes = RDCMIN(readSizeBytes, maxSubrangeBytes);
       }
 
-      GetBufferData(state.ibuffer.buf, state.ibuffer.offs + action->indexOffset * idxsize,
-                    readSizeBytes, idxdata);
+      if(state.ibuffer.buf != ResourceId())
+        GetBufferData(state.ibuffer.buf, state.ibuffer.offs + action->indexOffset * idxsize,
+                      readSizeBytes, idxdata);
+      else if(m_pDriver->Maintenance6())
+        idxdata.resize((size_t)readSizeBytes);
     }
 
     // figure out what the maximum index could be, so we can clamp our index buffer to something
@@ -4695,7 +4839,7 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
     VkDescriptorBufferInfo descriptor;
   };
 
-  rdcarray<uint32_t> attrInstDivisor;
+  rdcarray<VertexAttributeInfo> vertexAttrInfo;
   rdcarray<CompactedAttrBuffer> vbuffers;
   vbuffers.resize(MeshOutputBufferArraySize);
 
@@ -5052,8 +5196,9 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
         m_pDriver->vkUnmapMemory(m_Device, vbuffers[attr].mem);
       }
 
-      attrInstDivisor.resize(RDCMAX(attrInstDivisor.size(), size_t(attr + 1)));
-      attrInstDivisor[attr] = instDivisor;
+      vertexAttrInfo.resize(RDCMAX(vertexAttrInfo.size(), size_t(attr + 1)));
+      vertexAttrInfo[attr].divisor = instDivisor;
+      vertexAttrInfo[attr].valid = true;
 
       vbuffers[attr].descriptor.buffer = vbuffers[attr].buf;
       vbuffers[attr].descriptor.offset = 0;
@@ -5109,8 +5254,8 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
     FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postvs_vert.spv", modSpirv);
 
   ConvertToMeshOutputCompute(*refl, *vertShad.patchData, vertShad.entryPoint, m_StorageMode,
-                             attrInstDivisor, action, numVerts, numViews, baseSpecConstant,
-                             modSpirv, bufStride);
+                             vertexAttrInfo, action, numVerts, numViews, baseSpecConstant, modSpirv,
+                             bufStride, defaultVertexAttributeValue);
 
   if(!Vulkan_Debug_PostVSDumpDirPath().empty())
     FileIO::WriteAll(Vulkan_Debug_PostVSDumpDirPath() + "/debug_postvs_comp.spv", modSpirv);
@@ -5203,6 +5348,9 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   // repoint pipeline layout
   compPipeInfo.layout = patchedBufferdata.pipeLayout;
 
+  if(pipeCreateInfo.flags & VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT)
+    compPipeInfo.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+
   // create vertex shader with modified code
   VkShaderModuleCreateInfo moduleCreateInfo = {
       VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL,         0,
@@ -5236,12 +5384,21 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
                         "KHR and EXT buffer_device_address should be interchangeable here.");
       VkBufferDeviceAddressInfo getAddressInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
 
+      uint32_t specIdOffset = i;
       if(i < MeshOutputBufferArraySize)
+      {
         getAddressInfo.buffer = vbuffers[i].buf;
+      }
       else if(i == MeshOutputBufferArraySize)
+      {
         getAddressInfo.buffer = uniqIdxBuf;
+        specIdOffset = MeshOutputIBufferSpecConstant;
+      }
       else if(i == MeshOutputBufferArraySize + 1)
+      {
         getAddressInfo.buffer = meshBuffer;
+        specIdOffset = MeshOutputOutputSpecConstant;
+      }
 
       // skip
       if(getAddressInfo.buffer == VK_NULL_HANDLE)
@@ -5254,7 +5411,7 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
 
       VkSpecializationMapEntry entry;
       entry.offset = baseOffset + i * sizeof(uint64_t);
-      entry.constantID = baseSpecConstant + i * 2 + 0;
+      entry.constantID = baseSpecConstant + specIdOffset * 2 + 0;
 
       // for EXT we have one 64-bit spec constant per address, for KHR we have a uvec2 - two
       // constants
@@ -5575,7 +5732,7 @@ void VulkanReplay::FetchTessGSOut(uint32_t eventId, VulkanRenderState &state)
       state.graphics.shaderObject ? creationInfo.m_ShaderObject[state.shaderObjects[stageIndex]].shad
                                   : pipeInfo.shaders[stageIndex];
 
-  ShaderReflection *lastRefl = shader.refl;
+  const ShaderReflection *lastRefl = shader.refl;
 
   RDCASSERT(lastRefl);
 

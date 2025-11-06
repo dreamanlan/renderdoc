@@ -66,8 +66,12 @@ void GatherInputDataForInitialValues(const DXBC::DXBCContainer *dxbc, InputFetch
   nonfloatInputs.clear();
   inputVarNames.clear();
   fetcher.hlsl += "struct Inputs\n{\n";
-  rdcstr defines;
+  rdcstr defines, copyFunc;
   fetcher.laneDataBufferStride = 0;
+
+  copyFunc =
+      "void CopyInputs(out Inputs OUT, in Inputs IN) {\n"
+      "  OUT = (Inputs)0;\n";
 
   if(stageInputSig.empty() && dxbc->m_Type == DXBC::ShaderType::Pixel)
   {
@@ -322,7 +326,7 @@ void GatherInputDataForInitialValues(const DXBC::DXBCContainer *dxbc, InputFetch
     if(arrayLength > 0)
       inputVarNames[i] += StringFormat::Fmt("[%d]", RDCMAX(0, arrayIndex));
 
-    if(included)
+    if(included && sig.channelUsedMask != 0)
     {
       rdcarray<rdcstr> &outArray = sig.varType == VarType::Float ? floatInputs : nonfloatInputs;
       if(arrayLength == 0)
@@ -334,6 +338,8 @@ void GatherInputDataForInitialValues(const DXBC::DXBCContainer *dxbc, InputFetch
         for(int a = 0; a < arrayLength; a++)
           outArray.push_back(inputName + "[" + ToStr(a) + "]");
       }
+
+      copyFunc += StringFormat::Fmt("  OUT.%s = IN.%s;\n", inputName.c_str(), inputName.c_str());
     }
 
     fetcher.hlsl += ";\n";
@@ -366,7 +372,9 @@ void GatherInputDataForInitialValues(const DXBC::DXBCContainer *dxbc, InputFetch
     }
   }
 
-  fetcher.hlsl += "};\n\n" + defines;
+  copyFunc += "\n};\n\n";
+
+  fetcher.hlsl += "};\n\n" + defines + "\n\n" + copyFunc;
 }
 
 void CreateLegacyInputFetcher(const DXBC::DXBCContainer *dxbc, const InputFetcherConfig &cfg,
@@ -532,10 +540,10 @@ void ExtractInputs(Inputs IN
 
   // start off with just copying all the inputs to all the quad. For float inputs or uints that may
   // vary across the quad we will quadSwizzle them
-  HitBuffer[idx].lanes[0].IN = IN;
-  HitBuffer[idx].lanes[1].IN = IN;
-  HitBuffer[idx].lanes[2].IN = IN;
-  HitBuffer[idx].lanes[3].IN = IN;
+  CopyInputs(HitBuffer[idx].lanes[0].IN, IN);
+  CopyInputs(HitBuffer[idx].lanes[1].IN, IN);
+  CopyInputs(HitBuffer[idx].lanes[2].IN, IN);
+  CopyInputs(HitBuffer[idx].lanes[3].IN, IN);
 )";
 
   for(int q = 0; q < 4; q++)
@@ -667,6 +675,12 @@ void ExtractInputs(Inputs IN
 void CreateInputFetcher(const DXBC::DXBCContainer *dxbc, const DXBC::DXBCContainer *prevdxbc,
                         const InputFetcherConfig &cfg, InputFetcher &fetcher)
 {
+  if(cfg.fetchWorkgroup && dxbc->m_Type != DXBC::ShaderType::Compute)
+  {
+    RDCERR("Can only fetch workgroup inputs for Compute shaders");
+    return;
+  }
+
   bool usePrimitiveID = prevdxbc && ((prevdxbc->m_Type != DXBC::ShaderType::Geometry) &&
                                      (prevdxbc->m_Type != DXBC::ShaderType::Mesh));
 
@@ -679,6 +693,7 @@ void CreateInputFetcher(const DXBC::DXBCContainer *dxbc, const DXBC::DXBCContain
 struct Inputs
 {
 };
+void CopyInputs(out Inputs OUT, in Inputs IN) {}
 )";
   }
   else
@@ -706,7 +721,7 @@ struct Inputs
       RDCERR("Invalid requested wave size %u vs device maximum of %u", reqWaveSize, cfg.maxWaveSize);
   }
 
-  fetcher.numLanesPerHit = waveSize;
+  fetcher.numLanesPerHit = cfg.fetchWorkgroup ? cfg.groupSize : waveSize;
 
   fetcher.hlsl += StringFormat::Fmt(
       "#define STAGE_VS %u\n"
@@ -715,9 +730,10 @@ struct Inputs
       "#define STAGE %u\n"
       "#define MAXHIT %u\n"
       "#define MAXWAVESIZE %u\n"
-      "#define USEPRIM %u\n",
+      "#define USEPRIM %u\n"
+      "#define FETCH_WORKGROUP %u\n",
       DXBC::ShaderType::Vertex, DXBC::ShaderType::Pixel, DXBC::ShaderType::Compute, dxbc->m_Type,
-      DXDebug::maxPixelHits, waveSize, usePrimitiveID ? 1 : 0);
+      DXDebug::maxPixelHits, waveSize, usePrimitiveID ? 1 : 0, cfg.fetchWorkgroup);
 
   if(dxbc->m_Type == DXBC::ShaderType::Vertex)
   {
@@ -744,6 +760,11 @@ struct Inputs
                                       dxbc->GetReflection()->DispatchThreadsDimension[0],
                                       dxbc->GetReflection()->DispatchThreadsDimension[1],
                                       dxbc->GetReflection()->DispatchThreadsDimension[2]);
+    fetcher.hlsl += StringFormat::Fmt(
+        "#define GROUPX %u\n"
+        "#define GROUPY %u\n"
+        "#define GROUPZ %u\n",
+        cfg.groupid[0], cfg.groupid[1], cfg.groupid[2]);
   }
   else
   {
@@ -812,7 +833,7 @@ struct CSLaneData
 {
 #if STAGE == STAGE_CS
   uint3 threadid;
-  uint pad;
+  uint activeSubgroup;
 #endif
 };
 
@@ -885,6 +906,8 @@ void ExtractInputs(Inputs IN
 
                      , uint3 threadid : SV_GroupThreadID 
                      , uint3 dtid : SV_DispatchThreadID 
+                     , uint3 groupid : SV_GroupID
+                     , uint groupindex : SV_GroupIndex
 
 #endif
 )
@@ -928,11 +951,13 @@ void ExtractInputs(Inputs IN
 
 #if STAGE == STAGE_VS
   bool candidateThread = (vert == DEST_VERT && inst == DEST_INST);
+  bool fetchWorkgroup = false;
 
   vs.vert = vert;
   vs.inst = inst;
 #elif STAGE == STAGE_PS
   bool candidateThread = (abs(debug_pixelPos.x - DESTX) < 0.5f && abs(debug_pixelPos.y - DESTY) < 0.5f);
+  bool fetchWorkgroup = false;
 
   quadLaneIndex = (2u * (uint(debug_pixelPos.y) & 1u)) + (uint(debug_pixelPos.x) & 1u);
   derivValid = ddx(debug_pixelPos.x);
@@ -994,11 +1019,44 @@ void ExtractInputs(Inputs IN
   ps.isFrontFace = isFrontFace;
 #elif STAGE == STAGE_CS
   bool candidateThread = (dtid.x == DESTX && dtid.y == DESTY && dtid.z == DESTZ);
-
   cs.threadid = threadid;
 #endif
 
-  if(WaveActiveAnyTrue(candidateThread))
+#if FETCH_WORKGROUP
+
+#if STAGE != STAGE_CS
+#error "Only compute shader fetches whole workgroup"
+#endif // #if STAGE != STAGE_CS
+
+  bool candidateGroup = (groupid.x == GROUPX && groupid.y == GROUPY && groupid.z == GROUPZ);
+  if (!candidateGroup)
+    return;
+
+  bool activeSubgroup = WaveActiveAnyTrue(candidateThread);
+  cs.activeSubgroup = activeSubgroup ? 1 : 0;
+  if(candidateThread)
+  {
+    HitBuffer[0].numHits = 1;
+    HitBuffer[0].pos_depth = debug_pixelPos.xyz;
+    HitBuffer[0].derivValid = derivValid;
+    HitBuffer[0].primitive = primitive;
+    HitBuffer[0].sample = sample;
+    HitBuffer[0].laneIndex = laneIndex;
+    HitBuffer[0].quadLaneIndex = quadLaneIndex;
+    HitBuffer[0].subgroupSize = WaveGetLaneCount();
+    HitBuffer[0].globalBallot = globalBallot;
+    HitBuffer[0].helperBallot = helperBallot;
+  }
+  // Use SV_GroupIndex as the output index
+  LaneBuffer[groupindex].laneIndex = laneIndex;
+  LaneBuffer[groupindex].active = 1;
+  LaneBuffer[groupindex].cs = cs;
+#else // #if FETCH_WORKGROUP
+  bool activeSubgroup = WaveActiveAnyTrue(candidateThread);
+#if STAGE == STAGE_CS
+  cs.activeSubgroup = activeSubgroup ? 1 : 0;
+#endif
+  if (activeSubgroup)
   {
     if(isHelper == 0)
     {
@@ -1042,10 +1100,11 @@ void ExtractInputs(Inputs IN
         LaneBuffer[idx*MAXWAVESIZE+laneIndex].vs = vs;
         LaneBuffer[idx*MAXWAVESIZE+laneIndex].ps = ps;
         LaneBuffer[idx*MAXWAVESIZE+laneIndex].cs = cs;
-        LaneBuffer[idx*MAXWAVESIZE+laneIndex].IN = IN;
+        CopyInputs(LaneBuffer[idx*MAXWAVESIZE+laneIndex].IN, IN);
       }
     }
   }
+#endif // #if FETCH_WORKGROUP
 }
 )";
 }

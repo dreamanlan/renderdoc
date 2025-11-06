@@ -8,27 +8,24 @@ class Subgroup_Zoo(rdtest.TestCase):
     demos_test_name = None
     workgroup = (0, 0, 0)
 
-    def check_support(self, **kwargs):
-        # Only allow this if explicitly run
-        if kwargs['test_include'] == self.demos_test_name:
-            return True, ''
-        return False, 'Disabled test'
-
     def check_compute_thread_result(self, test, action, x, y, z, dim, bufdata):
         try:
             real = struct.unpack_from(
                 "4f", bufdata, 16*y*dim[0] + 16*x)
+        except Exception as ex:
+            rdtest.log.error(f"Exception Test {test} failed {ex}")
+            return False
 
-            trace = self.controller.DebugThread(
-                self.workgroup, (x, y, z))
+        try:
+            trace = self.controller.DebugThread(self.workgroup, (x, y, z))
 
             _, variables = self.process_trace(trace)
 
             if trace.debugger is None:
                 raise rdtest.TestFailureException(f"Test {test} at {action.eventId} got no debug result at {x},{y},{z}")
 
-            # Find the source variable 'data' at the highest instruction index
-            name = 'data'
+            # Find the source variable 'testResult' at the highest instruction index
+            name = 'testResult'
             debugged = None
             countInst = len(trace.instInfo)
             for inst in range(countInst):
@@ -166,7 +163,7 @@ class Subgroup_Zoo(rdtest.TestCase):
                             rdtest.log.error(
                                 f"Test {idx} at {action.eventId} got no debug result at {vtx} inst {inst} view {view}")
                             failed = True
-                            return
+                            continue
 
                         _, variables = self.process_trace(trace)
 

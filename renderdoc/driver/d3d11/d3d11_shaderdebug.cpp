@@ -41,8 +41,6 @@
 
 #include "data/hlsl/hlsl_cbuffers.h"
 
-RDOC_EXTERN_CONFIG(bool, D3D_Hack_EnableGroups);
-
 class D3D11DebugAPIWrapper : public DXBCDebug::DebugAPIWrapper
 {
 public:
@@ -1424,8 +1422,10 @@ void AddCBuffersToGlobalState(const DXBCBytecode::Program &program, D3D11DebugMa
     {
       DXBCDebug::BindingSlot slot(i, 0);
       cbufData.clear();
-      debugManager.GetBufferData(shader.ConstantBuffers[i], shader.CBOffsets[i] * sizeof(Vec4f),
-                                 shader.CBCounts[i] * sizeof(Vec4f), cbufData);
+      // GetBufferData returns the whole buffer if we pass a length of 0, so skip explicitly
+      if(shader.CBCounts[i] > 0)
+        debugManager.GetBufferData(shader.ConstantBuffers[i], shader.CBOffsets[i] * sizeof(Vec4f),
+                                   shader.CBCounts[i] * sizeof(Vec4f), cbufData);
 
       AddCBufferToGlobalState(program, global, sourceVars, refl, slot, cbufData);
     }
@@ -1452,13 +1452,13 @@ ShaderDebugTrace *D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, ui
   if(!vs)
     return new ShaderDebugTrace;
 
-  DXBC::DXBCContainer *dxbc = vs->GetDXBC();
+  const DXBC::DXBCContainer *dxbc = vs->GetDXBC();
   const ShaderReflection &refl = vs->GetDetails();
 
   if(!dxbc)
     return new ShaderDebugTrace;
 
-  dxbc->GetDisassembly(false);
+  vs->GetWriteableDXBC()->GetDisassembly(false);
 
   D3D11RenderState *rs = m_pImmediateContext->GetCurrentPipelineState();
 
@@ -1840,15 +1840,15 @@ ShaderDebugTrace *D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t
 
   D3D11RenderState *rs = m_pImmediateContext->GetCurrentPipelineState();
 
-  DXBC::DXBCContainer *dxbc = ps->GetDXBC();
+  const DXBC::DXBCContainer *dxbc = ps->GetDXBC();
   const ShaderReflection &refl = ps->GetDetails();
 
   if(!dxbc)
     return new ShaderDebugTrace;
 
-  dxbc->GetDisassembly(false);
+  ps->GetWriteableDXBC()->GetDisassembly(false);
 
-  DXBC::DXBCContainer *prevdxbc = NULL;
+  const DXBC::DXBCContainer *prevdxbc = NULL;
 
   if(prevdxbc == NULL && gs != NULL)
     prevdxbc = gs->GetDXBC();
@@ -2303,22 +2303,21 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
   if(!cs)
     return new ShaderDebugTrace;
 
-  DXBC::DXBCContainer *dxbc = cs->GetDXBC();
+  const DXBC::DXBCContainer *dxbc = cs->GetDXBC();
   const ShaderReflection &refl = cs->GetDetails();
 
   if(!dxbc)
     return new ShaderDebugTrace;
 
-  dxbc->GetDisassembly(false);
+  cs->GetWriteableDXBC()->GetDisassembly(false);
 
   D3D11RenderState *rs = m_pImmediateContext->GetCurrentPipelineState();
 
   uint32_t activeIndex = 0;
   if(dxbc->GetThreadScope() == DXBC::ThreadScope::Workgroup)
   {
-    if(D3D_Hack_EnableGroups())
-      activeIndex = threadid[0] + threadid[1] * refl.dispatchThreadsDimension[0] +
-                    threadid[2] * refl.dispatchThreadsDimension[0] * refl.dispatchThreadsDimension[1];
+    activeIndex = threadid[0] + threadid[1] * refl.dispatchThreadsDimension[0] +
+                  threadid[2] * refl.dispatchThreadsDimension[0] * refl.dispatchThreadsDimension[1];
   }
 
   DXBCDebug::InterpretDebugger *interpreter = new DXBCDebug::InterpretDebugger;

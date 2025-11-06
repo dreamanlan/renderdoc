@@ -621,15 +621,16 @@ struct ShaderBindpointMapping;
 void EvaluateVertexAttributeBinds(GLuint curProg, const ShaderReflection *refl, bool spirv,
                                   rdcarray<int32_t> &vertexAttrBindings);
 
-void GetCurrentBinding(GLuint curProg, ShaderReflection *refl, const ShaderResource &resource,
+void GetCurrentBinding(GLuint curProg, const ShaderReflection *refl, const ShaderResource &resource,
                        uint32_t &slot, bool &used);
-void GetCurrentBinding(GLuint curProg, ShaderReflection *refl, const ConstantBlock &cblock,
+void GetCurrentBinding(GLuint curProg, const ShaderReflection *refl, const ConstantBlock &cblock,
                        uint32_t &slot, bool &used);
 
 // calls glBlitFramebuffer but ensures no state can interfere like scissor or color mask
 // pops state for only a single drawbuffer!
 void SafeBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0,
                          GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
+void SafeClearFramebuffer(GLbitfield clearMask, GLfloat rgba[4], GLfloat depth, GLint stencil);
 
 enum UniformType
 {
@@ -790,6 +791,8 @@ extern bool IsGLES;
   EXT_TO_CHECK(99, 99, EXT_texture_buffer)                       \
   /* OpenGL ES extensions */                                     \
   EXT_TO_CHECK(99, 32, EXT_color_buffer_float)                   \
+  EXT_TO_CHECK(99, 99, EXT_color_buffer_half_float)              \
+  EXT_TO_CHECK(99, 99, EXT_render_snorm)                         \
   EXT_TO_CHECK(99, 32, EXT_primitive_bounding_box)               \
   EXT_TO_CHECK(99, 32, OES_primitive_bounding_box)               \
   EXT_TO_CHECK(99, 32, OES_texture_border_color)                 \
@@ -914,8 +917,8 @@ template <typename SerialiserType>
 void SerialiseProgramUniforms(SerialiserType &ser, CaptureState state,
                               const PerStageReflections &stages, GLuint prog,
                               std::map<GLint, GLint> *locTranslate);
-bool CopyProgramAttribBindings(GLuint progsrc, GLuint progdst, ShaderReflection *refl);
-bool CopyProgramFragDataBindings(GLuint progsrc, GLuint progdst, ShaderReflection *refl);
+bool CopyProgramAttribBindings(GLuint progsrc, GLuint progdst, const ShaderReflection *refl);
+bool CopyProgramFragDataBindings(GLuint progsrc, GLuint progdst, const ShaderReflection *refl);
 template <typename SerialiserType>
 bool SerialiseProgramBindings(SerialiserType &ser, CaptureState state,
                               const PerStageReflections &stages, GLuint prog);

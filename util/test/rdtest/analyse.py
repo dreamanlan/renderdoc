@@ -1,6 +1,8 @@
 import struct
 from typing import List
+from typing import Tuple
 import renderdoc
+from . import util
 
 # Alias for convenience - we need to import as-is so types don't get confused
 rd = renderdoc
@@ -24,27 +26,39 @@ def open_capture(filename="", cap: rd.CaptureFile=None, opts: rd.ReplayOptions=N
     own_cap = False
     api = "Unknown"
 
-    if cap is None:
-        own_cap = True
+    result = None
+    controller = None
+    if util.get_remote_server() is None:
+        if cap is None:
+            own_cap = True
 
-        cap = rd.OpenCaptureFile()
+            cap = rd.OpenCaptureFile()
 
-        # Open a particular file
-        result = cap.OpenFile(filename, '', None)
+            # Open a particular file
+            result = cap.OpenFile(filename, '', None)
 
-        # Make sure the file opened successfully
-        if result != rd.ResultCode.Succeeded:
-            cap.Shutdown()
-            raise RuntimeError("Couldn't open '{}': {}".format(filename, str(result)))
+            # Make sure the file opened successfully
+            if result != rd.ResultCode.Succeeded:
+                cap.Shutdown()
+                raise RuntimeError("Couldn't open '{}': {}".format(filename, str(result)))
 
-        api = cap.DriverName()
+            api = cap.DriverName()
 
-        # Make sure we can replay
-        if not cap.LocalReplaySupport():
-            cap.Shutdown()
-            raise RuntimeError("{} capture cannot be replayed".format(api))
+            # Make sure we can replay
+            if not cap.LocalReplaySupport():
+                cap.Shutdown()
+                raise RuntimeError("{} capture cannot be replayed".format(api))
 
-    result, controller = cap.OpenCapture(opts, None)
+        result, controller = cap.OpenCapture(opts, None)
+    else:
+        if not cap is None:
+            raise ValueError("Cannot call analyse.open_capture() with capture handle for remote {}"
+                        .format(util.get_remote_server().remote))
+
+        result, controller = util.get_remote_server().OpenCapture(rd.RemoteServer.NoPreference,
+                                                                  filename, opts, None)
+        if result == rd.ResultCode.Succeeded:
+            api = util.get_remote_server().remote.DriverName()
 
     if own_cap:
         cap.Shutdown()
@@ -323,3 +337,92 @@ def decode_mesh_data(controller: rd.ReplayController, indices: List[int], displa
         ret.append(vertex)
 
     return ret
+
+def str_vartype(t: rd.VarType) -> str:
+    if t == rd.VarType.Bool:
+        return "Bool"
+    elif t == rd.VarType.ConstantBlock:
+        return "ConstantBlock"
+    elif t == rd.VarType.Double:
+        return "Double"
+    elif t == rd.VarType.Enum:
+        return "Enum"
+    elif t == rd.VarType.Float:
+        return "Float"
+    elif t == rd.VarType.GPUPointer:
+        return "GPUPointer"
+    elif t == rd.VarType.Half:
+        return "Half"
+    elif t == rd.VarType.ReadOnlyResource:
+        return "ReadOnlyResource"
+    elif t == rd.VarType.ReadWriteResource:
+        return "ReadWriteResource"
+    elif t == rd.VarType.Sampler:
+        return "Sampler"
+    elif t == rd.VarType.SByte:
+        return "SByte"
+    elif t == rd.VarType.SInt:
+        return "SInt"
+    elif t == rd.VarType.SLong:
+        return "SLong"
+    elif t == rd.VarType.SShort:
+        return "SShort"
+    elif t == rd.VarType.Struct:
+        return "Struct"
+    elif t == rd.VarType.UByte:
+        return "UByte"
+    elif t == rd.VarType.UInt:
+        return "UInt"
+    elif t == rd.VarType.ULong:
+        return "ULong"
+    elif t == rd.VarType.Unknown:
+        return "Unknown"
+    elif t == rd.VarType.UShort:
+        return "UShort"
+    return "???"
+
+def shadervariable_equal(a: rd.ShaderVariable, b : rd.ShaderVariable) -> Tuple[bool, str]:
+    difference = ""
+    if a.rows != b.rows:
+        difference = f"Rows differ: {a.rows} != {b.rows}"
+        return (False, difference)
+    if a.columns != b.columns:
+        difference = f"Columns differ: {a.columns} != {b.columns}"
+        return (False, difference)
+    if a.name != b.name:
+        difference = f"Names differ: {a.name} != {b.name}"
+        return (False, difference)
+    if a.type != b.type:
+        difference = f"Types differ: {str_vartype(a.type)} != {str_vartype(b.type)}"
+        return (False, difference)
+    if a.flags != b.flags:
+        difference = f"Flags differ: {a.flags} != {b.flags}"
+        return (False, difference)
+    if len(a.members) != len(b.members):
+        difference = f"Member count differs: {len(a.members)} != {len(b.members)}"
+        return (False, difference)
+
+    for i in range(a.rows * a.columns):
+        if a.type == rd.VarType.UByte or a.type == rd.VarType.SByte:
+            if a.value.u8v[i] != b.value.u8v[i]:
+                return (False, f"Values differ at index {i}: {a.value.u8v[i]} != {b.value.u8v[i]}")
+        elif a.type == rd.VarType.Half or a.type == rd.VarType.UShort or a.type == rd.VarType.SShort:
+            if a.value.u16v[i] != b.value.u16v[i]:
+                return (False, f"Values differ at index {i}: {a.value.u16v[i]} != {b.value.u16v[i]}")
+        elif a.type == rd.VarType.Float or a.type == rd.VarType.UInt or a.type == rd.VarType.SInt or a.type == rd.VarType.Bool or a.type == rd.VarType.Enum:
+            if a.value.u32v[i] != b.value.u32v[i]:
+                return (False, f"Values differ at index {i}: {a.value.u32v[i]} != {b.value.u32v[i]}")
+        elif a.type == rd.VarType.Double or a.type == rd.VarType.ULong or a.type == rd.VarType.SLong or a.type == rd.VarType.GPUPointer:
+            if a.value.u64v[i] != b.value.u64v[i]:
+                return (False, f"Values differ at index {i}: {a.value.u64v[i]} != {b.value.u64v[i]}")
+        else:
+            if a.value.u64v[i] != b.value.u64v[i]:
+                return (False, f"Values differ at index {i}: {a.value.u64v[i]} != {b.value.u64v[i]}")
+
+    for m in range(len(a.members)):
+        (ret, diff) = shadervariable_equal(a.members[m], b.members[m])
+        if not ret:
+            difference = f"Member[{m}] differs {diff}"
+            return (False, difference)
+
+    return (True, "")

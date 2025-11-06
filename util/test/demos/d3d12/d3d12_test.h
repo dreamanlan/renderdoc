@@ -82,11 +82,13 @@ struct D3D12GraphicsTest : public GraphicsTest
     None = 0,
     SkipOptimise = 1 << 0,
     Enable16BitTypes = 1 << 1,
+    SeparateDebug = 1 << 2,
   };
 
   ID3DBlobPtr Compile(std::string src, std::string entry, std::string profile,
                       uint32_t compileOptions = CompileOptionFlags::SkipOptimise);
   void WriteBlob(std::string name, ID3DBlobPtr blob, bool compress);
+  void WriteBlob(std::string name, void *data, size_t size, bool compress);
 
   void SetBlobPath(std::string name, ID3DBlobPtr &blob);
   void SetBlobPath(std::string name, ID3D12DeviceChild *shader);
@@ -266,6 +268,7 @@ struct D3D12GraphicsTest : public GraphicsTest
   D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5 = {};
   D3D12_FEATURE_DATA_D3D12_OPTIONS6 opts6 = {};
   D3D12_FEATURE_DATA_D3D12_OPTIONS7 opts7 = {};
+  D3D12_FEATURE_DATA_D3D12_OPTIONS19 opts19 = {};
   D3D_SHADER_MODEL m_HighestShaderModel = D3D_SHADER_MODEL_5_1;
 
   ID3D12FencePtr m_GPUSyncFence;

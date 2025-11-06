@@ -45,14 +45,39 @@ struct VulkanStatePipeline
   struct DescriptorAndOffsets
   {
     ResourceId pipeLayout;
+    bool push = false;
+
+    // if descriptor set bound
     ResourceId descSet;
     rdcarray<uint32_t> offsets;
+
+    // if descriptor buffer bound
+    uint32_t descBufferIdx = ~0U;
+    VkDeviceSize descBufferOffset = 0;
+    bool descBufferEmbeddedSamplers = false;
+    bool descBufferPush = false;
+
+    bool IsDescBufferBound() const
+    {
+      return descBufferIdx != ~0U || descBufferEmbeddedSamplers || descBufferPush;
+    }
+
+    bool IsBound() const
+    {
+      return descSet != ResourceId() || descBufferIdx != ~0U || descBufferEmbeddedSamplers;
+    }
   };
   rdcarray<DescriptorAndOffsets> descSets;
   // the index of the last set bound. In the case where we are re-binding sets and don't have a
   // valid pipeline to reference, this can help us resolve which descriptor sets to rebind in the
   // event that they're not all compatible
   uint32_t lastBoundSet = 0;
+
+  bool UsingDescBufs() const
+  {
+    // all sets must be using buffers or not
+    return !descSets.empty() && descSets[0].descBufferIdx != ~0U;
+  }
 };
 
 struct VulkanRenderState
@@ -71,6 +96,9 @@ struct VulkanRenderState
   void BeginRenderPassAndApplyState(WrappedVulkan *vk, VkCommandBuffer cmd, PipelineBinding binding,
                                     bool obeySuspending);
   void BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd, PipelineBinding binding, bool subpass0);
+
+  void BindDescriptorBuffers(WrappedVulkan *vk, VkCommandBuffer cmd);
+
   void BindShaderObjects(WrappedVulkan *vk, VkCommandBuffer cmd, PipelineBinding binding);
   void BindDynamicState(WrappedVulkan *vk, VkCommandBuffer cmd);
 
@@ -181,6 +209,15 @@ struct VulkanRenderState
     return compute;
   }
 
+  struct DescriptorBuffer
+  {
+    VkDeviceAddress address;
+    VkBufferUsageFlags2 usage;
+    bool flags2;
+    ResourceId pushBuffer;
+  };
+  rdcarray<DescriptorBuffer> descBufs;
+
   struct IdxBuffer
   {
     ResourceId buf;
@@ -278,6 +315,40 @@ struct VulkanRenderState
   // dynamic rendering
   struct DynamicRendering
   {
+    DynamicRendering() = default;
+    DynamicRendering &operator=(const DynamicRendering &o)
+    {
+      active = o.active;
+      suspended = o.suspended;
+      flags = o.flags;
+      layerCount = o.layerCount;
+      viewMask = o.viewMask;
+      color = o.color;
+      depth = o.depth;
+      stencil = o.stencil;
+
+      fragmentDensityView = o.fragmentDensityView;
+      fragmentDensityLayout = o.fragmentDensityLayout;
+
+      shadingRateView = o.shadingRateView;
+      shadingRateLayout = o.shadingRateLayout;
+      shadingRateTexelSize = o.shadingRateTexelSize;
+
+      tileOnlyMSAAEnable = o.tileOnlyMSAAEnable;
+      tileOnlyMSAASampleCount = o.tileOnlyMSAASampleCount;
+
+      localRead = o.localRead;
+
+      // this will deep copy from the incoming object
+      CopyAttachmentNexts();
+
+      return *this;
+    }
+
+    DynamicRendering(const DynamicRendering &o) { *this = o; }
+
+    void CopyAttachmentNexts();
+
     bool active = false;
     bool suspended = false;
     VkRenderingFlags flags = 0;
@@ -299,6 +370,12 @@ struct VulkanRenderState
 
     // VK_KHR_dynamic_rendering_local_read
     DynamicRenderingLocalRead localRead;
+
+  private:
+    // VK_KHR_unified_image_layouts
+    rdcarray<VkAttachmentFeedbackLoopInfoEXT> feedbacks;
+
+    void CopyAttachmentNext(VkRenderingAttachmentInfo &info);
   } dynamicRendering;
 
   // fdm offset

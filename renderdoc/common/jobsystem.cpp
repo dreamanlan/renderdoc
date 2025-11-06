@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include <math.h>
+#include "formatting.h"
 #include "threading.h"
 
 namespace Threading
@@ -215,6 +216,7 @@ bool RunJobIfReady(Threading::JobSystem::Job *curJob)
 
 void WorkerThread(JobWorker &worker)
 {
+  Threading::SetCurrentThreadName(StringFormat::Fmt("JobWorker %02u", (uint32_t)worker.idx));
   // outer loop until shutdown
   while(true)
   {
@@ -442,6 +444,11 @@ Job *AddJob(std::function<void()> &&callback, const rdcarray<Job *> &parents)
   TryWakeFirstSleepingWorker();
 
   return ret;
+}
+
+uint32_t GetCountWorkers()
+{
+  return (uint32_t)workers.size();
 }
 
 };    // namespace JobSystem

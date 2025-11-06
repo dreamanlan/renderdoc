@@ -106,8 +106,11 @@ D3D12PipelineStateViewer::D3D12PipelineStateViewer(ICaptureContext &ctx,
   const QIcon &action_hover = Icons::action_hover();
 
   RDLabel *shaderLabels[] = {
-      ui->vsShader, ui->hsShader, ui->dsShader, ui->gsShader,
-      ui->psShader, ui->csShader, ui->asShader, ui->msShader,
+      ui->vsPipeline, ui->hsPipeline, ui->dsPipeline, ui->gsPipeline,
+      ui->psPipeline, ui->csPipeline, ui->asPipeline, ui->msPipeline,
+
+      ui->vsShader,   ui->hsShader,   ui->dsShader,   ui->gsShader,
+      ui->psShader,   ui->csShader,   ui->asShader,   ui->msShader,
   };
 
   RDLabel *rootsigLabels[] = {
@@ -158,21 +161,28 @@ D3D12PipelineStateViewer::D3D12PipelineStateViewer(ICaptureContext &ctx,
       ui->psCBuffers, ui->csCBuffers, ui->asCBuffers, ui->msCBuffers,
   };
 
-  // setup FlowLayout for CS shader group, with debugging controls
-  {
-    QLayout *oldLayout = ui->csShaderGroup->layout();
+  // setup FlowLayout for shader groups
+  QWidget *shaderGroups[] = {
+      ui->vsShaderGroup, ui->hsShaderGroup, ui->dsShaderGroup, ui->gsShaderGroup,
+      ui->psShaderGroup, ui->csShaderGroup, ui->asShaderGroup, ui->msShaderGroup,
+  };
 
-    QObjectList childs = ui->csShaderGroup->children();
+  // setup FlowLayout for shader groups
+  for(QWidget *shaderGroup : shaderGroups)
+  {
+    QLayout *oldLayout = shaderGroup->layout();
+
+    QObjectList childs = shaderGroup->children();
     childs.removeOne((QObject *)oldLayout);
 
     delete oldLayout;
 
-    FlowLayout *csShaderFlow = new FlowLayout(ui->csShaderGroup, -1, 3, 3);
+    FlowLayout *shaderFlow = new FlowLayout(shaderGroup, -1, 3, 3);
 
     for(QObject *o : childs)
-      csShaderFlow->addWidget(qobject_cast<QWidget *>(o));
+      shaderFlow->addWidget(qobject_cast<QWidget *>(o));
 
-    ui->csShaderGroup->setLayout(csShaderFlow);
+    shaderGroup->setLayout(shaderFlow);
   }
 
   for(QToolButton *b : viewButtons)
@@ -528,15 +538,14 @@ void D3D12PipelineStateViewer::OnEventChanged(uint32_t eventId)
 
       // if the last range is contiguous with this access, append this access as a new range to query
       if(!ranges.empty() && ranges.back().descriptorSize == acc.byteSize &&
-         ranges.back().offset + ranges.back().descriptorSize == acc.byteOffset)
+         ranges.back().offset + ranges.back().descriptorSize == acc.byteOffset &&
+         ranges.back().type == acc.type)
       {
         ranges.back().count++;
         continue;
       }
 
-      DescriptorRange range;
-      range.offset = acc.byteOffset;
-      range.descriptorSize = acc.byteSize;
+      DescriptorRange range = acc;
       ranges.push_back(range);
     }
 
@@ -1031,12 +1040,13 @@ void D3D12PipelineStateViewer::setNewMeshPipeFlow()
   ui->pipeFlow->setIsolatedStage(5);    // compute shader isolated
 }
 
-void D3D12PipelineStateViewer::clearShaderState(RDLabel *shader, RDLabel *rootSig,
+void D3D12PipelineStateViewer::clearShaderState(RDLabel *pipeline, RDLabel *shader, RDLabel *rootSig,
                                                 RDTreeWidget *tex, RDTreeWidget *samp,
                                                 RDTreeWidget *cbuffer, RDTreeWidget *sub)
 {
   rootSig->setText(ToQStr(ResourceId()));
-  shader->setText(ToQStr(ResourceId()));
+  pipeline->setText(ToQStr(ResourceId()));
+  shader->hide();
   tex->clear();
   samp->clear();
   sub->clear();
@@ -1054,22 +1064,22 @@ void D3D12PipelineStateViewer::clearState()
   ui->primRestart->setVisible(false);
   ui->topologyDiagram->setPixmap(QPixmap());
 
-  clearShaderState(ui->asShader, ui->asRootSig, ui->asResources, ui->asSamplers, ui->asCBuffers,
-                   ui->asUAVs);
-  clearShaderState(ui->msShader, ui->msRootSig, ui->msResources, ui->msSamplers, ui->msCBuffers,
-                   ui->msUAVs);
-  clearShaderState(ui->vsShader, ui->vsRootSig, ui->vsResources, ui->vsSamplers, ui->vsCBuffers,
-                   ui->vsUAVs);
-  clearShaderState(ui->gsShader, ui->gsRootSig, ui->gsResources, ui->gsSamplers, ui->gsCBuffers,
-                   ui->gsUAVs);
-  clearShaderState(ui->hsShader, ui->hsRootSig, ui->hsResources, ui->hsSamplers, ui->hsCBuffers,
-                   ui->hsUAVs);
-  clearShaderState(ui->dsShader, ui->dsRootSig, ui->dsResources, ui->dsSamplers, ui->dsCBuffers,
-                   ui->dsUAVs);
-  clearShaderState(ui->psShader, ui->psRootSig, ui->psResources, ui->psSamplers, ui->psCBuffers,
-                   ui->psUAVs);
-  clearShaderState(ui->csShader, ui->csRootSig, ui->csResources, ui->csSamplers, ui->csCBuffers,
-                   ui->csUAVs);
+  clearShaderState(ui->asPipeline, ui->asShader, ui->asRootSig, ui->asResources, ui->asSamplers,
+                   ui->asCBuffers, ui->asUAVs);
+  clearShaderState(ui->msPipeline, ui->msShader, ui->msRootSig, ui->msResources, ui->msSamplers,
+                   ui->msCBuffers, ui->msUAVs);
+  clearShaderState(ui->vsPipeline, ui->vsShader, ui->vsRootSig, ui->vsResources, ui->vsSamplers,
+                   ui->vsCBuffers, ui->vsUAVs);
+  clearShaderState(ui->gsPipeline, ui->gsShader, ui->gsRootSig, ui->gsResources, ui->gsSamplers,
+                   ui->gsCBuffers, ui->gsUAVs);
+  clearShaderState(ui->hsPipeline, ui->hsShader, ui->hsRootSig, ui->hsResources, ui->hsSamplers,
+                   ui->hsCBuffers, ui->hsUAVs);
+  clearShaderState(ui->dsPipeline, ui->dsShader, ui->dsRootSig, ui->dsResources, ui->dsSamplers,
+                   ui->dsCBuffers, ui->dsUAVs);
+  clearShaderState(ui->psPipeline, ui->psShader, ui->psRootSig, ui->psResources, ui->psSamplers,
+                   ui->psCBuffers, ui->psUAVs);
+  clearShaderState(ui->csPipeline, ui->csShader, ui->csRootSig, ui->csResources, ui->csSamplers,
+                   ui->csCBuffers, ui->csUAVs);
 
   ui->gsStreamOut->clear();
 
@@ -1158,10 +1168,10 @@ void D3D12PipelineStateViewer::clearState()
   ui->computeDebugSelector->setEnabled(false);
 }
 
-void D3D12PipelineStateViewer::setShaderState(const D3D12Pipe::Shader &stage, RDLabel *shader,
-                                              RDLabel *rootSig)
+void D3D12PipelineStateViewer::setShaderState(const D3D12Pipe::Shader &stage, RDLabel *pipeline,
+                                              RDLabel *shader, RDLabel *rootSig)
 {
-  ShaderReflection *shaderDetails = stage.reflection;
+  const ShaderReflection *shaderDetails = stage.reflection;
   const D3D12Pipe::State &state = *m_Ctx.CurD3D12PipelineState();
 
   rootSig->setText(ToQStr(state.rootSignature.resourceId));
@@ -1172,17 +1182,27 @@ void D3D12PipelineStateViewer::setShaderState(const D3D12Pipe::Shader &stage, RD
     shText = tr("%1 - %2 Shader")
                  .arg(ToQStr(state.pipelineResourceId))
                  .arg(ToQStr(stage.stage, GraphicsAPI::D3D12));
+  pipeline->setText(shText);
 
   if(shaderDetails && !shaderDetails->debugInfo.files.empty())
   {
     const ShaderDebugInfo &dbg = shaderDetails->debugInfo;
     int entryFile = qMax(0, dbg.entryLocation.fileIndex);
 
-    shText += QFormatStr(": %1() - %2")
-                  .arg(shaderDetails->debugInfo.entrySourceName)
-                  .arg(QFileInfo(dbg.files[entryFile].filename).fileName());
+    QString entryName = dbg.entrySourceName;
+    TruncateStringFromEnd(entryName);
+
+    QString filename = QFileInfo(dbg.files[entryFile].filename).fileName();
+    TruncateStringFromEnd(filename);
+
+    shText = QFormatStr("%1() - %2").arg(entryName).arg(filename);
+    shader->show();
+    shader->setText(shText);
   }
-  shader->setText(shText);
+  else
+  {
+    shader->hide();
+  }
 }
 
 void D3D12PipelineStateViewer::setState()
@@ -1265,8 +1285,8 @@ void D3D12PipelineStateViewer::setState()
 
   if(m_MeshPipe)
   {
-    setShaderState(state.ampShader, ui->asShader, ui->asRootSig);
-    setShaderState(state.meshShader, ui->msShader, ui->msRootSig);
+    setShaderState(state.ampShader, ui->asPipeline, ui->asShader, ui->asRootSig);
+    setShaderState(state.meshShader, ui->msPipeline, ui->msShader, ui->msRootSig);
 
     if(state.meshShader.reflection)
       ui->msTopology->setText(ToQStr(state.meshShader.reflection->outputTopology));
@@ -1558,14 +1578,14 @@ void D3D12PipelineStateViewer::setState()
     ui->iaBuffers->endUpdate();
     ui->iaBuffers->verticalScrollBar()->setValue(vs);
 
-    setShaderState(state.vertexShader, ui->vsShader, ui->vsRootSig);
-    setShaderState(state.geometryShader, ui->gsShader, ui->gsRootSig);
-    setShaderState(state.hullShader, ui->hsShader, ui->hsRootSig);
-    setShaderState(state.domainShader, ui->dsShader, ui->dsRootSig);
+    setShaderState(state.vertexShader, ui->vsPipeline, ui->vsShader, ui->vsRootSig);
+    setShaderState(state.geometryShader, ui->gsPipeline, ui->gsShader, ui->gsRootSig);
+    setShaderState(state.hullShader, ui->hsPipeline, ui->hsShader, ui->hsRootSig);
+    setShaderState(state.domainShader, ui->dsPipeline, ui->dsShader, ui->dsRootSig);
   }
 
-  setShaderState(state.pixelShader, ui->psShader, ui->psRootSig);
-  setShaderState(state.computeShader, ui->csShader, ui->csRootSig);
+  setShaderState(state.pixelShader, ui->psPipeline, ui->psShader, ui->psRootSig);
+  setShaderState(state.computeShader, ui->csPipeline, ui->csShader, ui->csRootSig);
 
   // fill in descriptor access
   {
@@ -2144,8 +2164,17 @@ void D3D12PipelineStateViewer::setState()
   {
     ui->depthEnabled->setPixmap(tick);
     ui->depthFunc->setText(ToQStr(state.outputMerger.depthStencilState.depthFunction));
-    ui->depthWrite->setPixmap(state.outputMerger.depthStencilState.depthWrites ? tick : cross);
-    ui->depthWrite->setText(QString());
+
+    if(state.outputMerger.depthReadOnly)
+    {
+      ui->depthWrite->setPixmap(QPixmap());
+      ui->depthWrite->setText(tr("Read-Only DSV"));
+    }
+    else
+    {
+      ui->depthWrite->setPixmap(state.outputMerger.depthStencilState.depthWrites ? tick : cross);
+      ui->depthWrite->setText(QString());
+    }
   }
   else
   {
@@ -2183,8 +2212,16 @@ void D3D12PipelineStateViewer::setState()
         QVariant(),
     }));
 
-    m_Common.SetStencilTreeItemValue(ui->stencils->topLevelItem(0), 5,
-                                     state.outputMerger.depthStencilState.frontFace.writeMask);
+    if(state.outputMerger.stencilReadOnly)
+    {
+      ui->stencils->topLevelItem(0)->setText(5, tr("Read-Only DSV"));
+      ui->stencils->topLevelItem(0)->setToolTip(QString());
+    }
+    else
+    {
+      m_Common.SetStencilTreeItemValue(ui->stencils->topLevelItem(0), 5,
+                                       state.outputMerger.depthStencilState.frontFace.writeMask);
+    }
     m_Common.SetStencilTreeItemValue(ui->stencils->topLevelItem(0), 6,
                                      state.outputMerger.depthStencilState.frontFace.compareMask);
     m_Common.SetStencilTreeItemValue(ui->stencils->topLevelItem(0), 7,
@@ -2606,7 +2643,7 @@ void D3D12PipelineStateViewer::shaderSave_clicked()
   if(stage == NULL)
     return;
 
-  ShaderReflection *shaderDetails = stage->reflection;
+  const ShaderReflection *shaderDetails = stage->reflection;
 
   if(stage->resourceId == ResourceId())
     return;
@@ -2845,7 +2882,7 @@ void D3D12PipelineStateViewer::exportHTML(QXmlStreamWriter &xml, const D3D12Pipe
 
 void D3D12PipelineStateViewer::exportHTML(QXmlStreamWriter &xml, const D3D12Pipe::Shader &sh)
 {
-  ShaderReflection *shaderDetails = sh.reflection;
+  const ShaderReflection *shaderDetails = sh.reflection;
 
   {
     xml.writeStartElement(lit("h3"));

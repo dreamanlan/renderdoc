@@ -103,6 +103,63 @@ void VkInitParams::Set(const VkInstanceCreateInfo *pCreateInfo, ResourceId inst)
   InstanceID = inst;
 }
 
+bool DescriptorTrieNode::operator==(const DescriptorTrieNode &o) const
+{
+  // allow samplers to alias as drivers may deduplicate these. We will still verify the match by
+  // checking that the descriptor bytes for the resulting sampler comes out the same.
+  if(type == DescriptorSlotType::Sampler && o.type == DescriptorSlotType::Sampler)
+    return true;
+
+  // allow a NULL descriptor of different types to alias
+  if(resource == ResourceId() && sampler == ResourceId() && o.resource == ResourceId() &&
+     sampler == ResourceId())
+    return true;
+
+  // allow a NULL combined image/sampler to alias with a sampler
+  if((type == DescriptorSlotType::Sampler && o.type == DescriptorSlotType::SampledImage) ||
+     (type == DescriptorSlotType::SampledImage && o.type == DescriptorSlotType::Sampler))
+  {
+    if(resource == ResourceId() && o.resource == ResourceId())
+      return true;
+  }
+
+  if(resource != o.resource || sampler != o.sampler || offset != o.offset)
+    return false;
+
+  // deliberately allow imageLayout differences to be considered equal still - some drivers are
+  // likely to ignore imageLayout for the descriptor bytes even if the feature is not enabled
+
+  if((range & rangeToleranceMask) != (o.range & rangeToleranceMask))
+    return false;
+
+  if(type == o.type)
+    return true;
+
+  // allow similar types alias based on usage if they're otherwise identical since not all descriptors
+  // vary this way and the type is provided on lookup so this won't cause any problems in practice
+  DescriptorSlotType aType = RDCMIN(type, o.type);
+  DescriptorSlotType bType = RDCMAX(type, o.type);
+
+  if(aType == DescriptorSlotType::SampledImage && bType == DescriptorSlotType::StorageImage)
+    return true;
+  if(aType == DescriptorSlotType::SampledImage && bType == DescriptorSlotType::InputAttachment)
+    return true;
+  if(aType == DescriptorSlotType::StorageImage && bType == DescriptorSlotType::InputAttachment)
+    return true;
+
+  if(aType == DescriptorSlotType::UniformBuffer && bType == DescriptorSlotType::StorageBuffer)
+    return true;
+  if(aType == DescriptorSlotType::UniformTexelBuffer &&
+     bType == DescriptorSlotType::StorageTexelBuffer)
+    return true;
+
+  // could maybe allow all buffer types to alias but we'll stick to this for now
+
+  return false;
+}
+
+uint64_t DescriptorTrieNode::rangeToleranceMask = ~0ULL;
+
 WrappedVulkan::WrappedVulkan()
 {
   RenderDoc::Inst().RegisterMemoryRegion(this, sizeof(WrappedVulkan));
@@ -171,8 +228,6 @@ WrappedVulkan::WrappedVulkan()
     m_FrameCaptureRecord = NULL;
 
     ResourceIDGen::SetReplayResourceIDs();
-
-    m_CreationInfo.pushConstantDescriptorStorage = ResourceIDGen::GetNewUniqueID();
   }
 }
 
@@ -1067,6 +1122,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_DEPTH_RANGE_UNRESTRICTED_SPEC_VERSION,
     },
     {
+        VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
+        VK_EXT_DESCRIPTOR_BUFFER_SPEC_VERSION,
+    },
+    {
         VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
         VK_EXT_DESCRIPTOR_INDEXING_SPEC_VERSION,
     },
@@ -1085,6 +1144,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_EXT_DISPLAY_SURFACE_COUNTER_EXTENSION_NAME,
         VK_EXT_DISPLAY_SURFACE_COUNTER_SPEC_VERSION,
+    },
+    {
+        VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME,
+        VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_SPEC_VERSION,
     },
     {
         VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
@@ -1115,6 +1178,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_FRAGMENT_DENSITY_MAP_2_SPEC_VERSION,
     },
     {
+        VK_EXT_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME,
+        VK_EXT_FRAGMENT_DENSITY_MAP_OFFSET_SPEC_VERSION,
+    },
+    {
         VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME,
         VK_EXT_FRAGMENT_SHADER_INTERLOCK_SPEC_VERSION,
     },
@@ -1143,6 +1210,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME,
         VK_EXT_HEADLESS_SURFACE_SPEC_VERSION,
+    },
+    {
+        VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,
+        VK_EXT_HOST_IMAGE_COPY_SPEC_VERSION,
     },
     {
         VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME,
@@ -1235,8 +1306,20 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_PIPELINE_CREATION_FEEDBACK_SPEC_VERSION,
     },
     {
+        VK_EXT_PIPELINE_PROTECTED_ACCESS_EXTENSION_NAME,
+        VK_EXT_PIPELINE_PROTECTED_ACCESS_SPEC_VERSION,
+    },
+    {
+        VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
+        VK_EXT_PIPELINE_ROBUSTNESS_SPEC_VERSION,
+    },
+    {
         VK_EXT_POST_DEPTH_COVERAGE_EXTENSION_NAME,
         VK_EXT_POST_DEPTH_COVERAGE_SPEC_VERSION,
+    },
+    {
+        VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME,
+        VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_SPEC_VERSION,
     },
     {
         VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME,
@@ -1369,6 +1452,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,
         VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_SPEC_VERSION,
+    },
+    {
+        VK_EXT_VERTEX_ATTRIBUTE_ROBUSTNESS_EXTENSION_NAME,
+        VK_EXT_VERTEX_ATTRIBUTE_ROBUSTNESS_SPEC_VERSION,
     },
     {
         VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME,
@@ -1639,6 +1726,26 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_KHR_MAINTENANCE_5_SPEC_VERSION,
     },
     {
+        VK_KHR_MAINTENANCE_6_EXTENSION_NAME,
+        VK_KHR_MAINTENANCE_6_SPEC_VERSION,
+    },
+    {
+        VK_KHR_MAINTENANCE_7_EXTENSION_NAME,
+        VK_KHR_MAINTENANCE_7_SPEC_VERSION,
+    },
+    {
+        VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+        VK_KHR_MAINTENANCE_8_SPEC_VERSION,
+    },
+    {
+        VK_KHR_MAINTENANCE_9_EXTENSION_NAME,
+        VK_KHR_MAINTENANCE_9_SPEC_VERSION,
+    },
+    {
+        VK_KHR_MAP_MEMORY_2_EXTENSION_NAME,
+        VK_KHR_MAP_MEMORY_2_SPEC_VERSION,
+    },
+    {
         VK_KHR_MULTIVIEW_EXTENSION_NAME,
         VK_KHR_MULTIVIEW_SPEC_VERSION,
     },
@@ -1659,8 +1766,20 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_KHR_PRESENT_ID_SPEC_VERSION,
     },
     {
+        VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+        VK_KHR_PRESENT_ID_2_SPEC_VERSION,
+    },
+    {
+        VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME,
+        VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_SPEC_VERSION,
+    },
+    {
         VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
         VK_KHR_PRESENT_WAIT_SPEC_VERSION,
+    },
+    {
+        VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME,
+        VK_KHR_PRESENT_WAIT_2_SPEC_VERSION,
     },
     {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -1687,6 +1806,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_KHR_RELAXED_BLOCK_LAYOUT_SPEC_VERSION,
     },
     {
+        VK_KHR_ROBUSTNESS_2_EXTENSION_NAME,
+        VK_KHR_ROBUSTNESS_2_SPEC_VERSION,
+    },
+    {
         VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME,
         VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_SPEC_VERSION,
     },
@@ -1701,6 +1824,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME,
         VK_KHR_SHADER_ATOMIC_INT64_SPEC_VERSION,
+    },
+    {
+        VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME,
+        VK_KHR_SHADER_BFLOAT16_SPEC_VERSION,
     },
     {
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
@@ -1779,12 +1906,20 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_KHR_SURFACE_SPEC_VERSION,
     },
     {
+        VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
+        VK_KHR_SURFACE_MAINTENANCE_1_SPEC_VERSION,
+    },
+    {
         VK_KHR_SURFACE_PROTECTED_CAPABILITIES_EXTENSION_NAME,
         VK_KHR_SURFACE_PROTECTED_CAPABILITIES_SPEC_VERSION,
     },
     {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         VK_KHR_SWAPCHAIN_SPEC_VERSION,
+    },
+    {
+        VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
+        VK_KHR_SWAPCHAIN_MAINTENANCE_1_SPEC_VERSION,
     },
     {
         VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME,
@@ -1797,6 +1932,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_SPEC_VERSION,
+    },
+    {
+        VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME,
+        VK_KHR_UNIFIED_IMAGE_LAYOUTS_SPEC_VERSION,
     },
     {
         VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME,
@@ -1923,6 +2062,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_QCOM_RENDER_PASS_STORE_OPS_SPEC_VERSION,
     },
     {
+        VK_VALVE_FRAGMENT_DENSITY_MAP_LAYERED_EXTENSION_NAME,
+        VK_VALVE_FRAGMENT_DENSITY_MAP_LAYERED_SPEC_VERSION,
+    },
+    {
         VK_VALVE_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME,
         VK_VALVE_MUTABLE_DESCRIPTOR_TYPE_SPEC_VERSION,
     },
@@ -2023,7 +2166,11 @@ VkResult WrappedVulkan::FilterDeviceExtensionProperties(VkPhysicalDevice physDev
 
     // extensions with conditional support
     filtered.removeIf([instDevInfo, physDev](const VkExtensionProperties &ext) {
-      if(!strcmp(ext.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME))
+      // Anything that depends on VK_EXT_fragment_density_map will need disabling if the
+      // fragmentDensityMapNonSubsampledImages feature is not supported
+      if(!strcmp(ext.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME) ||
+         !strcmp(ext.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_2_EXTENSION_NAME) ||
+         !strcmp(ext.extensionName, VK_QCOM_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME))
       {
         // require GPDP2
         if(instDevInfo->ext_KHR_get_physical_device_properties2)
@@ -2043,8 +2190,8 @@ VkResult WrappedVulkan::FilterDeviceExtensionProperties(VkPhysicalDevice physDev
           {
             RDCWARN(
                 "VkPhysicalDeviceFragmentDensityMapFeaturesEXT."
-                "fragmentDensityMapNonSubsampledImages is "
-                "false, can't support capture of VK_EXT_fragment_density_map");
+                "fragmentDensityMapNonSubsampledImages is false, can't support capture of %s",
+                ext.extensionName);
           }
         }
 
@@ -2074,6 +2221,166 @@ VkResult WrappedVulkan::FilterDeviceExtensionProperties(VkPhysicalDevice physDev
                 "VkPhysicalDeviceBufferDeviceAddressFeaturesEXT.bufferDeviceAddressCaptureReplay "
                 "is false, can't support capture of VK_EXT_buffer_device_address");
           }
+        }
+
+        // if it wasn't supported, remove the extension
+        return true;
+      }
+
+      if(!strcmp(ext.extensionName, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME))
+      {
+        // require GPDP2
+        if(instDevInfo->ext_KHR_get_physical_device_properties2)
+        {
+          VkPhysicalDeviceDescriptorBufferFeaturesEXT descFeats = {
+              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+          VkPhysicalDeviceFeatures2 baseFeats = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+          baseFeats.pNext = &descFeats;
+          ObjDisp(physDev)->GetPhysicalDeviceFeatures2(Unwrap(physDev), &baseFeats);
+
+          if(!descFeats.descriptorBufferCaptureReplay)
+          {
+            if(!filterWarned)
+            {
+              RDCWARN(
+                  "VkPhysicalDeviceDescriptorBufferFeaturesEXT.descriptorBufferCaptureReplay "
+                  "is false, can't support capture of VK_EXT_descriptor_buffer");
+            }
+            return true;
+          }
+
+          VkPhysicalDeviceDescriptorBufferPropertiesEXT descProps = {
+              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT};
+          VkPhysicalDeviceProperties2 baseProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+          baseProps.pNext = &descProps;
+          ObjDisp(physDev)->GetPhysicalDeviceProperties2(Unwrap(physDev), &baseProps);
+
+#define CHECK_PROP_SIZE(prop, max)                                                                 \
+  if(descProps.prop > max)                                                                         \
+  {                                                                                                \
+    if(!filterWarned)                                                                              \
+    {                                                                                              \
+      RDCWARN(                                                                                     \
+          "VkPhysicalDeviceDescriptorBufferPropertiesEXT." #prop                                   \
+          "is too large at %u (must be <= %u), can't support capture of VK_EXT_descriptor_buffer", \
+          descProps.prop, max);                                                                    \
+    }                                                                                              \
+    return true;                                                                                   \
+  }
+
+          CHECK_PROP_SIZE(bufferCaptureReplayDescriptorDataSize, FixedOpaqueDescriptorCaptureSize);
+          CHECK_PROP_SIZE(imageCaptureReplayDescriptorDataSize, FixedOpaqueDescriptorCaptureSize);
+          CHECK_PROP_SIZE(imageViewCaptureReplayDescriptorDataSize, FixedOpaqueDescriptorCaptureSize);
+          CHECK_PROP_SIZE(samplerCaptureReplayDescriptorDataSize, FixedOpaqueDescriptorCaptureSize);
+          CHECK_PROP_SIZE(accelerationStructureCaptureReplayDescriptorDataSize,
+                          FixedOpaqueDescriptorCaptureSize);
+
+          CHECK_PROP_SIZE(samplerDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(combinedImageSamplerDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(sampledImageDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(storageImageDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(uniformTexelBufferDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(robustUniformTexelBufferDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(storageTexelBufferDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(robustStorageTexelBufferDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(uniformBufferDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(robustUniformBufferDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(storageBufferDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(robustStorageBufferDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(inputAttachmentDescriptorSize, MaxDescriptorSize);
+          CHECK_PROP_SIZE(accelerationStructureDescriptorSize, MaxDescriptorSize);
+
+          // we don't expect any world where descriptor buffer is available but descriptor
+          // indexing doesn't support robust update after bind, but require it anyway as we
+          // force robustness on
+          VkPhysicalDeviceDescriptorIndexingProperties descIndexingProps = {
+              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES,
+          };
+          baseProps.pNext = &descIndexingProps;
+          ObjDisp(physDev)->GetPhysicalDeviceProperties2(Unwrap(physDev), &baseProps);
+
+          if(!descIndexingProps.robustBufferAccessUpdateAfterBind)
+          {
+            if(!filterWarned)
+            {
+              RDCWARN(
+                  "VkPhysicalDeviceDescriptorIndexingProperties.robustBufferAccessUpdateAfterBind "
+                  "is false, can't support capture of VK_EXT_descriptor_buffer");
+            }
+            return true;
+          }
+
+          // calculate the maximum descriptor size according to the spec
+          size_t maxResourceDescriptorSize = 0;
+#define CALC_MAX_SIZE(prop) \
+  maxResourceDescriptorSize = RDCMAX(maxResourceDescriptorSize, descProps.prop);
+
+          CALC_MAX_SIZE(storageImageDescriptorSize);
+          CALC_MAX_SIZE(sampledImageDescriptorSize);
+          CALC_MAX_SIZE(robustUniformTexelBufferDescriptorSize);
+          CALC_MAX_SIZE(robustStorageTexelBufferDescriptorSize);
+          CALC_MAX_SIZE(robustUniformBufferDescriptorSize);
+          CALC_MAX_SIZE(robustStorageBufferDescriptorSize);
+          CALC_MAX_SIZE(inputAttachmentDescriptorSize);
+          CALC_MAX_SIZE(accelerationStructureDescriptorSize);
+
+          // guess worst-case size of a descriptor set with 2 descriptors
+          VkDeviceSize reservedDescriptorSize = AlignUp(VkDeviceSize(maxResourceDescriptorSize * 2),
+                                                        descProps.descriptorBufferOffsetAlignment);
+
+          // finally we need to ensure we have enough room to hopefully expand every resource
+          // descriptor buffer a bit without blowing up available address space. we assume that
+          // making room for a certain number of buffers is more than enough - anyone making more
+          // than that is hopefully making buffers that are a much smaller fraction of the address space
+
+          // if the range is so small that we can't shrink the limit to give ourselves room and
+          // remain legal, that's a problem. We need to be able to expand each buffer by a bit
+          if(descProps.maxResourceDescriptorBufferRange - reservedDescriptorSize <
+             ((1 << 20) - (1 << 15)) * maxResourceDescriptorSize)
+          {
+            if(!filterWarned)
+            {
+              RDCWARN(
+                  "VkPhysicalDeviceDescriptorIndexingProperties buffer range of %llx is too "
+                  "small for maxResourceDescriptorSize %zu, can't support capture of "
+                  "VK_EXT_descriptor_buffer",
+                  descProps.maxResourceDescriptorBufferRange, maxResourceDescriptorSize);
+            }
+            return true;
+          }
+
+          const VkDeviceSize addrSpaceSize =
+              RDCMIN(descProps.descriptorBufferAddressSpaceSize,
+                     descProps.resourceDescriptorBufferAddressSpaceSize);
+
+          // an example set of close-to-problem limits here would be: 128MB (0x8000000) addr space
+          // with 64MB resource buffer range (0x4000000)
+
+          // the spec requires that the resource buffer range must be at least enough for ~1
+          // million (2^20-2^15 = 1015808) descriptors so as long as that's still satisfied if we
+          // reduce the max range by a bit, we're fine. In practice most implementations have
+          // plenty of address space and those that are more constrained have a max range that's
+          // power-of-two rather than the minimum ~1 million so we have plenty scope to remove.
+
+          // if the address space can't be shrunk by enough for 100 buffers to each have a couple
+          // of descriptors that's also a problem - this is a heuristic, and it could break if the
+          // user perfectly subdivided a shrunken address space into 101 buffers as then our
+          // expansion would cause things to explode. We don't expect that to be a problem though.
+          if(addrSpaceSize - ExpectedMaxNumDescriptorBuffers * reservedDescriptorSize < (1 << 27))
+          {
+            if(!filterWarned)
+            {
+              RDCWARN(
+                  "VkPhysicalDeviceDescriptorIndexingProperties resource address space size of "
+                  "%llx is too small for maxResourceDescriptorSize %zu, can't support capture of "
+                  "VK_EXT_descriptor_buffer",
+                  addrSpaceSize, maxResourceDescriptorSize);
+            }
+            return true;
+          }
+
+          // supported and all descriptor sizes are sensible
+          return false;
         }
 
         // if it wasn't supported, remove the extension
@@ -2409,13 +2716,13 @@ void WrappedVulkan::StartFrameCapture(DeviceOwnedWindow devWnd)
   // way of knowing how it's used
   for(auto it = forced.begin(); it != forced.end(); ++it)
   {
-    // reference the buffer
+    // reference the buffer/image
     GetResourceManager()->MarkResourceFrameReferenced((*it)->GetResourceID(), eFrameRef_Read);
     // and its backing memory
     GetResourceManager()->MarkMemoryFrameReferenced((*it)->baseResourceMem, (*it)->memOffset,
                                                     (*it)->memSize, eFrameRef_ReadBeforeWrite);
     // and sparse memory (yuck yuck yuck)
-    if((*it)->resType == eResBuffer && (*it)->resInfo)
+    if(((*it)->resType == eResBuffer || (*it)->resType == eResImage) && (*it)->resInfo)
       GetResourceManager()->MarkSparseMapReferenced((*it)->resInfo);
   }
 }
@@ -2468,7 +2775,7 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
 
     const SwapchainInfo &swapInfo = *swaprecord->swapInfo;
 
-    backbuffer = swapInfo.images[swapInfo.lastPresent.imageIndex].im;
+    backbuffer = swapInfo.images[swapInfo.lastPresent.imageIndex].userSwapImage;
     swapImageInfo = &swapInfo.imageInfo;
     swapQueueIndex = GetRecord(swapInfo.lastPresent.presentQueue)->queueFamilyIndex;
     swapLayout =
@@ -2476,8 +2783,12 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
 
     // mark all images referenced as well
     for(size_t i = 0; i < swapInfo.images.size(); i++)
-      GetResourceManager()->MarkResourceFrameReferenced(GetResID(swapInfo.images[i].im),
+      GetResourceManager()->MarkResourceFrameReferenced(GetResID(swapInfo.images[i].userSwapImage),
                                                         eFrameRef_Read);
+
+    // we're using the fake image for descriptor buffers, which is in layout general not present
+    if(DescriptorBuffers())
+      swapLayout = VK_IMAGE_LAYOUT_GENERAL;
   }
   else
   {
@@ -2493,7 +2804,7 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
 
       const SwapchainInfo &swapInfo = *swaprecord->swapInfo;
 
-      backbuffer = swapInfo.images[swapInfo.lastPresent.imageIndex].im;
+      backbuffer = swapInfo.images[swapInfo.lastPresent.imageIndex].userSwapImage;
       swapImageInfo = &swapInfo.imageInfo;
       swapQueueIndex = GetRecord(swapInfo.lastPresent.presentQueue)->queueFamilyIndex;
       swapLayout =
@@ -2501,8 +2812,11 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
 
       // mark all images referenced as well
       for(size_t i = 0; i < swapInfo.images.size(); i++)
-        GetResourceManager()->MarkResourceFrameReferenced(GetResID(swapInfo.images[i].im),
-                                                          eFrameRef_Read);
+        GetResourceManager()->MarkResourceFrameReferenced(
+            GetResID(swapInfo.images[i].userSwapImage), eFrameRef_Read);
+
+      if(DescriptorBuffers())
+        swapLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
     else if(VRBackbufferRecord)
     {
@@ -2518,6 +2832,8 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
 
   rdcarray<VkDeviceMemory> DeadMemories;
   rdcarray<VkBuffer> DeadBuffers;
+  rdcarray<VkImage> DeadImages;
+  rdcarray<VkImageView> DeadImageViews;
 
   // transition back to IDLE atomically
   {
@@ -2544,14 +2860,10 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
       SCOPED_LOCK(m_DeviceAddressResourcesLock);
       DeadMemories.swap(m_DeviceAddressResources.DeadMemories);
       DeadBuffers.swap(m_DeviceAddressResources.DeadBuffers);
+      DeadImages.swap(m_DeviceAddressResources.DeadImages);
+      DeadImageViews.swap(m_DeviceAddressResources.DeadImageViews);
     }
   }
-
-  for(VkDeviceMemory m : DeadMemories)
-    vkFreeMemory(m_Device, m, NULL);
-
-  for(VkBuffer b : DeadBuffers)
-    vkDestroyBuffer(m_Device, b, NULL);
 
   // gather backbuffer screenshot
   const uint32_t maxSize = 2048;
@@ -2578,7 +2890,7 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
     VkBufferCreateInfo bufInfo = {
         VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         NULL,
-        0,
+        DefaultBufferCreateFlags(),
         GetByteSize(imageInfo.extent.width, imageInfo.extent.height, 1, imageInfo.format, 0),
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     };
@@ -2901,6 +3213,18 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
 
   GetResourceManager()->FreeInitialContents();
 
+  for(VkDeviceMemory m : DeadMemories)
+    vkFreeMemory(m_Device, m, NULL);
+
+  for(VkBuffer b : DeadBuffers)
+    vkDestroyBuffer(m_Device, b, NULL);
+
+  for(VkImage i : DeadImages)
+    vkDestroyImage(m_Device, i, NULL);
+
+  for(VkImageView v : DeadImageViews)
+    vkDestroyImageView(m_Device, v, NULL);
+
   FreeAllMemory(MemoryScope::InitialContents);
   for(rdcstr &fn : m_InitTempFiles)
     FileIO::Delete(fn);
@@ -2922,6 +3246,11 @@ bool WrappedVulkan::DiscardFrameCapture(DeviceOwnedWindow devWnd)
 
   m_CapturedFrames.pop_back();
 
+  rdcarray<VkDeviceMemory> DeadMemories;
+  rdcarray<VkBuffer> DeadBuffers;
+  rdcarray<VkImage> DeadImages;
+  rdcarray<VkImageView> DeadImageViews;
+
   // transition back to IDLE atomically
   {
     SCOPED_WRITELOCK(m_CapTransitionLock);
@@ -2941,7 +3270,27 @@ bool WrappedVulkan::DiscardFrameCapture(DeviceOwnedWindow devWnd)
         (*it)->memMapState->needRefData = false;
       }
     }
+
+    {
+      SCOPED_LOCK(m_DeviceAddressResourcesLock);
+      DeadMemories.swap(m_DeviceAddressResources.DeadMemories);
+      DeadBuffers.swap(m_DeviceAddressResources.DeadBuffers);
+      DeadImages.swap(m_DeviceAddressResources.DeadImages);
+      DeadImageViews.swap(m_DeviceAddressResources.DeadImageViews);
+    }
   }
+
+  for(VkDeviceMemory m : DeadMemories)
+    vkFreeMemory(m_Device, m, NULL);
+
+  for(VkBuffer b : DeadBuffers)
+    vkDestroyBuffer(m_Device, b, NULL);
+
+  for(VkImage i : DeadImages)
+    vkDestroyImage(m_Device, i, NULL);
+
+  for(VkImageView v : DeadImageViews)
+    vkDestroyImageView(m_Device, v, NULL);
 
   Atomic::Inc32(&m_ReuseEnabled);
 
@@ -3875,6 +4224,21 @@ bool WrappedVulkan::ContextProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
   return true;
 }
 
+void WrappedVulkan::CopyInternalDescriptor(VkCommandBuffer unwrappedCmdBuf, VkBuffer unwrappedSrc,
+                                           uint32_t size)
+{
+  VkBufferCopy bufCopy = {};
+  bufCopy.size = size;
+
+  for(ResourceId id : m_ResourceDescBuffers)
+  {
+    VkBuffer dst = Unwrap(GetResourceManager()->GetCurrentHandle<VkBuffer>(id));
+    bufCopy.dstOffset = m_CreationInfo.m_Buffer[id].size;
+
+    ObjDisp(m_Device)->CmdCopyBuffer(unwrappedCmdBuf, unwrappedSrc, dst, 1, &bufCopy);
+  }
+}
+
 bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
 {
   switch(chunk)
@@ -4104,13 +4468,13 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
       // Just in case it gets exported and imported, completely ignore it.
       return true;
 
-    case VulkanChunk::vkCmdPushDescriptorSetKHR:
-      return Serialise_vkCmdPushDescriptorSetKHR(
-          ser, VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_GRAPHICS, VK_NULL_HANDLE, 0, 0, NULL);
+    case VulkanChunk::vkCmdPushDescriptorSet:
+      return Serialise_vkCmdPushDescriptorSet(ser, VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                              VK_NULL_HANDLE, 0, 0, NULL);
 
-    case VulkanChunk::vkCmdPushDescriptorSetWithTemplateKHR:
-      return Serialise_vkCmdPushDescriptorSetWithTemplateKHR(ser, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                                                             VK_NULL_HANDLE, 0, NULL);
+    case VulkanChunk::vkCmdPushDescriptorSetWithTemplate:
+      return Serialise_vkCmdPushDescriptorSetWithTemplate(ser, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                                          VK_NULL_HANDLE, 0, NULL);
 
     case VulkanChunk::vkCreateDescriptorUpdateTemplate:
       return Serialise_vkCreateDescriptorUpdateTemplate(ser, VK_NULL_HANDLE, NULL, NULL, NULL);
@@ -4196,10 +4560,18 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
       rdcarray<MemRefInterval> data;
       return GetResourceManager()->Serialise_DeviceMemoryRefs(ser, data);
     }
+    case VulkanChunk::vkCopyImageToImage:
+      return Serialise_vkCopyImageToImage(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCopyImageToMemory:
+      return Serialise_vkCopyImageToMemory(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCopyMemoryToImage:
+      return Serialise_vkCopyMemoryToImage(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkTransitionImageLayout:
+      return Serialise_vkTransitionImageLayout(ser, VK_NULL_HANDLE, 0, NULL);
     case VulkanChunk::vkResetQueryPool:
       return Serialise_vkResetQueryPool(ser, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 0);
-    case VulkanChunk::vkCmdSetLineStippleKHR:
-      return Serialise_vkCmdSetLineStippleKHR(ser, VK_NULL_HANDLE, 0, 0);
+    case VulkanChunk::vkCmdSetLineStipple:
+      return Serialise_vkCmdSetLineStipple(ser, VK_NULL_HANDLE, 0, 0);
     case VulkanChunk::ImageRefs:
     {
       SCOPED_LOCK(m_ImageStatesLock);
@@ -4289,10 +4661,12 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
     case VulkanChunk::vkCmdBeginRendering:
       return Serialise_vkCmdBeginRendering(ser, VK_NULL_HANDLE, NULL);
     case VulkanChunk::vkCmdEndRendering: return Serialise_vkCmdEndRendering(ser, VK_NULL_HANDLE);
-    case VulkanChunk::vkCmdSetRenderingAttachmentLocationsKHR:
-      return Serialise_vkCmdSetRenderingAttachmentLocationsKHR(ser, VK_NULL_HANDLE, NULL);
-    case VulkanChunk::vkCmdSetRenderingInputAttachmentIndicesKHR:
-      return Serialise_vkCmdSetRenderingInputAttachmentIndicesKHR(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdEndRendering2EXT:
+      return Serialise_vkCmdEndRendering2EXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdSetRenderingAttachmentLocations:
+      return Serialise_vkCmdSetRenderingAttachmentLocations(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdSetRenderingInputAttachmentIndices:
+      return Serialise_vkCmdSetRenderingInputAttachmentIndices(ser, VK_NULL_HANDLE, NULL);
 
     case VulkanChunk::vkCmdSetFragmentShadingRateKHR:
       return Serialise_vkCmdSetFragmentShadingRateKHR(ser, VK_NULL_HANDLE, NULL, NULL);
@@ -4371,6 +4745,16 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
       return Serialise_vkCmdCopyMemoryToAccelerationStructureKHR(ser, VK_NULL_HANDLE, NULL);
     case VulkanChunk::vkCreateAccelerationStructureKHR:
       return Serialise_vkCreateAccelerationStructureKHR(ser, VK_NULL_HANDLE, NULL, NULL, NULL);
+    case VulkanChunk::vkGetDescriptorEXT:
+      return Serialise_vkGetDescriptorEXT(ser, VK_NULL_HANDLE, NULL, 0, NULL);
+    case VulkanChunk::vkCmdBindDescriptorBuffersEXT:
+      return Serialise_vkCmdBindDescriptorBuffersEXT(ser, VK_NULL_HANDLE, 0, NULL);
+    case VulkanChunk::vkCmdSetDescriptorBufferOffsetsEXT:
+      return Serialise_vkCmdSetDescriptorBufferOffsetsEXT(
+          ser, VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_MAX_ENUM, VK_NULL_HANDLE, 0, 0, NULL, NULL);
+    case VulkanChunk::vkCmdBindDescriptorBufferEmbeddedSamplersEXT:
+      return Serialise_vkCmdBindDescriptorBufferEmbeddedSamplersEXT(
+          ser, VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_MAX_ENUM, VK_NULL_HANDLE, 0);
 
     case VulkanChunk::vkCmdBindShadersEXT:
       return Serialise_vkCmdBindShadersEXT(ser, VK_NULL_HANDLE, 0, NULL, NULL);
@@ -4391,9 +4775,25 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
     case VulkanChunk::vkCmdWriteAccelerationStructuresPropertiesKHR:
       return Serialise_vkCmdWriteAccelerationStructuresPropertiesKHR(
           ser, VK_NULL_HANDLE, 0, NULL, VK_QUERY_TYPE_MAX_ENUM, VK_NULL_HANDLE, 0);
-    case VulkanChunk::vkCmdBindIndexBuffer2KHR:
-      return Serialise_vkCmdBindIndexBuffer2KHR(ser, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 0,
-                                                VK_INDEX_TYPE_MAX_ENUM);
+    case VulkanChunk::vkCmdBindIndexBuffer2:
+      return Serialise_vkCmdBindIndexBuffer2(ser, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 0,
+                                             VK_INDEX_TYPE_MAX_ENUM);
+
+    case VulkanChunk::vkUnmapMemory2:
+      return Serialise_vkUnmapMemory2(ser, VK_NULL_HANDLE, VK_NULL_HANDLE);
+
+    case VulkanChunk::vkCmdBindDescriptorSets2:
+      return Serialise_vkCmdBindDescriptorSets2(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdPushConstants2:
+      return Serialise_vkCmdPushConstants2(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdBindDescriptorBufferEmbeddedSamplers2EXT:
+      return Serialise_vkCmdBindDescriptorBufferEmbeddedSamplers2EXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdSetDescriptorBufferOffsets2EXT:
+      return Serialise_vkCmdSetDescriptorBufferOffsets2EXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdPushDescriptorSet2:
+      return Serialise_vkCmdPushDescriptorSet2(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdPushDescriptorSetWithTemplate2:
+      return Serialise_vkCmdPushDescriptorSetWithTemplate2(ser, VK_NULL_HANDLE, NULL);
 
     // chunks that are reserved but not yet serialised
     case VulkanChunk::vkResetCommandPool:
@@ -5094,6 +5494,10 @@ VkBool32 WrappedVulkan::DebugCallback(MessageSeverity severity, MessageCategory 
     if(strstr(pMessageId, "VUID-VkSwapchainCreateInfoKHR-imageExtent"))
       return false;
 
+    // dedicated allocation size must match, but we have no choice but to ignore this one
+    if(strstr(pMessageId, "VUID-VkMemoryDedicatedAllocateInfo-image-02964"))
+      return false;
+
     // "Missing extension required by the device extension VK_KHR_driver_properties:
     // VK_KHR_get_physical_device_properties2. The Vulkan spec states: All required extensions for
     // each extension in the VkDeviceCreateInfo::ppEnabledExtensionNames list must also be present
@@ -5273,6 +5677,12 @@ WrappedVulkan::CommandBufferNode *WrappedVulkan::GetCommandBufferPartialSubmissi
   }
 
   return NULL;
+}
+
+ResourceId WrappedVulkan::GetASFromAddr(VkDeviceAddress addr)
+{
+  SCOPED_LOCK(m_ASLookupByAddrLock);
+  return m_ASLookupByAddr[addr];
 }
 
 bool WrappedVulkan::IsPartialRenderPassActive()
@@ -5542,7 +5952,6 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
   ActionDescription &action = actionNode.action;
 
   const VulkanRenderState &state = m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
-  VulkanCreationInfo &c = m_CreationInfo;
   uint32_t eid = action.eventId;
 
   ActionFlags DrawMask = ActionFlags::MeshDispatch | ActionFlags::Drawcall | ActionFlags::Dispatch;
@@ -5579,28 +5988,226 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
   }
 
   //////////////////////////////
+  // Framebuffer/renderpass
+
+  bool compute = bool(action.flags & ActionFlags::Dispatch);
+
+  if(!compute)
+    AddFramebufferUsage(actionNode, state);
+
+  const VulkanStatePipeline &pipeState = (compute ? state.compute : state.graphics);
+
+  //////////////////////////////
   // Shaders
 
-  rdcarray<int> shaderStages;
+  if(pipeState.UsingDescBufs())
+  {
+    actionNode.deferredResourceUsage.push_back({});
+
+    VulkanActionTreeNode::DeferredResourceUsage &def = actionNode.deferredResourceUsage.back();
+
+    def.descBufVersionIdx = m_BakedCmdBufferInfo[m_LastCmdBufferID].descBufVersionIdx;
+    def.pipeline = pipeState.shaderObject ? ResourceId() : pipeState.pipeline;
+    if(pipeState.shaderObject)
+      memcpy(def.shaderObjects, state.shaderObjects, sizeof(state.shaderObjects));
+    def.descSets = pipeState.descSets;
+
+    bool usesPush = false;
+
+    // bake the recorded descriptor buffer offsets in so we don't have to track them separately
+    for(VulkanStatePipeline::DescriptorAndOffsets &desc : def.descSets)
+    {
+      if(desc.push)
+      {
+        usesPush = true;
+        continue;
+      }
+
+      // gaps in descriptor sets are possible
+      if(desc.descBufferIdx == ~0U)
+        continue;
+
+      desc.descBufferOffset +=
+          m_BakedCmdBufferInfo[m_LastCmdBufferID].descBufOffsets[desc.descBufferIdx];
+    }
+
+    if(!usesPush)
+      return;
+  }
+
+  AddUsageForDescriptorSets(actionNode, debugMessages);
+}
+
+static rdcarray<int> ShaderStagesForAction(ActionDescription &action)
+{
   if(action.flags & ActionFlags::Dispatch)
-  {
-    shaderStages = {5};
-  }
+    return {5};
   else if(action.flags & ActionFlags::Drawcall)
-  {
-    shaderStages = {0, 1, 2, 3, 4};
-  }
+    return {0, 1, 2, 3, 4};
   else if(action.flags & ActionFlags::MeshDispatch)
+    return {4, 6, 7};
+  return {};
+}
+
+void WrappedVulkan::AddUsageForDescriptorBuffers(VulkanActionTreeNode &actionNode,
+                                                 rdcarray<DebugMessage> &debugMessages,
+                                                 const VulkanActionTreeNode::DeferredResourceUsage &def)
+{
+  if(def.descBufVersionIdx >= m_DescriptorBufferVersions.size())
   {
-    shaderStages = {4, 6, 7};
+    RDCERR("Invalid deferred resource usage buffer reference");
+    return;
   }
+
+  ActionDescription &action = actionNode.action;
+
+  VulkanCreationInfo &c = m_CreationInfo;
+
+  rdcarray<int> shaderStages = ShaderStagesForAction(action);
+
+  GPUBuffer &buf = m_DescriptorBufferVersions[def.descBufVersionIdx];
+
+  byte *descriptorBytes = (byte *)buf.Map();
 
   for(int shad : shaderStages)
   {
-    bool compute = (shad == 5);
-    ResourceId pipe = (compute ? state.compute.pipeline : state.graphics.pipeline);
+    ResourceId pipe = def.pipeline;
+    bool shaderObject = pipe == ResourceId();
 
-    bool shaderObject = (compute ? state.compute.shaderObject : state.graphics.shaderObject);
+    VulkanCreationInfo::ShaderEntry &sh = shaderObject
+                                              ? c.m_ShaderObject[def.shaderObjects[shad]].shad
+                                              : c.m_Pipeline[pipe].shaders[shad];
+    if(sh.module == ResourceId())
+      continue;
+
+    ResourceId origPipe = GetResourceManager()->GetOriginalID(pipe);
+    ResourceId origShad = GetResourceManager()->GetOriginalID(sh.module);
+
+    for(const ConstantBlock &constantBlock : sh.refl->constantBlocks)
+    {
+      // ignore push constants
+      if(!constantBlock.bufferBacked)
+        continue;
+
+      AddUsageForDescriptorBufferBind(
+          actionNode, debugMessages, def, descriptorBytes,
+          DescriptorDataSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER), DescriptorType::ConstantBuffer,
+          constantBlock.fixedBindSetOrSpace, constantBlock.fixedBindNumber,
+          ResourceUsage(uint32_t(ResourceUsage::VS_Constants) + shad));
+    }
+
+    for(const ShaderResource &res : sh.refl->readOnlyResources)
+    {
+      AddUsageForDescriptorBufferBind(
+          actionNode, debugMessages, def, descriptorBytes,
+          DescriptorDataSize(MakeVkDescriptorType(res.descriptorType, res.isInputAttachment)),
+          res.descriptorType, res.fixedBindSetOrSpace, res.fixedBindNumber,
+          ResourceUsage(uint32_t(ResourceUsage::VS_Resource) + shad));
+    }
+
+    for(const ShaderResource &res : sh.refl->readWriteResources)
+    {
+      AddUsageForDescriptorBufferBind(
+          actionNode, debugMessages, def, descriptorBytes,
+          DescriptorDataSize(MakeVkDescriptorType(res.descriptorType, false)), res.descriptorType,
+          res.fixedBindSetOrSpace, res.fixedBindNumber,
+          ResourceUsage(uint32_t(ResourceUsage::VS_RWResource) + shad));
+    }
+  }
+
+  buf.Unmap();
+}
+
+void WrappedVulkan::AddUsageForDescriptorBufferBind(
+    VulkanActionTreeNode &actionNode, rdcarray<DebugMessage> &debugMessages,
+    const VulkanActionTreeNode::DeferredResourceUsage &def, byte *descriptorBytes,
+    size_t descriptorSize, DescriptorType type, uint32_t bindset, uint32_t bind, ResourceUsage usage)
+{
+  static bool hugeRangeWarned = false;
+  uint32_t eid = actionNode.action.eventId;
+
+  const rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descSets = def.descSets;
+
+  VulkanCreationInfo &c = m_CreationInfo;
+
+  DebugMessage msg;
+  msg.eventId = eid;
+  msg.category = MessageCategory::Execution;
+  msg.messageID = 0;
+  msg.source = MessageSource::IncorrectAPIUse;
+  msg.severity = MessageSeverity::High;
+
+  if(bindset >= descSets.size() || !descSets[bindset].IsBound())
+  {
+    msg.description =
+        StringFormat::Fmt("Shader referenced a descriptor set %i that was not bound", bindset);
+    debugMessages.push_back(msg);
+    return;
+  }
+
+  // ignore push sets, these were handled normally
+  if(descSets[bindset].push)
+    return;
+
+  const VulkanCreationInfo::PipelineLayout &pipeLayout =
+      c.m_PipelineLayout[descSets[bindset].pipeLayout];
+  const DescSetLayout &layout = c.m_DescSetLayout[pipeLayout.descSetLayouts[bindset]];
+
+  if(layout.bindings.empty())
+  {
+    msg.description =
+        StringFormat::Fmt("Shader referenced a descriptor set %i that was not bound", bindset);
+    debugMessages.push_back(msg);
+    return;
+  }
+
+  if(bind >= layout.bindings.size())
+  {
+    msg.description = StringFormat::Fmt(
+        "Shader referenced a bind %i in descriptor set %i that does not exist. Mismatched "
+        "descriptor set?",
+        bind, bindset);
+    debugMessages.push_back(msg);
+    return;
+  }
+
+  // no object to mark for usage with inline blocks
+  if(layout.bindings[bind].layoutDescType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+    return;
+
+  uint32_t descriptorCount = layout.bindings[bind].descriptorCount;
+  // completely skip variable size or arrayed bindings as it is too spammy to look up uninitialised
+  // descriptors and there is a chance of false positives
+  if(layout.bindings[bind].variableSize || descriptorCount > 1)
+    return;
+
+  for(uint32_t a = 0; a < descriptorCount; a++)
+  {
+    DescriptorSetSlot tmp = {};
+    LookupDescriptor(descriptorBytes + descSets[bindset].descBufferOffset +
+                         layout.bindings[bind].elemOffset + descriptorSize * a,
+                     descriptorSize, type, tmp);
+
+    AddUsageForDescriptor(actionNode, tmp, usage);
+  }
+}
+
+void WrappedVulkan::AddUsageForDescriptorSets(VulkanActionTreeNode &actionNode,
+                                              rdcarray<DebugMessage> &debugMessages)
+{
+  ActionDescription &action = actionNode.action;
+
+  const VulkanRenderState &state = m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
+  const VulkanStatePipeline &pipeState =
+      (action.flags & ActionFlags::Dispatch ? state.compute : state.graphics);
+  VulkanCreationInfo &c = m_CreationInfo;
+
+  rdcarray<int> shaderStages = ShaderStagesForAction(action);
+
+  for(int shad : shaderStages)
+  {
+    ResourceId pipe = pipeState.pipeline;
+    bool shaderObject = pipeState.shaderObject;
 
     VulkanCreationInfo::ShaderEntry &sh = shaderObject
                                               ? c.m_ShaderObject[state.shaderObjects[shad]].shad
@@ -5617,34 +6224,30 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
       if(!constantBlock.bufferBacked)
         continue;
 
-      AddUsageForBind(actionNode, debugMessages, constantBlock.fixedBindSetOrSpace,
-                      constantBlock.fixedBindNumber,
-                      ResourceUsage(uint32_t(ResourceUsage::VS_Constants) + shad));
+      AddUsageForDescriptorSetBind(actionNode, debugMessages, constantBlock.fixedBindSetOrSpace,
+                                   constantBlock.fixedBindNumber,
+                                   ResourceUsage(uint32_t(ResourceUsage::VS_Constants) + shad));
     }
 
     for(const ShaderResource &res : sh.refl->readOnlyResources)
     {
-      AddUsageForBind(actionNode, debugMessages, res.fixedBindSetOrSpace, res.fixedBindNumber,
-                      ResourceUsage(uint32_t(ResourceUsage::VS_Resource) + shad));
+      AddUsageForDescriptorSetBind(actionNode, debugMessages, res.fixedBindSetOrSpace,
+                                   res.fixedBindNumber,
+                                   ResourceUsage(uint32_t(ResourceUsage::VS_Resource) + shad));
     }
 
     for(const ShaderResource &res : sh.refl->readWriteResources)
     {
-      AddUsageForBind(actionNode, debugMessages, res.fixedBindSetOrSpace, res.fixedBindNumber,
-                      ResourceUsage(uint32_t(ResourceUsage::VS_RWResource) + shad));
+      AddUsageForDescriptorSetBind(actionNode, debugMessages, res.fixedBindSetOrSpace,
+                                   res.fixedBindNumber,
+                                   ResourceUsage(uint32_t(ResourceUsage::VS_RWResource) + shad));
     }
   }
-
-  //////////////////////////////
-  // Framebuffer/renderpass
-
-  if(!(action.flags & ActionFlags::Dispatch))
-    AddFramebufferUsage(actionNode, state);
 }
 
-void WrappedVulkan::AddUsageForBind(VulkanActionTreeNode &actionNode,
-                                    rdcarray<DebugMessage> &debugMessages, uint32_t bindset,
-                                    uint32_t bind, ResourceUsage usage)
+void WrappedVulkan::AddUsageForDescriptorSetBind(VulkanActionTreeNode &actionNode,
+                                                 rdcarray<DebugMessage> &debugMessages,
+                                                 uint32_t bindset, uint32_t bind, ResourceUsage usage)
 {
   static bool hugeRangeWarned = false;
   uint32_t eid = actionNode.action.eventId;
@@ -5663,7 +6266,7 @@ void WrappedVulkan::AddUsageForBind(VulkanActionTreeNode &actionNode,
   msg.source = MessageSource::IncorrectAPIUse;
   msg.severity = MessageSeverity::High;
 
-  if(bindset >= descSets.size() || descSets[bindset].descSet == ResourceId())
+  if(bindset >= descSets.size() || !descSets[bindset].IsBound())
   {
     msg.description =
         StringFormat::Fmt("Shader referenced a descriptor set %i that was not bound", bindset);
@@ -5671,10 +6274,12 @@ void WrappedVulkan::AddUsageForBind(VulkanActionTreeNode &actionNode,
     return;
   }
 
-  DescriptorSetInfo &descset = m_DescriptorSetState[descSets[bindset].descSet];
-  DescSetLayout &layout = c.m_DescSetLayout[descset.layout];
+  // can't generate usage for descriptor buffers
+  if(descSets[bindset].descBufferIdx != ~0U)
+    return;
 
-  ResourceId layoutId = GetResourceManager()->GetOriginalID(descset.layout);
+  const DescriptorSetInfo &descset = m_DescriptorSetState[descSets[bindset].descSet];
+  const DescSetLayout &layout = c.m_DescSetLayout[descset.layout];
 
   if(layout.bindings.empty())
   {
@@ -5725,49 +6330,57 @@ void WrappedVulkan::AddUsageForBind(VulkanActionTreeNode &actionNode,
     if(!descset.data.binds[bind])
       return;
 
-    DescriptorSetSlot &slot = descset.data.binds[bind][a];
-
-    // handled as part of the framebuffer attachments
-    if(slot.type == DescriptorSlotType::InputAttachment)
-      return;
-
-    // ignore unwritten descriptors
-    if(slot.type == DescriptorSlotType::Unwritten)
-      return;
-
-    // we don't mark samplers with usage
-    if(slot.type == DescriptorSlotType::Sampler)
-      return;
-
-    ResourceId id;
-
-    switch(slot.type)
-    {
-      case DescriptorSlotType::CombinedImageSampler:
-      case DescriptorSlotType::SampledImage:
-      case DescriptorSlotType::StorageImage:
-        if(slot.resource != ResourceId())
-          id = c.m_ImageView[slot.resource].image;
-        break;
-      case DescriptorSlotType::UniformTexelBuffer:
-      case DescriptorSlotType::StorageTexelBuffer:
-        if(slot.resource != ResourceId())
-          id = c.m_BufferView[slot.resource].buffer;
-        break;
-      case DescriptorSlotType::UniformBuffer:
-      case DescriptorSlotType::UniformBufferDynamic:
-      case DescriptorSlotType::StorageBuffer:
-      case DescriptorSlotType::StorageBufferDynamic:
-      case DescriptorSlotType::AccelerationStructure:
-        if(slot.resource != ResourceId())
-          id = slot.resource;
-        break;
-      default: RDCERR("Unexpected type %d", slot.type); break;
-    }
-
-    if(id != ResourceId())
-      actionNode.resourceUsage.push_back(make_rdcpair(id, EventUsage(eid, usage)));
+    AddUsageForDescriptor(actionNode, descset.data.binds[bind][a], usage);
   }
+}
+
+void WrappedVulkan::AddUsageForDescriptor(VulkanActionTreeNode &actionNode,
+                                          const DescriptorSetSlot &slot, ResourceUsage usage)
+{
+  VulkanCreationInfo &c = m_CreationInfo;
+  uint32_t eid = actionNode.action.eventId;
+
+  // handled as part of the framebuffer attachments
+  if(slot.type == DescriptorSlotType::InputAttachment)
+    return;
+
+  // ignore unwritten descriptors
+  if(slot.type == DescriptorSlotType::Unwritten)
+    return;
+
+  // we don't mark samplers with usage
+  if(slot.type == DescriptorSlotType::Sampler)
+    return;
+
+  ResourceId id;
+
+  switch(slot.type)
+  {
+    case DescriptorSlotType::CombinedImageSampler:
+    case DescriptorSlotType::SampledImage:
+    case DescriptorSlotType::StorageImage:
+      if(slot.resource != ResourceId())
+        id = c.m_ImageView[slot.resource].image;
+      break;
+    case DescriptorSlotType::UniformTexelBuffer:
+    case DescriptorSlotType::StorageTexelBuffer:
+      id = slot.resource;
+      if(c.m_BufferView.find(slot.resource) != c.m_BufferView.end())
+        id = c.m_BufferView[slot.resource].buffer;
+      break;
+    case DescriptorSlotType::UniformBuffer:
+    case DescriptorSlotType::UniformBufferDynamic:
+    case DescriptorSlotType::StorageBuffer:
+    case DescriptorSlotType::StorageBufferDynamic:
+    case DescriptorSlotType::AccelerationStructure:
+      if(slot.resource != ResourceId())
+        id = slot.resource;
+      break;
+    default: RDCERR("Unexpected type %d", slot.type); break;
+  }
+
+  if(id != ResourceId())
+    actionNode.resourceUsage.push_back(make_rdcpair(id, EventUsage(eid, usage)));
 }
 
 void WrappedVulkan::AddFramebufferUsage(VulkanActionTreeNode &actionNode,

@@ -3062,7 +3062,8 @@ void WrappedID3D12GraphicsCommandList::SetMarker(UINT Metadata, const void *pDat
   SERIALISE_TIME_CALL(m_pList->SetMarker(Metadata, pData, Size));
 
   if(m_AMDMarkers && Metadata == PIX_EVENT_UNICODE_VERSION)
-    m_AMDMarkers->SetMarker(StringFormat::Wide2UTF8((const wchar_t *)pData).c_str());
+    m_AMDMarkers->SetMarker(
+        StringFormat::Wide2UTF8(rdcwstr((const wchar_t *)pData, Size / sizeof(wchar_t))).c_str());
 
   if(IsCaptureMode(m_State))
   {
@@ -3135,7 +3136,8 @@ void WrappedID3D12GraphicsCommandList::BeginEvent(UINT Metadata, const void *pDa
   SERIALISE_TIME_CALL(m_pList->BeginEvent(Metadata, pData, Size));
 
   if(m_AMDMarkers && Metadata == PIX_EVENT_UNICODE_VERSION)
-    m_AMDMarkers->PushMarker(StringFormat::Wide2UTF8((const wchar_t *)pData).c_str());
+    m_AMDMarkers->PushMarker(
+        StringFormat::Wide2UTF8(rdcwstr((const wchar_t *)pData, Size / sizeof(wchar_t))).c_str());
 
   if(IsCaptureMode(m_State))
   {
@@ -3519,7 +3521,8 @@ void WrappedID3D12GraphicsCommandList::SaveExecuteIndirectParameters(
 
   BakedCmdListInfo &cmdListInfo = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
 
-  const size_t argsSize = comSig->sig.ByteStride * (MaxCommandCount - 1) + comSig->sig.PackedByteSize;
+  const size_t argsSize =
+      comSig->sig.ByteStride * (RDCMAX(1U, MaxCommandCount) - 1) + comSig->sig.PackedByteSize;
   const size_t countSize = 16;
 
   // at most we need to copy two executes. The last may be partial and so contain some state set
@@ -3574,10 +3577,26 @@ void WrappedID3D12GraphicsCommandList::ResetAndRecordExecuteIndirectStates(
         case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: state.ibuffer = {}; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
           if(arg.Constant.RootParameterIndex < state.graphics.sigelems.size())
-            state.graphics.sigelems[arg.Constant.RootParameterIndex].constants.clear();
+          {
+            for(uint32_t j = 0; j < arg.Constant.Num32BitValuesToSet; j++)
+            {
+              size_t index = j + arg.Constant.DestOffsetIn32BitValues;
+              state.graphics.sigelems[arg.Constant.RootParameterIndex].constants.resize_for_index(
+                  index);
+              state.graphics.sigelems[arg.Constant.RootParameterIndex].constants[index] = 0;
+            }
+          }
 
           if(arg.Constant.RootParameterIndex < state.compute.sigelems.size())
-            state.compute.sigelems[arg.Constant.RootParameterIndex].constants.clear();
+          {
+            for(uint32_t j = 0; j < arg.Constant.Num32BitValuesToSet; j++)
+            {
+              size_t index = j + arg.Constant.DestOffsetIn32BitValues;
+              state.compute.sigelems[arg.Constant.RootParameterIndex].constants.resize_for_index(
+                  index);
+              state.compute.sigelems[arg.Constant.RootParameterIndex].constants[index] = 0;
+            }
+          }
           break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
         case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
@@ -3932,12 +3951,20 @@ void WrappedID3D12GraphicsCommandList::FinaliseExecuteIndirectEvents(BakedCmdLis
             structuriser.Serialise("Values"_lit, data32, arg.Constant.Num32BitValuesToSet).Important();
 
             if(arg.Constant.RootParameterIndex < state.graphics.sigelems.size())
-              state.graphics.sigelems[arg.Constant.RootParameterIndex].constants.assign(
-                  data32, arg.Constant.Num32BitValuesToSet);
+            {
+              state.graphics.sigelems[arg.Constant.RootParameterIndex].constants.resize_for_index(
+                  arg.Constant.Num32BitValuesToSet + arg.Constant.DestOffsetIn32BitValues);
+              state.graphics.sigelems[arg.Constant.RootParameterIndex].SetConstants(
+                  arg.Constant.Num32BitValuesToSet, data32, arg.Constant.DestOffsetIn32BitValues);
+            }
 
             if(arg.Constant.RootParameterIndex < state.compute.sigelems.size())
-              state.compute.sigelems[arg.Constant.RootParameterIndex].constants.assign(
-                  data32, arg.Constant.Num32BitValuesToSet);
+            {
+              state.compute.sigelems[arg.Constant.RootParameterIndex].constants.resize_for_index(
+                  arg.Constant.Num32BitValuesToSet + arg.Constant.DestOffsetIn32BitValues);
+              state.compute.sigelems[arg.Constant.RootParameterIndex].SetConstants(
+                  arg.Constant.Num32BitValuesToSet, data32, arg.Constant.DestOffsetIn32BitValues);
+            }
 
             // advance only the EID, since we're still in the same action
             eid++;
@@ -4192,6 +4219,7 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
                   (pCountBuffer ? pCountBuffer->GetGPUVirtualAddress() : 0) + CountBufferOffset,
                   MaxCommandCount);
 
+          m_Cmd->m_IndirectData.commandSig = pCommandSignature;
           m_Cmd->m_IndirectData.argsBuffer = patched.first;
           m_Cmd->m_IndirectData.argsOffset = patched.second;
 
@@ -4221,14 +4249,24 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
 
           countToReplay = RDCMIN(countToReplay, maxCommands);
 
+          if(m_Cmd->m_FirstEventID > 1)
+          {
+            const uint32_t argidx = (curEID - baseEventID - 1);
+            const uint32_t execidx = argidx / comSig->sig.arguments.count();
+
+            argOffset += comSig->sig.ByteStride * execidx;
+          }
+
           for(uint32_t i = 0; i < countToReplay; i++)
           {
-            m_Cmd->m_IndirectData.commandSig = pCommandSignature;
             ActionFlags drawType =
                 comSig->sig.graphics ? ActionFlags::Drawcall : ActionFlags::Dispatch;
 
             uint32_t eventId =
                 m_Cmd->HandlePreCallback(list, drawType, (i + 1) * comSig->sig.arguments.count());
+
+            // Allow the callback to recreate the command signature i.e. to match the root signature
+            pCommandSignature = m_Cmd->m_IndirectData.commandSig;
 
             // action up to and including i. The previous draws will be nop'd out
             Unwrap(list)->ExecuteIndirect(Unwrap(pCommandSignature), 1, argBuffer, argOffset, NULL,
@@ -4253,12 +4291,12 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
               }
             }
 
-            m_Cmd->m_IndirectData.commandSig = NULL;
-            m_Cmd->m_IndirectData.argsBuffer = NULL;
-            m_Cmd->m_IndirectData.argsOffset = 0;
-
             argOffset += comSig->sig.ByteStride;
+            m_Cmd->m_IndirectData.argsOffset += comSig->sig.ByteStride;
           }
+          m_Cmd->m_IndirectData.commandSig = NULL;
+          m_Cmd->m_IndirectData.argsBuffer = NULL;
+          m_Cmd->m_IndirectData.argsOffset = 0;
 
           D3D12MarkerRegion::End(list);
         }

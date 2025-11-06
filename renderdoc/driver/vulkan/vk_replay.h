@@ -277,12 +277,17 @@ enum TexDisplayFlags
 
 struct ShaderDebugData
 {
+  enum
+  {
+    MAX_QUEUED_OPS = 128
+  };
   void Init(WrappedVulkan *driver, VkDescriptorPool descriptorPool);
   void Destroy(WrappedVulkan *driver);
 
+  VkDescriptorPool DescPool = VK_NULL_HANDLE;
   VkDescriptorSetLayout DescSetLayout = VK_NULL_HANDLE;
   VkPipelineLayout PipeLayout = VK_NULL_HANDLE;
-  VkDescriptorSet DescSet = VK_NULL_HANDLE;
+  VkDescriptorSet DescSets[MAX_QUEUED_OPS];
 
   VkPipeline MathPipe[3] = {};
 
@@ -337,7 +342,7 @@ public:
   TextureDescription GetTexture(ResourceId id);
 
   rdcarray<ShaderEntryPoint> GetShaderEntryPoints(ResourceId shader);
-  ShaderReflection *GetShader(ResourceId pipeline, ResourceId shader, ShaderEntryPoint entry);
+  const ShaderReflection *GetShader(ResourceId pipeline, ResourceId shader, ShaderEntryPoint entry);
 
   rdcarray<rdcstr> GetDisassemblyTargets(bool withPipeline);
   rdcstr DisassembleShader(ResourceId pipeline, const ShaderReflection *refl, const rdcstr &target);
@@ -735,9 +740,11 @@ private:
     GPUBuffer m_CheckerUBO;
 
     VkDescriptorSetLayout m_QuadDescSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_QuadDescBufLayout = VK_NULL_HANDLE;
     VkDescriptorSet m_QuadDescSet = VK_NULL_HANDLE;
     VkPipelineLayout m_QuadResolvePipeLayout = VK_NULL_HANDLE;
     VkPipeline m_QuadResolvePipeline[8] = {VK_NULL_HANDLE};
+    GPUBuffer m_QuadDescriptor;
 
     VkDescriptorSetLayout m_DepthCopyDescSetLayout = VK_NULL_HANDLE;
     VkDescriptorSet m_DepthCopyDescSet = VK_NULL_HANDLE;

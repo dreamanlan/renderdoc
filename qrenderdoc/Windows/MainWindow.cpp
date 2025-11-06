@@ -227,6 +227,56 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   m_MessageTick.setInterval(175);
   m_MessageTick.start();
 
+  QTimer *vkconfigCheckTimer = new QTimer(this);
+  QObject::connect(vkconfigCheckTimer, &QTimer::timeout, [vkconfigCheckTimer]() {
+    QString homePath = QStandardPaths::writableLocation(QStandardPaths::HomeLocation);
+
+    // for some reason these paths have changed a lot so we have to check them all :(
+    const QString basePaths[] = {
+#if defined(Q_OS_WIN32)
+      lit("/AppData/Local/LunarG/vkconfig/override/"),
+      lit("/AppData/Local/LunarG/vulkan/"),
+#else
+      lit("/.local/share/vulkan/implicit_layer.d/"),
+      lit("/.local/share/vulkan/loader_settings.d/"),
+#endif
+    };
+
+    const QString filenames[] = {
+        lit("VkLayerOverride.json"),
+        lit("VkLayer_Override.json"),
+        lit("VkLayer_override.json"),
+        lit("vk_loader_settings.json"),
+    };
+
+    for(const QString &path : basePaths)
+    {
+      for(const QString &fn : filenames)
+      {
+        QFileInfo vkconfigcheck(homePath + path + fn);
+
+        if(vkconfigcheck.exists() && vkconfigcheck.isFile())
+        {
+          RDDialog::warning(
+              NULL, tr("vkconfig detected - possible incompatibility"),
+              tr("Configuration from 'vkconfig' tool detected.\n\n"
+                 "This program has caused problems in the past and it is \n"
+                 "strongly recommended that you disable it while using RenderDoc.\n\n"
+                 "If this program is not active check the path below for any leftover files:\n\n%1")
+                  .arg(vkconfigcheck.absoluteFilePath()));
+
+          qInfo() << "vkconfig detected and warned";
+          vkconfigCheckTimer->stop();
+          return;
+        }
+      }
+    }
+  });
+
+  vkconfigCheckTimer->setSingleShot(false);
+  vkconfigCheckTimer->setInterval(2500);
+  vkconfigCheckTimer->start();
+
   m_RemoteProbeSemaphore.release();
   m_RemoteProbe = new LambdaThread([this]() {
     // fetch all device protocols to start them processing
@@ -1681,6 +1731,11 @@ void MainWindow::LoadInitialLayout()
   }
 }
 
+bool MainWindow::ErrorReportsAllowed()
+{
+  return ui->action_Send_Error_Report->isEnabled();
+}
+
 void MainWindow::RemoveRecentCapture(const QString &filename)
 {
   RemoveRecentFile(m_Ctx.Config().RecentCaptureFiles, filename);
@@ -2858,6 +2913,9 @@ void MainWindow::on_action_Send_Error_Report_triggered()
 
 void MainWindow::sendErrorReport(bool forceCaptureInclusion)
 {
+  if(!ErrorReportsAllowed())
+    return;
+
   rdcstr report;
   RENDERDOC_CreateBugReport(RENDERDOC_GetLogFile(), "", report);
 

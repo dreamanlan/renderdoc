@@ -30,6 +30,11 @@
 // for compatibility we use the same DXBC name since it's now configured by the UI
 RDOC_EXTERN_CONFIG(rdcarray<rdcstr>, DXBC_Debug_SearchDirPaths);
 
+ResourceId VulkanCreationInfo::pushConstantDescriptorStorage;
+rdcarray<ResourceId> VulkanCreationInfo::descriptorSetStorage;
+rdcarray<ResourceId> VulkanCreationInfo::descriptorBufferStorage;
+rdcarray<ResourceId> VulkanCreationInfo::inlineBufferStorage;
+
 VkDynamicState ConvertDynamicState(VulkanDynamicStateIndex idx)
 {
   switch(idx)
@@ -316,8 +321,10 @@ static VkGraphicsPipelineLibraryFlagsEXT DynamicStateValidState(VkDynamicState s
 }
 
 void DescSetLayout::Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,
-                         const VkDescriptorSetLayoutCreateInfo *pCreateInfo)
+                         ResourceId id, const VkDescriptorSetLayoutCreateInfo *pCreateInfo)
 {
+  resourceId = id;
+
   dynamicCount = 0;
   inlineCount = 0;
   inlineByteSize = 0;
@@ -739,7 +746,7 @@ bool CreateDescriptorWritesForSlotData(WrappedVulkan *vk, rdcarray<VkWriteDescri
         else
           writeImage[arrayIdx].sampler = VK_NULL_HANDLE;
 
-        writeImage[arrayIdx].imageLayout = convert(slots[slot].imageLayout);
+        writeImage[arrayIdx].imageLayout = convert(slots[slot].imageLayoutOrFormat);
 
         // if we're not updating a SAMPLER descriptor fill in immutable samplers so that
         // our
@@ -825,9 +832,31 @@ bool CreateDescriptorWritesForSlotData(WrappedVulkan *vk, rdcarray<VkWriteDescri
   return ret;
 }
 
-void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
-    ResourceId pushStorage, ResourceId specStorage, rdcarray<DescriptorAccess> &descriptorAccess,
-    rdcarray<const DescSetLayout *> setLayoutInfos) const
+uint32_t GetDescriptorSizeOfBind(VulkanResourceManager *resourceMan,
+                                 const rdcarray<DescSetLayout::Binding> &bindings,
+                                 const rdcarray<uint64_t> &mutableBitmasks, uint32_t fixedBindNumber)
+{
+  if(bindings[fixedBindNumber].layoutDescType != VK_DESCRIPTOR_TYPE_MUTABLE_EXT)
+    return resourceMan->DescriptorDataSize(bindings[fixedBindNumber].layoutDescType);
+
+  uint64_t bitmask = mutableBitmasks[fixedBindNumber];
+  uint32_t ret = 0;
+
+  for(uint64_t m = 0; m < (uint64_t)DescriptorSlotType::Count; m++)
+  {
+    if(bitmask & (1ULL << m))
+    {
+      ret = RDCMAX(ret, resourceMan->DescriptorDataSize(convert(DescriptorSlotType(m))));
+    }
+  }
+
+  return ret;
+}
+
+static void ProcessStaticDescriptorAccess(VulkanResourceManager *resourceMan,
+                                          const ShaderReflection *refl, ResourceId specStorage,
+                                          rdcarray<DescriptorAccess> &descriptorAccess,
+                                          rdcarray<const DescSetLayout *> setLayoutInfos)
 {
   if(!refl)
     return;
@@ -837,8 +866,7 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
   DescriptorAccess access;
   access.stage = refl->stage;
 
-  // we will store the descriptor set in byteSize to be decoded into descriptorStore later
-  access.byteSize = 0;
+  // desciptor set storage is fake, so byteSize is just 1
 
   descriptorAccess.reserve(descriptorAccess.size() + refl->constantBlocks.size() +
                            refl->samplers.size() + refl->readOnlyResources.size() +
@@ -857,19 +885,19 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
 
     if(!bind.bufferBacked)
     {
+      access.byteSize = 1;
+
       if(bind.compileConstants)
       {
         // spec constants
         access.descriptorStore = specStorage;
-        access.byteSize = 1;
         access.byteOffset = 0;
         descriptorAccess.push_back(access);
       }
       else
       {
         // push constants
-        access.descriptorStore = pushStorage;
-        access.byteSize = 1;
+        access.descriptorStore = VulkanCreationInfo::pushConstantDescriptorStorage;
         access.byteOffset = 0;
         descriptorAccess.push_back(access);
       }
@@ -881,19 +909,45 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
          bind.fixedBindNumber >= setLayoutInfos[bind.fixedBindSetOrSpace]->bindings.size())
         continue;
 
-      access.descriptorStore = ResourceId();
+      const DescSetLayout *setLayout = setLayoutInfos[bind.fixedBindSetOrSpace];
 
       // VkShaderStageFlagBits and ShaderStageMask are identical bit-for-bit.
       // this might be deliberate if the binding is never actually used dynamically, only
       // statically used bindings must be declared
-      if((setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].stageFlags &
+      if((setLayout->bindings[bind.fixedBindNumber].stageFlags &
           (VkShaderStageFlags)MaskForStage(refl->stage)) == 0)
         continue;
 
-      access.byteSize = bind.fixedBindSetOrSpace;
-      access.byteOffset =
-          setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset +
-          setLayoutInfos[bind.fixedBindSetOrSpace]->inlineByteSize;
+      if((setLayout->flags & (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+                              VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT |
+                              VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)) ==
+         VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT)
+      {
+        if(setLayout->bindings[bind.fixedBindNumber].layoutDescType ==
+           VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+        {
+          access.descriptorStore = VulkanCreationInfo::inlineBufferStorage[bind.fixedBindSetOrSpace];
+          access.byteSize = setLayout->bindings[bind.fixedBindNumber].descriptorCount;
+        }
+        else
+        {
+          access.descriptorStore =
+              VulkanCreationInfo::descriptorBufferStorage[bind.fixedBindSetOrSpace];
+          access.byteSize = GetDescriptorSizeOfBind(
+              resourceMan, setLayout->bindings, setLayout->mutableBitmasks, bind.fixedBindNumber);
+        }
+
+        // we are only handling non-arrays here
+        access.byteOffset = setLayout->bindings[bind.fixedBindNumber].elemOffset;
+      }
+      else
+      {
+        access.descriptorStore = VulkanCreationInfo::descriptorSetStorage[bind.fixedBindSetOrSpace];
+        access.byteSize = 1;
+        access.byteOffset =
+            setLayout->bindings[bind.fixedBindNumber].elemOffset + setLayout->inlineByteSize;
+      }
+
       descriptorAccess.push_back(access);
     }
   }
@@ -913,19 +967,44 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
        bind.fixedBindNumber >= setLayoutInfos[bind.fixedBindSetOrSpace]->bindings.size())
       continue;
 
+    const DescSetLayout *setLayout = setLayoutInfos[bind.fixedBindSetOrSpace];
+
     // VkShaderStageFlagBits and ShaderStageMask are identical bit-for-bit.
     // this might be deliberate if the binding is never actually used dynamically, only
     // statically used bindings must be declared
-    if((setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].stageFlags &
+    if((setLayout->bindings[bind.fixedBindNumber].stageFlags &
         (VkShaderStageFlags)MaskForStage(refl->stage)) == 0)
       continue;
 
     access.type = DescriptorType::Sampler;
     access.index = i;
-    access.byteSize = bind.fixedBindSetOrSpace;
-    access.byteOffset =
-        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset +
-        setLayoutInfos[bind.fixedBindSetOrSpace]->inlineByteSize;
+
+    if((setLayout->flags & (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+                            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT |
+                            VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)) ==
+       VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT)
+    {
+      access.descriptorStore = VulkanCreationInfo::descriptorBufferStorage[bind.fixedBindSetOrSpace];
+      access.byteSize = GetDescriptorSizeOfBind(resourceMan, setLayout->bindings,
+                                                setLayout->mutableBitmasks, bind.fixedBindNumber);
+
+      // we are only handling non-arrays here
+      access.byteOffset = setLayout->bindings[bind.fixedBindNumber].elemOffset;
+    }
+    else if(setLayout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)
+    {
+      access.descriptorStore = resourceMan->GetOriginalID(setLayout->resourceId);
+      access.byteSize = 1;
+      access.byteOffset = bind.fixedBindNumber;
+    }
+    else
+    {
+      access.descriptorStore = VulkanCreationInfo::descriptorSetStorage[bind.fixedBindSetOrSpace];
+      access.byteSize = 1;
+      access.byteOffset =
+          setLayout->bindings[bind.fixedBindNumber].elemOffset + setLayout->inlineByteSize;
+    }
+
     descriptorAccess.push_back(access);
   }
 
@@ -942,19 +1021,38 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
        bind.fixedBindNumber >= setLayoutInfos[bind.fixedBindSetOrSpace]->bindings.size())
       continue;
 
+    const DescSetLayout *setLayout = setLayoutInfos[bind.fixedBindSetOrSpace];
+
     // VkShaderStageFlagBits and ShaderStageMask are identical bit-for-bit.
     // this might be deliberate if the binding is never actually used dynamically, only
     // statically used bindings must be declared
-    if((setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].stageFlags &
+    if((setLayout->bindings[bind.fixedBindNumber].stageFlags &
         (VkShaderStageFlags)MaskForStage(refl->stage)) == 0)
       continue;
 
     access.type = refl->readOnlyResources[i].descriptorType;
     access.index = i;
-    access.byteSize = bind.fixedBindSetOrSpace;
-    access.byteOffset =
-        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset +
-        setLayoutInfos[bind.fixedBindSetOrSpace]->inlineByteSize;
+
+    if((setLayout->flags & (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+                            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT |
+                            VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)) ==
+       VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT)
+    {
+      access.descriptorStore = VulkanCreationInfo::descriptorBufferStorage[bind.fixedBindSetOrSpace];
+      access.byteSize = GetDescriptorSizeOfBind(resourceMan, setLayout->bindings,
+                                                setLayout->mutableBitmasks, bind.fixedBindNumber);
+
+      // we are only handling non-arrays here
+      access.byteOffset = setLayout->bindings[bind.fixedBindNumber].elemOffset;
+    }
+    else
+    {
+      access.descriptorStore = VulkanCreationInfo::descriptorSetStorage[bind.fixedBindSetOrSpace];
+      access.byteSize = 1;
+      access.byteOffset =
+          setLayout->bindings[bind.fixedBindNumber].elemOffset + setLayout->inlineByteSize;
+    }
+
     descriptorAccess.push_back(access);
   }
 
@@ -971,19 +1069,38 @@ void VulkanCreationInfo::ShaderEntry::ProcessStaticDescriptorAccess(
        bind.fixedBindNumber >= setLayoutInfos[bind.fixedBindSetOrSpace]->bindings.size())
       continue;
 
+    const DescSetLayout *setLayout = setLayoutInfos[bind.fixedBindSetOrSpace];
+
     // VkShaderStageFlagBits and ShaderStageMask are identical bit-for-bit.
     // this might be deliberate if the binding is never actually used dynamically, only
     // statically used bindings must be declared
-    if((setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].stageFlags &
+    if((setLayout->bindings[bind.fixedBindNumber].stageFlags &
         (VkShaderStageFlags)MaskForStage(refl->stage)) == 0)
       continue;
 
     access.type = refl->readWriteResources[i].descriptorType;
     access.index = i;
-    access.byteSize = bind.fixedBindSetOrSpace;
-    access.byteOffset =
-        setLayoutInfos[bind.fixedBindSetOrSpace]->bindings[bind.fixedBindNumber].elemOffset +
-        setLayoutInfos[bind.fixedBindSetOrSpace]->inlineByteSize;
+
+    if((setLayout->flags & (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+                            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT |
+                            VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)) ==
+       VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT)
+    {
+      access.descriptorStore = VulkanCreationInfo::descriptorBufferStorage[bind.fixedBindSetOrSpace];
+      access.byteSize = GetDescriptorSizeOfBind(resourceMan, setLayout->bindings,
+                                                setLayout->mutableBitmasks, bind.fixedBindNumber);
+
+      // we are only handling non-arrays here
+      access.byteOffset = setLayout->bindings[bind.fixedBindNumber].elemOffset;
+    }
+    else
+    {
+      access.descriptorStore = VulkanCreationInfo::descriptorSetStorage[bind.fixedBindSetOrSpace];
+      access.byteSize = 1;
+      access.byteOffset =
+          setLayout->bindings[bind.fixedBindNumber].elemOffset + setLayout->inlineByteSize;
+    }
+
     descriptorAccess.push_back(access);
   }
 }
@@ -1066,9 +1183,8 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
   for(ResourceId setLayout : descSetLayouts)
     setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
 
-  shad.ProcessStaticDescriptorAccess(info.pushConstantDescriptorStorage,
-                                     resourceMan->GetOriginalID(id), staticDescriptorAccess,
-                                     setLayoutInfos);
+  ProcessStaticDescriptorAccess(resourceMan, shad.refl, resourceMan->GetOriginalID(id),
+                                staticDescriptorAccess, setLayoutInfos);
 }
 
 void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
@@ -1146,6 +1262,20 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
       dynamicStates[VkDynamicScissor] = false;
   }
 
+  vertexInputRobustness = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT;
+  const VkPipelineRobustnessCreateInfo *robustness =
+      (const VkPipelineRobustnessCreateInfo *)FindNextStruct(
+          pCreateInfo, VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO);
+  if(robustness)
+    vertexInputRobustness = robustness->vertexInputs;
+
+  maxFragmentDensityMapLayers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT;
+  const VkPipelineFragmentDensityMapLayeredCreateInfoVALVE *layered =
+      (const VkPipelineFragmentDensityMapLayeredCreateInfoVALVE *)FindNextStruct(
+          pCreateInfo, VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_DENSITY_MAP_LAYERED_CREATE_INFO_VALVE);
+  if(layered)
+    maxFragmentDensityMapLayers = layered->maxFragmentDensityMapLayers;
+
   // VkPipelineShaderStageCreateInfo
   for(uint32_t i = 0; i < pCreateInfo->stageCount; i++)
   {
@@ -1155,6 +1285,26 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     int stageIndex = StageIndex(pCreateInfo->pStages[i].stage);
 
     ShaderEntry &shad = shaders[stageIndex];
+
+    shad.storageBufferRobustness = shad.uniformBufferRobustness =
+        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT;
+    shad.imageRobustness = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DEVICE_DEFAULT;
+
+    const VkPipelineRobustnessCreateInfo *shaderRobustness =
+        (const VkPipelineRobustnessCreateInfo *)FindNextStruct(
+            &pCreateInfo->pStages[i], VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO);
+
+    // If VkPipelineRobustnessCreateInfo is specified for both a pipeline and a pipeline stage, the
+    // VkPipelineRobustnessCreateInfo specified for the pipeline stage will take precedence.
+    if(shaderRobustness == NULL)
+      shaderRobustness = robustness;
+
+    if(shaderRobustness)
+    {
+      shad.storageBufferRobustness = shaderRobustness->storageBuffers;
+      shad.uniformBufferRobustness = shaderRobustness->uniformBuffers;
+      shad.imageRobustness = shaderRobustness->images;
+    }
 
     const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *subgroupSize =
         (const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *)FindNextStruct(
@@ -1274,13 +1424,22 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     viewportCount = 0;
 
   viewports.resize(viewportCount);
-  scissors.resize(viewportCount);
 
   for(uint32_t i = 0; i < viewportCount; i++)
   {
     if(pCreateInfo->pViewportState->pViewports)
       viewports[i] = pCreateInfo->pViewportState->pViewports[i];
+  }
 
+  if(pCreateInfo->pViewportState)
+    scissorCount = pCreateInfo->pViewportState->scissorCount;
+  else
+    scissorCount = 0;
+
+  scissors.resize(scissorCount);
+
+  for(uint32_t i = 0; i < scissorCount; i++)
+  {
     if(pCreateInfo->pViewportState->pScissors)
       scissors[i] = pCreateInfo->pViewportState->pScissors[i];
   }
@@ -1601,6 +1760,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
         vertLayout = pipeInfo.vertLayout;
 
         viewportCount = pipeInfo.viewportCount;
+        scissorCount = pipeInfo.scissorCount;
         viewports = pipeInfo.viewports;
         scissors = pipeInfo.scissors;
 
@@ -1765,9 +1925,8 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
 
   for(const ShaderEntry &shad : shaders)
-    shad.ProcessStaticDescriptorAccess(info.pushConstantDescriptorStorage,
-                                       resourceMan->GetOriginalID(id), staticDescriptorAccess,
-                                       setLayoutInfos);
+    ProcessStaticDescriptorAccess(resourceMan, shad.refl, resourceMan->GetOriginalID(id),
+                                  staticDescriptorAccess, setLayoutInfos);
 }
 
 void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,
@@ -1788,10 +1947,30 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
 
   // need to figure out which states are valid to be NULL
 
+  // If VkPipelineRobustnessCreateInfo is specified for both a pipeline and a pipeline stage, the
+  // VkPipelineRobustnessCreateInfo specified for the pipeline stage will take precedence.
+  const VkPipelineRobustnessCreateInfo *shaderRobustness =
+      (const VkPipelineRobustnessCreateInfo *)FindNextStruct(
+          &pCreateInfo->stage, VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO);
+
+  if(shaderRobustness == NULL)
+    shaderRobustness = (const VkPipelineRobustnessCreateInfo *)FindNextStruct(
+        pCreateInfo, VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO);
+
   // VkPipelineShaderStageCreateInfo
   {
     ResourceId shadid = GetResID(pCreateInfo->stage.module);
     ShaderEntry &shad = shaders[5];    // 5 is the compute shader's index (VS, TCS, TES, GS, FS, CS)
+
+    shad.storageBufferRobustness = shad.uniformBufferRobustness =
+        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT;
+    shad.imageRobustness = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DEVICE_DEFAULT;
+    if(shaderRobustness)
+    {
+      shad.storageBufferRobustness = shaderRobustness->storageBuffers;
+      shad.uniformBufferRobustness = shaderRobustness->uniformBuffers;
+      shad.imageRobustness = shaderRobustness->images;
+    }
 
     const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *subgroupSize =
         (const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *)FindNextStruct(
@@ -1844,6 +2023,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
   tessellationDomainOrigin = VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT;
 
   viewportCount = 0;
+  scissorCount = 0;
 
   // VkPipelineRasterStateCreateInfo
   depthClampEnable = false;
@@ -1881,9 +2061,8 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
     setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
 
   for(const ShaderEntry &shad : shaders)
-    shad.ProcessStaticDescriptorAccess(info.pushConstantDescriptorStorage,
-                                       resourceMan->GetOriginalID(id), staticDescriptorAccess,
-                                       setLayoutInfos);
+    ProcessStaticDescriptorAccess(resourceMan, shad.refl, resourceMan->GetOriginalID(id),
+                                  staticDescriptorAccess, setLayoutInfos);
 }
 
 void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
@@ -1911,6 +2090,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
   tessellationDomainOrigin = VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT;
 
   viewportCount = 0;
+  scissorCount = 0;
 
   // VkPipelineRasterStateCreateInfo
   depthClampEnable = false;
@@ -2293,6 +2473,15 @@ void VulkanCreationInfo::Memory::Init(VulkanResourceManager *resourceMan, Vulkan
 {
   memoryTypeIndex = pAllocInfo->memoryTypeIndex;
   allocSize = wholeMemBufSize = pAllocInfo->allocationSize;
+
+  const VkMemoryOpaqueCaptureAddressAllocateInfo *memoryDeviceAddress =
+      (const VkMemoryOpaqueCaptureAddressAllocateInfo *)FindNextStruct(
+          pAllocInfo, VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
+
+  if(memoryDeviceAddress)
+  {
+    opaqueAddr = memoryDeviceAddress->opaqueCaptureAddress;
+  }
 }
 
 void VulkanCreationInfo::Memory::SimplifyBindings()
@@ -2334,7 +2523,7 @@ void VulkanCreationInfo::Buffer::Init(VulkanResourceManager *resourceMan, Vulkan
                                       const VkBufferCreateInfo *pCreateInfo,
                                       VkMemoryRequirements origMrq)
 {
-  usage = pCreateInfo->usage;
+  usage = GetBufferUsageFlags(pCreateInfo);
   size = pCreateInfo->size;
   gpuAddress = 0;
 
@@ -2395,6 +2584,8 @@ void VulkanCreationInfo::Image::Init(VulkanResourceManager *resourceMan, VulkanC
     creationFlags |= TextureCategory::ShaderReadWrite;
 
   cube = (pCreateInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? true : false;
+
+  address = 0;
 }
 
 void VulkanCreationInfo::Sampler::Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,
@@ -2531,6 +2722,8 @@ void VulkanCreationInfo::ImageView::Init(VulkanResourceManager *resourceMan, Vul
   {
     minLOD = minLODInfo->minLod;
   }
+
+  isDepthImage = !!(info.m_Image[image].creationFlags & TextureCategory::DepthTarget);
 }
 
 void VulkanCreationInfo::ShaderModule::Init(VulkanResourceManager *resourceMan,
@@ -2806,6 +2999,55 @@ void VulkanCreationInfo::AccelerationStructure::Init(
   offset = pCreateInfo->offset;
   size = pCreateInfo->size;
   type = pCreateInfo->type;
+}
+
+const VulkanCreationInfo::PipelineLayout &VulkanCreationInfo::GetPipelineLayoutInfo(ResourceId rp) const
+{
+  auto it = m_PipelineLayout.find(rp);
+  RDCASSERT(it != m_PipelineLayout.end());
+  return it->second;
+}
+
+const DescSetLayout &VulkanCreationInfo::GetDescSetLayout(ResourceId dsl) const
+{
+  auto it = m_DescSetLayout.find(dsl);
+  RDCASSERT(it != m_DescSetLayout.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::Buffer &VulkanCreationInfo::GetBufferInfo(ResourceId buf) const
+{
+  auto it = m_Buffer.find(buf);
+  RDCASSERT(it != m_Buffer.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::BufferView &VulkanCreationInfo::GetBufferViewInfo(ResourceId bufView) const
+{
+  auto it = m_BufferView.find(bufView);
+  RDCASSERT(it != m_BufferView.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::Image &VulkanCreationInfo::GetImageInfo(ResourceId img) const
+{
+  auto it = m_Image.find(img);
+  RDCASSERT(it != m_Image.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::ImageView &VulkanCreationInfo::GetImageViewInfo(ResourceId imgView) const
+{
+  auto it = m_ImageView.find(imgView);
+  RDCASSERT(it != m_ImageView.end());
+  return it->second;
+}
+
+const VulkanCreationInfo::Sampler &VulkanCreationInfo::GetSamplerInfo(ResourceId samp) const
+{
+  auto it = m_Sampler.find(samp);
+  RDCASSERT(it != m_Sampler.end());
+  return it->second;
 }
 
 void DescUpdateTemplate::Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,

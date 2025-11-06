@@ -2292,8 +2292,12 @@ void D3D12RTManager::PrepareRayDispatchBuffer(GPUAddressRangeTracker *origAddres
                                D3D12GpuBufferHeapMemoryFlag::Default, lookupData.size(), 256,
                                &m_LookupBuffer);
 
-    memcpy(m_LookupBuffer->Map(), lookupData.data(), lookupData.size());
-    m_LookupBuffer->Unmap();
+    void *ptr = m_LookupBuffer ? m_LookupBuffer->Map() : NULL;
+    if(ptr)
+    {
+      memcpy(m_LookupBuffer->Map(), lookupData.data(), lookupData.size());
+      m_LookupBuffer->Unmap();
+    }
 
     D3D12_GPU_VIRTUAL_ADDRESS baseAddr = m_LookupBuffer->Address();
     m_LookupAddrs[0] = baseAddr + ObjectLookupOffset;
@@ -3760,7 +3764,8 @@ void D3D12ResourceManager::ApplyBarriers(BarrierSet &barriers,
 void AddStateResetBarrier(D3D12ResourceLayout srcState, D3D12ResourceLayout dstState,
                           ID3D12Resource *res, UINT subresource, BarrierSet &barriers)
 {
-  if(srcState.IsStates() && dstState.IsStates())
+  if((srcState.IsStates() || srcState.ToLayout() == D3D12_BARRIER_LAYOUT_UNDEFINED) &&
+     dstState.IsStates())
   {
     D3D12_RESOURCE_BARRIER b;
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3770,7 +3775,12 @@ void AddStateResetBarrier(D3D12ResourceLayout srcState, D3D12ResourceLayout dstS
     b.Transition.StateBefore = srcState.ToStates();
     b.Transition.StateAfter = dstState.ToStates();
 
-    barriers.barriers.push_back(b);
+    if(srcState.ToLayout() == D3D12_BARRIER_LAYOUT_UNDEFINED)
+      b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+
+    // could now be identical after silently promoting the before state.
+    if(b.Transition.StateBefore != b.Transition.StateAfter)
+      barriers.barriers.push_back(b);
   }
   else if(srcState.IsLayout() && dstState.IsLayout())
   {

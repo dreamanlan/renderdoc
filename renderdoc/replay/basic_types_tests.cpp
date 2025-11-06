@@ -34,9 +34,29 @@
 #include "common/formatting.h"
 #include "common/globalconfig.h"
 #include "common/timing.h"
+#include "core/rdcbytetrie.h"
 #include "os/os_specific.h"
 
 #include "catch/catch.hpp"
+
+struct TrieValue
+{
+  TrieValue() : id() {}
+  TrieValue(uint32_t id) : id(id) {}
+
+  bool operator==(const TrieValue &o) const { return id == o.id; }
+
+  uint32_t id;
+  uint16_t _trie;
+};
+
+template <>
+rdcstr DoStringise<TrieValue>(const TrieValue &v)
+{
+  return DoStringise(v.id);
+}
+
+using KV = rdcpair<bytebuf, TrieValue>;
 
 template <typename inner>
 void TestInsert()
@@ -2499,5 +2519,432 @@ TEST_CASE("Test rdcfixedarray type", "[basictypes][rdcfixedarray]")
     CHECK(u.u32v[0] == 0);
   };
 };
+
+void Permute(rdcarray<uint32_t> &order, size_t l, rdcarray<rdcarray<uint32_t>> &permutations)
+{
+  if(l == order.size())
+    permutations.push_back(order);
+
+  for(size_t i = l; i < order.size(); ++i)
+  {
+    uint32_t temp = order[l];
+    order[l] = order[i];
+    order[i] = temp;
+
+    Permute(order, l + 1, permutations);
+
+    temp = order[l];
+    order[l] = order[i];
+    order[i] = temp;
+  }
+}
+
+template <typename container>
+void CheckKeyValues(container &trie, KV *keyVals, size_t numKeyVals, const bytebuf &missing)
+{
+  for(size_t i = 0; i <= numKeyVals; i++)
+  {
+    // check all keys added so far are contained and lookup if so
+    for(size_t j = 0; j < numKeyVals; j++)
+    {
+      if(j < i)
+      {
+        CHECK(trie.contains(keyVals[j].first));
+        CHECK(trie.lookup(keyVals[j].first) == keyVals[j].second);
+      }
+      else
+      {
+        CHECK_FALSE(trie.contains(keyVals[j].first));
+      }
+    }
+
+    CHECK_FALSE(trie.contains(missing));
+    CHECK(trie.lookup(missing) == TrieValue());
+
+    // add the key
+    if(i < numKeyVals)
+      CHECK(trie.insert(keyVals[i].first, keyVals[i].second));
+  }
+
+  // duplicate insertion is fine
+  CHECK(trie.insert(keyVals[0].first, keyVals[0].second));
+
+  CHECK(trie.lookup(keyVals[0].first) == keyVals[0].second);
+
+  // differing values is the problem
+  EXPECT_ERROR();
+
+  CHECK_FALSE(trie.insert(keyVals[0].first, keyVals[0].second.id + 1));
+
+  CHECK(DID_ERROR_HAPPEN());
+
+  CHECK(trie.lookup(keyVals[0].first) == keyVals[0].second);
+}
+
+TEST_CASE("Test rdcbytetrie type", "[basictypes][rdcbytetrie]")
+{
+  rdcbytetrie<TrieValue> trie;
+
+  trie.SetStrictErrorChecking(true);
+
+  SECTION("Simple lookups")
+  {
+    KV keyVals[] = {
+        {{1, 1}, 1},
+        {{1, 2}, 2},
+        {{3, 2}, 3},
+    };
+    bytebuf d = {1, 3};
+
+    CheckKeyValues(trie, keyVals, ARRAY_COUNT(keyVals), d);
+  }
+
+  SECTION("different sized keys, expanding length")
+  {
+    KV keyVals[] = {
+        //
+        {{1}, TrieValue(1)},
+        //
+        {{1, 2}, TrieValue(2)},
+        //
+        {{1, 2, 3}, TrieValue(3)},
+        //
+        {{1, 2, 4}, TrieValue(4)},
+        //
+        {{2, 1, 1}, TrieValue(5)},
+        //
+        {{2, 1, 6}, TrieValue(6)},
+        //
+        {{2, 1, 6, 9, 9}, TrieValue(7)},
+    };
+    bytebuf d = {1, 3};
+
+    CheckKeyValues(trie, keyVals, ARRAY_COUNT(keyVals), d);
+  }
+
+  SECTION("different sized keys, contracting length")
+  {
+    KV keyVals[] = {
+        //
+        {{1, 1, 1, 2, 3}, TrieValue(1)},
+        //
+        {{1, 1, 1}, TrieValue(8)},
+        //
+        {{1, 1, 1, 2, 4}, TrieValue(2)},
+        //
+        {{1, 1, 1, 3}, TrieValue(3)},
+        //
+        {{1, 2}, TrieValue(4)},
+        //
+        {{2, 1, 1}, TrieValue(5)},
+        //
+        {{2, 1, 6}, TrieValue(6)},
+        //
+        {{1}, TrieValue(7)},
+    };
+    bytebuf d = {1, 3};
+
+    CheckKeyValues(trie, keyVals, ARRAY_COUNT(keyVals), d);
+  }
+
+  SECTION("Varying key size with common prefixes, adding in all possible orders")
+  {
+    // Create keys in chunks of two identical bytes
+    rdcarray<KV> rawKeyVals;
+    uint32_t id = 1;
+    for(uint32_t i = 0; i < 2; ++i)
+    {
+      for(uint32_t j = 0; j < 2; ++j)
+      {
+        for(uint32_t k = 0; k < 2; ++k)
+        {
+          bytebuf key;
+          key.push_back((byte)(1 + i));
+          key.push_back((byte)(1 + i));
+          key.push_back((byte)(1 + i + j));
+          key.push_back((byte)(1 + i + j));
+          if(k > 0)
+          {
+            key.push_back((byte)(1 + i + j + k));
+            key.push_back((byte)(1 + i + j + k));
+          }
+          KV kv;
+          kv.first = key;
+          kv.second = TrieValue(id);
+          rawKeyVals.push_back(kv);
+          ++id;
+        }
+      }
+    }
+
+    // Insert the keys in all possible orders
+    size_t countKeys = rawKeyVals.size();
+    rdcarray<uint32_t> baseOrder;
+    baseOrder.resize(countKeys);
+    for(uint32_t i = 0; i < countKeys; ++i)
+      baseOrder[i] = i;
+
+    // Eight keys is approx 40,000 permutations
+    rdcarray<rdcarray<uint32_t>> permutations;
+    Permute(baseOrder, 0, permutations);
+
+    for(const rdcarray<uint32_t> &order : permutations)
+    {
+      rdcarray<KV> keyVals;
+      keyVals.resize(countKeys);
+      for(uint32_t i = 0; i < countKeys; ++i)
+      {
+        uint32_t idx = order[i];
+        keyVals[i] = rawKeyVals[idx];
+      }
+      rdcbytetrie<TrieValue> t;
+      // Add all the keys
+      for(size_t i = 0; i < countKeys; i++)
+        CHECK(t.insert(keyVals[i].first, keyVals[i].second));
+
+      // check all keys are contained
+      for(size_t j = 0; j < countKeys; j++)
+      {
+        CHECK(t.contains(keyVals[j].first));
+        CHECK(t.lookup(keyVals[j].first) == keyVals[j].second);
+      }
+    }
+  }
+
+  SECTION("Invalid key size")
+  {
+    bytebuf a;
+
+    a.resize(512);
+
+    TrieValue val(1);
+
+    EXPECT_ERROR();
+    CHECK_FALSE(trie.contains(a));
+    CHECK(DID_ERROR_HAPPEN());
+
+    EXPECT_ERROR();
+    CHECK_FALSE(trie.insert(a, val));
+    CHECK(DID_ERROR_HAPPEN());
+
+    EXPECT_ERROR();
+    CHECK_FALSE(trie.contains(a));
+    CHECK(DID_ERROR_HAPPEN());
+  }
+
+  SECTION("long common prefix with last byte varying")
+  {
+    bytebuf keys[80];
+    TrieValue vals[80];
+
+    keys[0].fill(200, 1);
+    for(uint8_t i = 1; i < 80; i++)
+      keys[i] = keys[0];
+
+    for(uint8_t i = 0; i < 80; i++)
+      keys[i].push_back(2 + i);
+
+    for(uint8_t i = 0; i < 80; i++)
+      CHECK_FALSE(trie.contains(keys[i]));
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      vals[i] = 5 + i;
+      CHECK(trie.insert(keys[i], vals[i]));
+    }
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      CHECK(trie.contains(keys[i]));
+      CHECK(trie.lookup(keys[i]) == vals[i]);
+    }
+  }
+
+  SECTION("first byte varying with long suffix")
+  {
+    bytebuf keys[80];
+    TrieValue vals[80];
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      keys[i].fill(200, 1);
+      keys[i].insert(0, 2 + i);
+    }
+
+    for(uint8_t i = 0; i < 80; i++)
+      CHECK_FALSE(trie.contains(keys[i]));
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      vals[i] = 5 + i;
+      CHECK(trie.insert(keys[i], vals[i]));
+    }
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      CHECK(trie.contains(keys[i]));
+      CHECK(trie.lookup(keys[i]) == vals[i]);
+    }
+  }
+
+  SECTION("middle varying byte with medium prefix/suffix")
+  {
+    bytebuf keys[80];
+    TrieValue vals[80];
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      keys[i].fill(200, 1);
+      keys[i].insert(100, 2 + i);
+    }
+
+    for(uint8_t i = 0; i < 80; i++)
+      CHECK_FALSE(trie.contains(keys[i]));
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      vals[i] = 5 + i;
+      CHECK(trie.insert(keys[i], vals[i]));
+    }
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      CHECK(trie.contains(keys[i]));
+      CHECK(trie.lookup(keys[i]) == vals[i]);
+    }
+  }
+
+  SECTION("middle shared sequences with prefix/suffix")
+  {
+    bytebuf keys[80];
+    TrieValue vals[80];
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      keys[i].fill(150, 1);
+      keys[i].insert(100, i >> 3);
+      keys[i].insert(101, i >> 3);
+
+      keys[i].insert(102, i >> 2);
+      keys[i].insert(103, i >> 2);
+
+      keys[i].insert(104, i);
+    }
+
+    for(uint8_t i = 0; i < 80; i++)
+      CHECK_FALSE(trie.contains(keys[i]));
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      vals[i] = 5 + i;
+      CHECK(trie.insert(keys[i], vals[i]));
+    }
+
+    for(uint8_t i = 0; i < 80; i++)
+    {
+      CHECK(trie.contains(keys[i]));
+      CHECK(trie.lookup(keys[i]) == vals[i]);
+    }
+  }
+
+  SECTION("'real' descriptors of palletised indices")
+  {
+    rdcarray<KV> keyVals;
+
+    struct indices
+    {
+      uint32_t a : 20;
+      uint32_t b : 12;
+    };
+
+    bytebuf k;
+    k.resize(sizeof(indices));
+    indices *i = (indices *)k.data();
+
+    for(uint32_t b = 0; b < 2000; b += 50 + (rand() & 0x3f))
+    {
+      for(uint32_t a = 0; a < 1000000; a += 1000 + (rand() & 0x3fff))
+      {
+        i->a = a;
+        i->b = b;
+
+        keyVals.push_back({k, TrieValue(b + a)});
+      }
+    }
+
+    CheckKeyValues(trie, keyVals.data(), keyVals.size(), bytebuf());
+  }
+
+  SECTION("'real' descriptors of pointer + size")
+  {
+    rdcarray<KV> keyVals;
+
+    struct pointerSize
+    {
+      uint64_t ptr;
+      uint64_t sz;
+    };
+
+    bytebuf k;
+    k.resize(sizeof(pointerSize));
+    pointerSize *p = (pointerSize *)k.data();
+
+    for(uint32_t b = 0; b < 0xfffff; b += 0x8000 + (rand() & 0xfff))
+    {
+      for(uint32_t a = 0; a < 0xfffffff; a += 0x600000 + (rand() & 0xfffff))
+      {
+        p->ptr = 0xdeadbeef + a;
+        p->sz = 0xf00b + b;
+
+        keyVals.push_back({k, TrieValue(b + a)});
+      }
+    }
+
+    CheckKeyValues(trie, keyVals.data(), keyVals.size(), bytebuf());
+  }
+
+  SECTION("'real' descriptors which are large with pointer + size")
+  {
+    rdcarray<KV> keyVals;
+
+    struct pointerSize
+    {
+      uint64_t padding1;
+      uint64_t padding2;
+      uint64_t ptr;
+      uint64_t padding3;
+      uint32_t sz;
+      uint32_t padding4;
+      uint64_t padding5;
+      uint64_t padding6;
+      uint64_t padding7;
+    };
+
+    bytebuf k;
+    k.resize(sizeof(pointerSize));
+    pointerSize *p = (pointerSize *)k.data();
+
+    p->padding1 = 0xDBBAE716BAB4;
+    p->padding2 = 0x3F097C6CC886;
+    p->padding3 = 0xD8D877E8012C;
+    p->padding4 = 0xFB97503B;
+    p->padding5 = 0x43C5E4856EED;
+    p->padding6 = 0x530E8ACF5452;
+    p->padding7 = 0x93D8819988A2;
+
+    for(uint32_t b = 0; b < 0xfffff; b += 0x8000 + (rand() & 0xfff))
+    {
+      for(uint32_t a = 0; a < 0xfffffff; a += 0x600000 + (rand() & 0xfffff))
+      {
+        p->ptr = 0xdeadbeef + a;
+        p->sz = 0xf00b + b;
+
+        keyVals.push_back({k, TrieValue(b + a)});
+      }
+    }
+
+    CheckKeyValues(trie, keyVals.data(), keyVals.size(), bytebuf());
+  }
+}
 
 #endif    // ENABLED(ENABLE_UNIT_TESTS)

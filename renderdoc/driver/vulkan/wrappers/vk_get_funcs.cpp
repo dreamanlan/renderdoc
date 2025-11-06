@@ -30,13 +30,15 @@ static char fakeRenderDocUUID[VK_UUID_SIZE] = {};
 
 void MakeFakeUUID()
 {
-  // assign a fake UUID, so that we get SPIR-V instead of cached pipeline data.
-  // the start is "rdoc", and the end is the time that this call was first made
+  // Assign a fake UUID, so that we get SPIR-V instead of cached shader data, etc.
   if(fakeRenderDocUUID[0] == 0)
   {
-    // 0123456789ABCDEF
-    // rdocyymmddHHMMSS
-    // we pass size+1 so that there's room for a null terminator (the UUID doesn't
+    // The start is "rdoc", and the end is the time that this call was first made
+    //
+    //     0123456789ABCDEF
+    //     rdocyymmddHHMMSS
+    //
+    // We pass size+1 so that there's room for a null terminator (the UUID doesn't
     // need a null terminator as it's a fixed size non-string array)
     rdcstr uuid = StringFormat::sntimef(Timing::GetUTCTime(), "rdoc%y%m%d%H%M%S");
     RDCASSERT(uuid.size() == sizeof(fakeRenderDocUUID));
@@ -82,9 +84,9 @@ void ClampPhysDevAPIVersion(VkPhysicalDeviceProperties *pProperties, VkPhysicalD
     }
   }
 
-  // clamp to highest supported API version, currently vulkan 1.3, because loader no longer does this for us
-  if(pProperties->apiVersion > VK_API_VERSION_1_3)
-    pProperties->apiVersion = VK_API_VERSION_1_3;
+  // clamp to highest supported API version, currently vulkan 1.4, because loader no longer does this for us
+  if(pProperties->apiVersion > VK_API_VERSION_1_4)
+    pProperties->apiVersion = VK_API_VERSION_1_4;
 }
 
 void WrappedVulkan::PatchImageCreateInfo(VkImageCreateInfo *info, VkFormat *newViewFormatsTempMem)
@@ -120,6 +122,8 @@ void WrappedVulkan::PatchImageCreateInfo(VkImageCreateInfo *info, VkFormat *newV
   }
 
   info->flags &= ~VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT;
+
+  info->flags |= DefaultImageCreateFlags();
 
   VkImageStencilUsageCreateInfo *separateStencilUsage =
       (VkImageStencilUsageCreateInfo *)FindNextStruct(
@@ -867,16 +871,81 @@ void WrappedVulkan::vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevi
 
   ClampPhysDevAPIVersion(&pProperties->properties, physicalDevice);
 
-  // internal RenderDoc UUID for shader object binary
-  VkPhysicalDeviceShaderObjectPropertiesEXT *shadObj =
+  // Internal RenderDoc UUID for:
+  //
+  // * Shader object binary, so we always get SPIR-V
+  // * Optimal image layout, so we never get VK_HOST_IMAGE_COPY_MEMCPY_BIT
+  VkPhysicalDeviceShaderObjectPropertiesEXT *shaderObject =
       (VkPhysicalDeviceShaderObjectPropertiesEXT *)FindNextStruct(
           pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_PROPERTIES_EXT);
+  VkPhysicalDeviceHostImageCopyProperties *hostImageCopy =
+      (VkPhysicalDeviceHostImageCopyProperties *)FindNextStruct(
+          pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES);
+  VkPhysicalDeviceVulkan14Properties *vulkan14 = (VkPhysicalDeviceVulkan14Properties *)FindNextStruct(
+      pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_PROPERTIES);
 
-  if(shadObj)
+  if(shaderObject || hostImageCopy || vulkan14)
   {
     MakeFakeUUID();
+  }
 
-    memcpy(shadObj->shaderBinaryUUID, fakeRenderDocUUID, VK_UUID_SIZE);
+  if(shaderObject)
+  {
+    memcpy(shaderObject->shaderBinaryUUID, fakeRenderDocUUID, VK_UUID_SIZE);
+  }
+  if(hostImageCopy)
+  {
+    memcpy(hostImageCopy->optimalTilingLayoutUUID, fakeRenderDocUUID, VK_UUID_SIZE);
+  }
+  if(vulkan14)
+  {
+    memcpy(vulkan14->optimalTilingLayoutUUID, fakeRenderDocUUID, VK_UUID_SIZE);
+  }
+
+  VkPhysicalDeviceDescriptorBufferPropertiesEXT *descBufferProperties =
+      (VkPhysicalDeviceDescriptorBufferPropertiesEXT *)FindNextStruct(
+          pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT);
+
+  // we force the use of robustness, so tweak sizes to be robust sizes as the application doesn't
+  // know we forced robustness
+  if(descBufferProperties)
+  {
+    descBufferProperties->uniformBufferDescriptorSize =
+        descBufferProperties->robustUniformBufferDescriptorSize;
+    descBufferProperties->storageBufferDescriptorSize =
+        descBufferProperties->robustStorageBufferDescriptorSize;
+    descBufferProperties->uniformTexelBufferDescriptorSize =
+        descBufferProperties->robustUniformTexelBufferDescriptorSize;
+    descBufferProperties->storageTexelBufferDescriptorSize =
+        descBufferProperties->robustStorageTexelBufferDescriptorSize;
+
+    // we also may need to shrink some range/address space limits to allow us to expand buffers. We
+    // checked that this should be valid at extension filter time
+
+    // calculate the maximum descriptor size according to the spec
+    size_t maxResourceDescriptorSize = 0;
+#define CALC_MAX_SIZE(prop) \
+  maxResourceDescriptorSize = RDCMAX(maxResourceDescriptorSize, descBufferProperties->prop);
+
+    CALC_MAX_SIZE(storageImageDescriptorSize);
+    CALC_MAX_SIZE(sampledImageDescriptorSize);
+    CALC_MAX_SIZE(robustUniformTexelBufferDescriptorSize);
+    CALC_MAX_SIZE(robustStorageTexelBufferDescriptorSize);
+    CALC_MAX_SIZE(robustUniformBufferDescriptorSize);
+    CALC_MAX_SIZE(robustStorageBufferDescriptorSize);
+    CALC_MAX_SIZE(inputAttachmentDescriptorSize);
+    CALC_MAX_SIZE(accelerationStructureDescriptorSize);
+
+    VkDeviceSize reservedDescriptorSize =
+        AlignUp(VkDeviceSize(maxResourceDescriptorSize * 2),
+                descBufferProperties->descriptorBufferOffsetAlignment);
+
+    descBufferProperties->maxResourceDescriptorBufferRange -= reservedDescriptorSize;
+
+    descBufferProperties->descriptorBufferAddressSpaceSize -=
+        ExpectedMaxNumDescriptorBuffers * reservedDescriptorSize;
+    descBufferProperties->resourceDescriptorBufferAddressSpaceSize -=
+        ExpectedMaxNumDescriptorBuffers * reservedDescriptorSize;
   }
 }
 
@@ -1285,9 +1354,9 @@ VkDeviceSize WrappedVulkan::vkGetRayTracingShaderGroupStackSizeKHR(
                                                                group, groupShader);
 }
 
-void WrappedVulkan::vkGetDeviceImageSubresourceLayoutKHR(VkDevice device,
-                                                         const VkDeviceImageSubresourceInfo *pInfo,
-                                                         VkSubresourceLayout2 *pLayout)
+void WrappedVulkan::vkGetDeviceImageSubresourceLayout(VkDevice device,
+                                                      const VkDeviceImageSubresourceInfo *pInfo,
+                                                      VkSubresourceLayout2 *pLayout)
 {
   size_t tempMemSize = GetNextPatchSize(pInfo);
 
@@ -1307,28 +1376,106 @@ void WrappedVulkan::vkGetDeviceImageSubresourceLayoutKHR(VkDevice device,
 
   PatchImageCreateInfo((VkImageCreateInfo *)unwrappedInfo->pCreateInfo, (VkFormat *)tempMem);
 
-  ObjDisp(device)->GetDeviceImageSubresourceLayoutKHR(Unwrap(device), unwrappedInfo, pLayout);
+  ObjDisp(device)->GetDeviceImageSubresourceLayout(Unwrap(device), unwrappedInfo, pLayout);
 }
 
-void WrappedVulkan::vkGetImageSubresourceLayout2KHR(VkDevice device, VkImage image,
-                                                    const VkImageSubresource2 *pSubresource,
-                                                    VkSubresourceLayout2 *pLayout)
+void WrappedVulkan::vkGetImageSubresourceLayout2(VkDevice device, VkImage image,
+                                                 const VkImageSubresource2 *pSubresource,
+                                                 VkSubresourceLayout2 *pLayout)
 {
-  ObjDisp(device)->GetImageSubresourceLayout2KHR(Unwrap(device), Unwrap(image), pSubresource,
-                                                 pLayout);
+  ObjDisp(device)->GetImageSubresourceLayout2(Unwrap(device), Unwrap(image), pSubresource, pLayout);
+
+  // RenderDoc removes calls with VK_HOST_IMAGE_COPY_MEMCPY_BIT flag, so the
+  // VkSubresourceHostMemcpySize struct chained to VkSubresourceLayout2 is overriden to
+  // provide a fixed size.
+  VkSubresourceHostMemcpySize *memcpySize = (VkSubresourceHostMemcpySize *)FindNextStruct(
+      pLayout, VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE);
+  if(memcpySize)
+    memcpySize->size = 64;
 }
 
-void WrappedVulkan::vkGetRenderingAreaGranularityKHR(VkDevice device,
-                                                     const VkRenderingAreaInfo *pRenderingAreaInfo,
-                                                     VkExtent2D *pGranularity)
+void WrappedVulkan::vkGetRenderingAreaGranularity(VkDevice device,
+                                                  const VkRenderingAreaInfo *pRenderingAreaInfo,
+                                                  VkExtent2D *pGranularity)
 {
-  ObjDisp(device)->GetRenderingAreaGranularityKHR(Unwrap(device), pRenderingAreaInfo, pGranularity);
+  ObjDisp(device)->GetRenderingAreaGranularity(Unwrap(device), pRenderingAreaInfo, pGranularity);
 }
 
 void WrappedVulkan::vkGetImageSubresourceLayout2EXT(VkDevice device, VkImage image,
                                                     const VkImageSubresource2 *pSubresource,
                                                     VkSubresourceLayout2 *pLayout)
 {
-  ObjDisp(device)->GetImageSubresourceLayout2EXT(Unwrap(device), Unwrap(image), pSubresource,
-                                                 pLayout);
+  ObjDisp(device)->GetImageSubresourceLayout2(Unwrap(device), Unwrap(image), pSubresource, pLayout);
+
+  // RenderDoc removes calls with VK_HOST_IMAGE_COPY_MEMCPY_BIT flag, so the
+  // VkSubresourceHostMemcpySize struct chained to VkSubresourceLayout2 is overriden to
+  // provide a fixed size.
+  VkSubresourceHostMemcpySize *memcpySize = (VkSubresourceHostMemcpySize *)FindNextStruct(
+      pLayout, VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE);
+  if(memcpySize)
+    memcpySize->size = 64;
+}
+
+void WrappedVulkan::vkGetDescriptorSetLayoutSizeEXT(VkDevice device, VkDescriptorSetLayout layout,
+                                                    VkDeviceSize *pLayoutSizeInBytes)
+{
+  ObjDisp(device)->GetDescriptorSetLayoutSizeEXT(Unwrap(device), Unwrap(layout), pLayoutSizeInBytes);
+}
+
+void WrappedVulkan::vkGetDescriptorSetLayoutBindingOffsetEXT(VkDevice device,
+                                                             VkDescriptorSetLayout layout,
+                                                             uint32_t binding, VkDeviceSize *pOffset)
+{
+  ObjDisp(device)->GetDescriptorSetLayoutBindingOffsetEXT(Unwrap(device), Unwrap(layout), binding,
+                                                          pOffset);
+}
+
+VkResult WrappedVulkan::vkGetBufferOpaqueCaptureDescriptorDataEXT(
+    VkDevice device, const VkBufferCaptureDescriptorDataInfoEXT *pInfo, void *pData)
+{
+  VkBufferCaptureDescriptorDataInfoEXT unwrappedInfo = *pInfo;
+  unwrappedInfo.buffer = Unwrap(unwrappedInfo.buffer);
+
+  return ObjDisp(device)->GetBufferOpaqueCaptureDescriptorDataEXT(Unwrap(device), &unwrappedInfo,
+                                                                  pData);
+}
+
+VkResult WrappedVulkan::vkGetImageOpaqueCaptureDescriptorDataEXT(
+    VkDevice device, const VkImageCaptureDescriptorDataInfoEXT *pInfo, void *pData)
+{
+  VkImageCaptureDescriptorDataInfoEXT unwrappedInfo = *pInfo;
+  unwrappedInfo.image = Unwrap(unwrappedInfo.image);
+
+  return ObjDisp(device)->GetImageOpaqueCaptureDescriptorDataEXT(Unwrap(device), &unwrappedInfo,
+                                                                 pData);
+}
+
+VkResult WrappedVulkan::vkGetImageViewOpaqueCaptureDescriptorDataEXT(
+    VkDevice device, const VkImageViewCaptureDescriptorDataInfoEXT *pInfo, void *pData)
+{
+  VkImageViewCaptureDescriptorDataInfoEXT unwrappedInfo = *pInfo;
+  unwrappedInfo.imageView = Unwrap(unwrappedInfo.imageView);
+
+  return ObjDisp(device)->GetImageViewOpaqueCaptureDescriptorDataEXT(Unwrap(device), &unwrappedInfo,
+                                                                     pData);
+}
+
+VkResult WrappedVulkan::vkGetSamplerOpaqueCaptureDescriptorDataEXT(
+    VkDevice device, const VkSamplerCaptureDescriptorDataInfoEXT *pInfo, void *pData)
+{
+  VkSamplerCaptureDescriptorDataInfoEXT unwrappedInfo = *pInfo;
+  unwrappedInfo.sampler = Unwrap(unwrappedInfo.sampler);
+
+  return ObjDisp(device)->GetSamplerOpaqueCaptureDescriptorDataEXT(Unwrap(device), &unwrappedInfo,
+                                                                   pData);
+}
+
+VkResult WrappedVulkan::vkGetAccelerationStructureOpaqueCaptureDescriptorDataEXT(
+    VkDevice device, const VkAccelerationStructureCaptureDescriptorDataInfoEXT *pInfo, void *pData)
+{
+  VkAccelerationStructureCaptureDescriptorDataInfoEXT unwrappedInfo = *pInfo;
+  unwrappedInfo.accelerationStructure = Unwrap(unwrappedInfo.accelerationStructure);
+
+  return ObjDisp(device)->GetAccelerationStructureOpaqueCaptureDescriptorDataEXT(
+      Unwrap(device), &unwrappedInfo, pData);
 }

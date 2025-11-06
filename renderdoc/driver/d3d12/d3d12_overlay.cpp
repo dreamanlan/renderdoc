@@ -1515,7 +1515,7 @@ ResourceId D3D12Replay::RenderOverlay(ResourceId texid, FloatVector clearCol, De
 
       list->SetGraphicsRootSignature(m_General.CheckerboardRootSig);
 
-      CheckerboardCBuffer pixelData = {0};
+      CheckerboardCBuffer pixelData = {};
 
       pixelData.BorderWidth = 3;
       pixelData.CheckerSquareDimension = 16.0f;
@@ -1683,7 +1683,7 @@ ResourceId D3D12Replay::RenderOverlay(ResourceId texid, FloatVector clearCol, De
         Vec4f viewport;
 
         if(!rs.views.empty())
-          viewport = Vec4f(rs.views[0].Width, rs.views[0].Height);
+          viewport = Vec4f(rs.views[0].Width, rs.views[0].Height, 0.0f, 0.0f);
 
         D3D12RenderState::SignatureElement viewportElem(eRootCBV, ResourceId(), 0);
         WrappedID3D12Resource::GetResIDFromAddr(
@@ -1991,8 +1991,8 @@ ResourceId D3D12Replay::RenderOverlay(ResourceId texid, FloatVector clearCol, De
         WrappedID3D12PipelineState::ShaderEntry *wrappedPS = pipe->PS();
         if(wrappedPS)
         {
-          ShaderReflection &reflection = pipe->PS()->GetDetails();
-          for(SigParameter &output : reflection.outputSignature)
+          const ShaderReflection &reflection = pipe->PS()->GetDetails();
+          for(const SigParameter &output : reflection.outputSignature)
           {
             if(output.systemValue == ShaderBuiltin::DepthOutput)
               useDepthWriteStencilPass = true;
@@ -2209,6 +2209,12 @@ ResourceId D3D12Replay::RenderOverlay(ResourceId texid, FloatVector clearCol, De
           psoDesc.DepthStencilState.DepthBoundsTestEnable = FALSE;
         }
       }
+
+      if(dsViewDesc.Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH)
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+      if(dsViewDesc.Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL)
+        psoDesc.DepthStencilState.FrontFace.StencilWriteMask =
+            psoDesc.DepthStencilState.BackFace.StencilWriteMask = 0;
 
       RDCEraseEl(psoDesc.RTVFormats.RTFormats);
       psoDesc.RTVFormats.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;

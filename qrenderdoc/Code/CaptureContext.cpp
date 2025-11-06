@@ -158,43 +158,47 @@ CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
 
       bool add_report = false;
 
-      if(CrashDialog::HasCaptureReady(m_Config))
+      if(m_MainWindow->ErrorReportsAllowed())
       {
-        text += tr(
-            "If you think this may be a RenderDoc bug please click the button below to report it, "
-            "but note that this will require you to upload the capture for reproduction as "
-            "otherwise it is impossible to tell what the problem may be.");
-
-        add_report = true;
-      }
-      else if(CrashDialog::CaptureTooLarge(m_Config))
-      {
-        text = tr("<html>%1<br><br>"
-                  "Your capture is too lage to upload as a crash report so this can't be "
-                  "automatically reported. "
-                  "Please email me at <a "
-                  "href=\"mailto:baldurk@baldurk.org?subject=RenderDoc%20Unrecoverable%20error\">"
-                  "baldurk@baldurk.org</a> with information and I can help investigate.</html>")
-                   .arg(text);
-      }
-      else
-      {
-        text += tr("The capture must be saved locally if you want to report this as a bug. ");
-
-        if(Replay().CurrentRemote().IsConnected())
+        if(CrashDialog::HasCaptureReady(m_Config))
         {
           text +=
-              tr("Before closing the capture you can save it to disk and manually report a bug. "
-                 "Please include the capture, or else it will be impossible to tell what the "
-                 "problem may be.");
+              tr("If you think this may be a RenderDoc bug please click the button below to report "
+                 "it, "
+                 "but note that this will require you to upload the capture for reproduction as "
+                 "otherwise it is impossible to tell what the problem may be.");
+
+          add_report = true;
+        }
+        else if(CrashDialog::CaptureTooLarge(m_Config))
+        {
+          text = tr("<html>%1<br><br>"
+                    "Your capture is too lage to upload as a crash report so this can't be "
+                    "automatically reported. "
+                    "Please email me at <a "
+                    "href=\"mailto:baldurk@baldurk.org?subject=RenderDoc%20Unrecoverable%20error\">"
+                    "baldurk@baldurk.org</a> with information and I can help investigate.</html>")
+                     .arg(text);
         }
         else
         {
-          text += tr("You will need to reconnect to the remote server to save the capture.");
+          text += tr("The capture must be saved locally if you want to report this as a bug. ");
+
+          if(Replay().CurrentRemote().IsConnected())
+          {
+            text +=
+                tr("Before closing the capture you can save it to disk and manually report a bug. "
+                   "Please include the capture, or else it will be impossible to tell what the "
+                   "problem may be.");
+          }
+          else
+          {
+            text += tr("You will need to reconnect to the remote server to save the capture.");
+          }
         }
       }
 
-      QMessageBox mb(QMessageBox::Critical, title, text, QMessageBox::Ok, m_MainWindow);
+      QMessageBox mb(QMessageBox::Critical, title, text.trimmed(), QMessageBox::Ok, m_MainWindow);
       mb.setDefaultButton(QMessageBox::NoButton);
       QPushButton *report = NULL;
       if(add_report)
@@ -300,7 +304,7 @@ rdcarray<ExtensionMetadata> CaptureContext::GetInstalledExtensions()
 
   for(QString extensionFolder : PythonContext::GetApplicationExtensionsPaths())
   {
-    QDirIterator it(extensionFolder, QDirIterator::Subdirectories);
+    QDirIterator it(extensionFolder, QDirIterator::Subdirectories | QDirIterator::FollowSymlinks);
 
     while(it.hasNext())
     {
@@ -1739,6 +1743,17 @@ void CaptureContext::AddMessages(const rdcarray<DebugMessage> &msgs)
   }
 }
 
+void CaptureContext::ClearMessages()
+{
+  m_UnreadMessageCount = 0;
+  m_DebugMessages.clear();
+
+  if(m_DebugMessageView)
+  {
+    GUIInvoke::call(m_DebugMessageView, [this]() { m_DebugMessageView->RefreshMessageList(); });
+  }
+}
+
 void CaptureContext::SetNotes(const rdcstr &key, const rdcstr &contents)
 {
   // ignore no-op changes
@@ -1782,6 +1797,11 @@ void CaptureContext::RemoveBookmark(uint32_t EID)
   SetModification(CaptureModifications::Bookmarks);
 
   RefreshUIStatus({}, true, true);
+}
+
+void CaptureContext::DelayedCallback(uint32_t milliseconds, std::function<void()> callback)
+{
+  QTimer::singleShot(milliseconds, callback);
 }
 
 void CaptureContext::SetModification(CaptureModifications mod)

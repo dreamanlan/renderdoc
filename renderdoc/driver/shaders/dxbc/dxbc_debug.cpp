@@ -33,9 +33,6 @@
 #include "dxbc_bytecode.h"
 #include "dxbc_container.h"
 
-RDOC_DEBUG_CONFIG(bool, D3D_Hack_EnableGroups, false,
-                  "Work in progress allow shaders to be debugged with workgroup requirements.");
-
 using namespace DXBCBytecode;
 using namespace DXDebug;
 
@@ -1254,7 +1251,6 @@ void ThreadState::GetGroupsharedSrc(uint32_t gsmIndex, const uint32_t byteOffset
 
   const uint32_t regIndex = byteOffset / gsmStride;
   const uint32_t component = AlignUp4(byteOffset % gsmStride) / 4;
-  RDCASSERT((component + countBytes / sizeof(uint32_t)) < 4, component, countBytes);
 
   uint32_t idx = program->GetRegisterIndex(TYPE_THREAD_GROUP_SHARED_MEMORY, gsmIndex);
   if(idx < variables.size())
@@ -1262,6 +1258,7 @@ void ThreadState::GetGroupsharedSrc(uint32_t gsmIndex, const uint32_t byteOffset
     const ShaderVariable &var = variables[idx].members[regIndex];
     if(gsmStride <= 16)
     {
+      RDCASSERT((component + countBytes / sizeof(uint32_t)) <= 4, component, countBytes);
       // if the stride is less than a float4, the groupshared storage is a simple array of N
       // float4 registers so we can just assign
       for(uint32_t i = 0; i < countBytes / sizeof(uint32_t); i++)
@@ -1748,6 +1745,11 @@ void FlattenSingleVariable(const rdcstr &cbufferName, uint32_t byteOffset, const
     // source mapping.
     // We should not overlap into the next register as that's not allowed.
     memcpy(&outvars[outIdx].value.u32v[outComp], &v.value.u32v[0], sizeof(uint32_t) * v.columns);
+    uint32_t oldColumns = outvars[outIdx].columns;
+    uint32_t newColumns = (uint32_t)(outComp + v.columns);
+    uint32_t numColumns = RDCMAX(oldColumns, newColumns);
+    numColumns = RDCMIN(4U, numColumns);
+    outvars[outIdx].columns = (uint8_t)numColumns;
 
     SourceVariableMapping mapping;
     mapping.name = basename;
@@ -1773,14 +1775,14 @@ void FlattenSingleVariable(const rdcstr &cbufferName, uint32_t byteOffset, const
     {
       outvars[outIdx + reg].rows = 1;
       outvars[outIdx + reg].type = VarType::Unknown;
-      outvars[outIdx + reg].columns = v.columns;
+      outvars[outIdx + reg].columns = v.columns + (uint8_t)outComp;
       outvars[outIdx + reg].flags = v.flags;
     }
 
     if(v.RowMajor())
     {
       for(size_t ri = 0; ri < v.rows; ri++)
-        memcpy(&outvars[outIdx + ri].value.u32v[0], &v.value.u32v[ri * v.columns],
+        memcpy(&outvars[outIdx + ri].value.u32v[outComp], &v.value.u32v[ri * v.columns],
                sizeof(uint32_t) * v.columns);
     }
     else
@@ -2681,9 +2683,10 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
             {
               // otherwise each entry in the groupshared storage array is a series of N
               // component-sized registers so unroll that here and copy into each's first component
-              RDCASSERT(gsmStride <= v->members[i].members.size(), gsmStride,
+              uint32_t countElems = gsmStride / sizeof(uint32_t);
+              RDCASSERT(countElems <= v->members[i].members.size(), countElems,
                         v->members[i].members.size());
-              for(uint32_t c = 0; c < gsmStride; c += sizeof(uint32_t))
+              for(uint32_t c = 0; c < countElems; ++c)
               {
                 memcpy(v->members[i].members[c].value.u32v.data(), data, sizeof(uint32_t));
 
@@ -3060,9 +3063,6 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
                DDY(op.operation == OPCODE_DERIV_RTY_FINE, prevWorkgroup, op.operands[1], op));
       break;
 
-    /////////////////////////////////////////////////////////////////////////////////////////////////////
-    // Buffer/Texture load and store
-
     // handle atomic operations all together
     case OPCODE_ATOMIC_IADD:
     case OPCODE_ATOMIC_IMAX:
@@ -3252,6 +3252,9 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       break;
     }
 
+    /////////////////////////////////////////////////////////////////////////////////////////////////////
+    // Buffer/Texture load and store
+
     // store and load paths are mostly identical
     case OPCODE_STORE_UAV_TYPED:
     case OPCODE_STORE_RAW:
@@ -3402,6 +3405,9 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           fmt.stride = 0;
         }
         texData = false;
+
+        if(op.operation == OPCODE_LD_RAW || op.operation == OPCODE_STORE_RAW)
+          stride = 1;
       }
       else
       {
@@ -4875,8 +4881,7 @@ ShaderDebugTrace *InterpretDebugger::BeginDebug(const DXBC::DXBCContainer *dxbcC
   if(dxbc->m_Type == DXBC::ShaderType::Compute &&
      dxbcContainer->GetThreadScope() == DXBC::ThreadScope::Workgroup)
   {
-    if(D3D_Hack_EnableGroups())
-      workgroupSize = numthreads[0] * numthreads[1] * numthreads[2];
+    workgroupSize = numthreads[0] * numthreads[1] * numthreads[2];
   }
 
   for(int i = 0; i < workgroupSize; i++)
@@ -5376,7 +5381,10 @@ rdcarray<ShaderDebugState> InterpretDebugger::ContinueDebug(DXBCDebug::DebugAPIW
     steps++;
   }
 
-  rdcarray<DXBCDebug::ThreadState> oldworkgroup = workgroup;
+  rdcarray<DXBCDebug::ThreadState> oldworkgroup;
+
+  if(active.GetType() == DXBC::ShaderType::Pixel)
+    oldworkgroup = workgroup;
 
   rdcarray<bool> activeMask;
 
@@ -5390,8 +5398,11 @@ rdcarray<ShaderDebugState> InterpretDebugger::ContinueDebug(DXBCDebug::DebugAPIW
     // set up the old workgroup so that cross-workgroup/cross-quad operations (e.g. DDX/DDY) get
     // consistent results even when we step the quad out of order. Otherwise if an operation reads
     // and writes from the same register we'd trash data needed for other workgroup elements.
-    for(size_t i = 0; i < oldworkgroup.size(); i++)
-      oldworkgroup[i].variables = workgroup[i].variables;
+    if(active.GetType() == DXBC::ShaderType::Pixel)
+    {
+      for(size_t i = 0; i < oldworkgroup.size(); i++)
+        oldworkgroup[i].variables = workgroup[i].variables;
+    }
 
     // calculate the current mask of which threads are active
     CalcActiveMask(activeMask);

@@ -2754,26 +2754,27 @@ void TextureViewer::render_keyPress(QKeyEvent *e)
 
   bool nudged = false;
 
-  int increment = 1 << (int)m_TexDisplay.subresource.mip;
+  uint32_t mipx = MipCoordFromBase(m_PickedPoint.x(), texptr->width);
+  uint32_t mipy = MipCoordFromBase(m_PickedPoint.y(), texptr->height);
 
   if(e->key() == Qt::Key_Up && m_PickedPoint.y() > 0)
   {
-    m_PickedPoint -= QPoint(0, increment);
+    m_PickedPoint.setY(BaseCoordFromMip(mipy - 1, texptr->height));
     nudged = true;
   }
   else if(e->key() == Qt::Key_Down && m_PickedPoint.y() < (int)texptr->height - 1)
   {
-    m_PickedPoint += QPoint(0, increment);
+    m_PickedPoint.setY(BaseCoordFromMip(mipy + 1, texptr->height));
     nudged = true;
   }
   else if(e->key() == Qt::Key_Left && m_PickedPoint.x() > 0)
   {
-    m_PickedPoint -= QPoint(increment, 0);
+    m_PickedPoint.setX(BaseCoordFromMip(mipx - 1, texptr->width));
     nudged = true;
   }
   else if(e->key() == Qt::Key_Right && m_PickedPoint.x() < (int)texptr->width - 1)
   {
-    m_PickedPoint += QPoint(increment, 0);
+    m_PickedPoint.setX(BaseCoordFromMip(mipx + 1, texptr->width));
     nudged = true;
   }
 
@@ -3294,15 +3295,14 @@ void TextureViewer::OnEventChanged(uint32_t eventId)
 
         // if the last range is contiguous with this access, append this access as a new range to query
         if(!ranges.empty() && ranges.back().descriptorSize == update.access.byteSize &&
-           ranges.back().offset + ranges.back().descriptorSize == update.access.byteOffset)
+           ranges.back().offset + ranges.back().descriptorSize == update.access.byteOffset &&
+           ranges.back().type == update.access.type)
         {
           ranges.back().count++;
           continue;
         }
 
-        DescriptorRange range;
-        range.offset = update.access.byteOffset;
-        range.descriptorSize = update.access.byteSize;
+        DescriptorRange range = update.access;
         ranges.push_back(range);
       }
 
@@ -3520,7 +3520,9 @@ void TextureViewer::on_zoomOption_currentIndexChanged(int index)
 
 void TextureViewer::zoomOption_returnPressed()
 {
-  UI_SetScale(GetZoomLevel());
+  ui->fitToWindow->setChecked(false);
+  float zoom = GetZoomLevel();
+  UI_SetScale(zoom);
 }
 
 void TextureViewer::on_overlay_currentIndexChanged(int index)
@@ -4143,7 +4145,7 @@ void TextureViewer::on_debugPixelContext_clicked()
   if(!trace)
   {
     if(m_Ctx.APIProps().pixelHistory)
-      on_pixelHistory_clicked();
+      ShowPixelHistory(true);
     else
       RDDialog::critical(this, tr("Debug Error"), tr("Error debugging pixel."));
     return;
@@ -4160,6 +4162,11 @@ void TextureViewer::on_debugPixelContext_clicked()
 }
 
 void TextureViewer::on_pixelHistory_clicked()
+{
+  ShowPixelHistory(false);
+}
+
+void TextureViewer::ShowPixelHistory(bool failedDebug)
 {
   TextureDescription *texptr = GetCurrentTexture();
 
@@ -4178,6 +4185,9 @@ void TextureViewer::on_pixelHistory_clicked()
 
   uint32_t view = m_TexDisplay.subresource.slice - m_Following.GetFirstArraySlice(m_Ctx);
   IPixelHistoryView *hist = m_Ctx.ViewPixelHistory(texptr->resourceId, x, y, view, m_TexDisplay);
+
+  if(failedDebug)
+    hist->SetFailedDebug();
 
   m_Ctx.AddDockWindow(hist->Widget(), DockReference::TransientPopupArea, this, 0.3f);
 

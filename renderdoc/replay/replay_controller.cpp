@@ -58,6 +58,7 @@ ReplayController::ReplayController()
 
 ReplayController::~ReplayController()
 {
+  RenderDoc::Inst().UnregisterMemoryRegion(this);
   CHECK_REPLAY_THREAD();
 }
 
@@ -1971,6 +1972,7 @@ void ReplayController::Shutdown()
     m_pDevice->Shutdown();
   m_pDevice = NULL;
 
+  RenderDoc::Inst().ClearTrackedFiles();
   delete this;
 }
 
@@ -2010,6 +2012,8 @@ bool ReplayController::FatalErrorCheck()
     m_D3D12PipelineState = D3D12Pipe::State();
     m_GLPipelineState = GLPipe::State();
     m_VulkanPipelineState = VKPipe::State();
+
+    m_PipeState.SetDescriptorAccess({}, {}, {});
 
     return true;
   }

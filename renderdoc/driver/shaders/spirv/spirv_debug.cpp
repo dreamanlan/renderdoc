@@ -36,7 +36,7 @@
 
 using namespace rdcshaders;
 
-#if defined(RELEASE)
+#if ENABLED(RDOC_RELEASE)
 #define CHECK_DEBUGGER_THREAD() \
   do                            \
   {                             \
@@ -44,7 +44,7 @@ using namespace rdcshaders;
 #else
 #define CHECK_DEBUGGER_THREAD() \
   RDCASSERTMSG("Function called from non-debugger thread!", debugger.IsDeviceThread());
-#endif    // #if defined(RELEASE)
+#endif    // #if ENABLED(RDOC_RELEASE)
 
 static bool ContainsNaNInf(const ShaderVariable &var)
 {
@@ -174,9 +174,14 @@ static ShaderVariable MakeIdentity(const rdcspv::DataType &type, float val, bool
 
 namespace rdcspv
 {
-ThreadState::ThreadState(Debugger &debug, const GlobalState &globalState)
-    : debugger(debug), global(globalState)
+ThreadState::ThreadState(Debugger &debug, const GlobalState &globalState, ShaderStage stage,
+                         ShaderFeatures shaderFeatures)
+    : debugger(debug), global(globalState), features(shaderFeatures)
 {
+  // Default to Coarse, choose Fine for compute shaders
+  defaultDeriveType = DerivType::Coarse;
+  if(stage == ShaderStage::Compute)
+    defaultDeriveType = DerivType::Fine;
 }
 
 ThreadState::~ThreadState()
@@ -387,6 +392,10 @@ DeviceOpResult ThreadState::WritePointerValue(Id pointer, const ShaderVariable &
     if(opResult == DeviceOpResult::NeedsDevice)
       return DeviceOpResult::NeedsDevice;
 
+    // Mark the pointer as being live
+    bool wasLive = SetLive(pointer);
+    bool baseWasLive = (pointer == ptrid) ? wasLive : live.contains(ptrid);
+
     rdcarray<ShaderVariableChange> changes;
     rdcarray<Id> &pointers = pointersForId[ptrid];
 
@@ -429,12 +438,14 @@ DeviceOpResult ThreadState::WritePointerValue(Id pointer, const ShaderVariable &
     // it's a no-op change
     int ptrIdx = pointers.indexOf(pointer);
 
+    bool aliasChangeAdded = false;
     if(ptrIdx >= 0)
     {
       if(pointer != ptrid)
       {
         pendingDebugState.changes.push_back(changes[ptrIdx]);
         changes.erase(ptrIdx);
+        aliasChangeAdded = true;
       }
     }
 
@@ -450,12 +461,56 @@ DeviceOpResult ThreadState::WritePointerValue(Id pointer, const ShaderVariable &
     opResult = debugger.GetPointerValue(ids[ptrid], basechange.after);
     SPIRV_DEBUG_RDCASSERTEQUAL(opResult, DeviceOpResult::Succeeded);
 
-    // if this is the first local write, mark this variable as becoming alive here, instead of at
-    // its declaration
-    if(firstLocalWrite)
-      basechange.before = {};
+    bool includeBaseChange = false;
 
-    pendingDebugState.changes.push_back(basechange);
+    // Generate a change for the base pointer if it is live in this scope
+    if(!includeBaseChange && live.contains(ptrid))
+      includeBaseChange = true;
+
+    // Generate a change for the base pointer if it is not live in any outer scopes
+    if(!includeBaseChange)
+    {
+      bool foundIt = false;
+      for(size_t i = 0; i < callstack.size() - 1; ++i)
+      {
+        foundIt = callstack[i]->live.contains(ptrid);
+        if(foundIt)
+          break;
+      }
+      if(!foundIt)
+      {
+        includeBaseChange = true;
+        baseWasLive = false;
+      }
+    }
+
+    // This should not happen
+    if(!includeBaseChange && !aliasChangeAdded)
+    {
+      RDCWARN("Base pointer is not live and no aliased pointer detected, adding base change");
+      includeBaseChange = true;
+    }
+
+    // there should always be a change writing direct to the base pointer
+    if(!includeBaseChange && (pointer == ptrid))
+    {
+      RDCWARN("Base pointer is not live and writing direct to pointer, adding base change");
+      includeBaseChange = true;
+    }
+
+    if(includeBaseChange)
+    {
+      // mark this variable as becoming alive here,
+      // if this is the first local write (instead of at its declaration)
+      if(firstLocalWrite)
+        basechange.before = {};
+
+      if(!baseWasLive)
+        basechange.before = {};
+
+      pendingDebugState.changes.push_back(basechange);
+      SetLive(ptrid);
+    }
 
     if(ptrIdx == -1)
       pointers.push_back(pointer);
@@ -487,6 +542,19 @@ void ThreadState::DebugBreak()
 {
   if(hasDebugState)
     pendingDebugState.flags |= ShaderEvents::DebugBreak;
+}
+
+bool ThreadState::SetLive(Id id)
+{
+  bool wasLive = false;
+  if(hasDebugState)
+  {
+    auto it = std::lower_bound(live.begin(), live.end(), id);
+    wasLive = (it != live.end() && *it == id);
+    if(!wasLive)
+      live.insert(it - live.begin(), id);
+  }
+  return wasLive;
 }
 
 void ThreadState::SetDst(Id id, const ShaderVariable &val)
@@ -525,14 +593,7 @@ void ThreadState::SetDst(Id id, const ShaderVariable &val)
 
   lastWrite[id] = hasDebugState ? stepIndex : nextInstruction;
 
-  bool wasLive = false;
-  if(hasDebugState)
-  {
-    auto it = std::lower_bound(live.begin(), live.end(), id);
-    wasLive = (it != live.end() && *it == id);
-    if(!wasLive)
-      live.insert(it - live.begin(), id);
-  }
+  bool wasLive = SetLive(id);
 
   if(val.type == VarType::GPUPointer && !debugger.IsPhysicalPointer(val))
   {
@@ -577,6 +638,8 @@ void ThreadState::ProcessScopeChange(const rdcarray<Id> &oldLive, const rdcarray
   {
     if(liveGlobals.contains(id))
       continue;
+    if(newLive.contains(id))
+      continue;
 
     DeviceOpResult opResult = debugger.GetPointerValue(ids[id], val);
     SPIRV_DEBUG_RDCASSERTEQUAL(opResult, DeviceOpResult::Succeeded);
@@ -594,6 +657,8 @@ void ThreadState::ProcessScopeChange(const rdcarray<Id> &oldLive, const rdcarray
   for(const Id &id : newLive)
   {
     if(liveGlobals.contains(id))
+      continue;
+    if(oldLive.contains(id))
       continue;
 
     DeviceOpResult opResult = debugger.GetPointerValue(ids[id], val);
@@ -616,6 +681,14 @@ ShaderVariable ThreadState::CalcDeriv(ThreadState::DerivDir dir, ThreadState::De
                                                debugger.GetHumanName(val).c_str()));
     return ShaderVariable("", 0.0f, 0.0f, 0.0f, 0.0f);
   }
+  if(!(features & ShaderFeatures::Derivatives))
+  {
+    debugger.AddDebugMessage(
+        MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+        StringFormat::Fmt("Derivative calculation within shader without support for derivatives %s",
+                          debugger.GetHumanName(val).c_str()));
+    return ShaderVariable("", 0.0f, 0.0f, 0.0f, 0.0f);
+  }
 
   RDCASSERT(quadNeighbours[0] < workgroup.size(), quadNeighbours[0], workgroup.size());
   RDCASSERT(quadNeighbours[1] < workgroup.size(), quadNeighbours[1], workgroup.size());
@@ -623,7 +696,7 @@ ShaderVariable ThreadState::CalcDeriv(ThreadState::DerivDir dir, ThreadState::De
   RDCASSERT(quadNeighbours[3] < workgroup.size(), quadNeighbours[3], workgroup.size());
 
   const bool xdirection = (dir == DDX);
-  if(type == Coarse)
+  if(type == DerivType::Coarse)
   {
     // coarse derivatives are identical across the quad, based on the top-left.
     a = &workgroup[quadNeighbours[0]];
@@ -1120,6 +1193,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     // spec allows the implementation to choose what DPdx means (coarse or fine), so we choose
     // coarse which seems a reasonable default. In future we could driver-detect the selection in
     // use (assuming it's not dynamic base on circumstances)
+    // Compute shaders use Fine by default
     case Op::DPdx:
     case Op::DPdy:
     case Op::DPdxCoarse:
@@ -1134,9 +1208,11 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       if(opdata.op == Op::DPdy || opdata.op == Op::DPdyCoarse || opdata.op == Op::DPdyFine)
         dir = DDY;
 
-      DerivType type = Coarse;
+      DerivType type = defaultDeriveType;
       if(opdata.op == Op::DPdxFine || opdata.op == Op::DPdyFine)
-        type = Fine;
+        type = DerivType::Fine;
+      if(opdata.op == Op::DPdxCoarse || opdata.op == Op::DPdyCoarse)
+        type = DerivType::Coarse;
 
       SetDst(deriv.result, CalcDeriv(dir, type, workgroup, deriv.p));
 
@@ -1149,9 +1225,9 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       // these all share a format
       OpFwidth deriv(it);
 
-      DerivType type = Coarse;
+      DerivType type = DerivType::Coarse;
       if(opdata.op == Op::FwidthFine)
-        type = Fine;
+        type = DerivType::Fine;
 
       ShaderVariable var = CalcDeriv(DDX, type, workgroup, deriv.p);
       ShaderVariable ddy = CalcDeriv(DDY, type, workgroup, deriv.p);
@@ -3022,7 +3098,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         OpGroupNonUniformBroadcast group(it);
         RDCASSERT(uintComp(GetSrc(group.execution), 0) == (uint32_t)Scope::Subgroup);
         value = group.value;
-        lane = firstLaneInSub + uintComp(GetSrc(group.id), 0);
+        lane = firstLaneInSub + uintComp(GetSrc(group.invocationId), 0);
       }
       else if(opdata.op == Op::GroupNonUniformQuadBroadcast)
       {
@@ -3086,7 +3162,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         OpGroupNonUniformShuffle group(it);
         RDCASSERT(uintComp(GetSrc(group.execution), 0) == (uint32_t)Scope::Subgroup);
         value = group.value;
-        lane = firstLaneInSub + uintComp(GetSrc(group.id), 0);
+        lane = firstLaneInSub + uintComp(GetSrc(group.invocationId), 0);
       }
       else if(opdata.op == Op::GroupNonUniformShuffleXor ||
               opdata.op == Op::GroupNonUniformShuffleUp ||
@@ -3844,8 +3920,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       if(derivId != Id())
       {
         // calculate DDX/DDY in coarse fashion
-        ddxCalc = CalcDeriv(DDX, Coarse, workgroup, derivId);
-        ddyCalc = CalcDeriv(DDY, Coarse, workgroup, derivId);
+        ddxCalc = CalcDeriv(DDX, DerivType::Coarse, workgroup, derivId);
+        ddyCalc = CalcDeriv(DDY, DerivType::Coarse, workgroup, derivId);
       }
 
       // if we have a dynamically combined image sampler, split it up here
@@ -4995,7 +5071,6 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::HitObjectIsMissNV:
     case Op::ReorderThreadWithHitObjectNV:
     case Op::ReorderThreadWithHintNV:
-    case Op::TypeHitObjectNV:
     case Op::ColorAttachmentReadEXT:
     case Op::DepthAttachmentReadEXT:
     case Op::StencilAttachmentReadEXT:
@@ -5006,7 +5081,6 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::RayQueryGetIntersectionTriangleVertexPositionsKHR:
     case Op::ConvertBF16ToFINTEL:
     case Op::ConvertFToBF16INTEL:
-    case Op::TypeCooperativeMatrixKHR:
     case Op::CooperativeMatrixLoadKHR:
     case Op::CooperativeMatrixStoreKHR:
     case Op::CooperativeMatrixMulAddKHR:
@@ -5027,6 +5101,65 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::ConstantCompositeReplicateEXT:
     case Op::SpecConstantCompositeReplicateEXT:
     case Op::RawAccessChainNV:
+    case Op::CreateTensorLayoutNV:
+    case Op::CreateTensorViewNV:
+    case Op::TensorViewSetClipNV:
+    case Op::TensorViewSetDimensionNV:
+    case Op::TensorViewSetStrideNV:
+    case Op::TensorLayoutSetDimensionNV:
+    case Op::TensorLayoutSetBlockSizeNV:
+    case Op::TensorLayoutSetClampValueNV:
+    case Op::TensorLayoutSetStrideNV:
+    case Op::TensorLayoutSliceNV:
+    case Op::RayQueryGetIntersectionClusterIdNV:
+    case Op::RayQueryIsSphereHitNV:
+    case Op::RayQueryIsLSSHitNV:
+    case Op::RayQueryGetIntersectionLSSHitValueNV:
+    case Op::RayQueryGetIntersectionLSSPositionsNV:
+    case Op::RayQueryGetIntersectionLSSRadiiNV:
+    case Op::RayQueryGetIntersectionSpherePositionNV:
+    case Op::RayQueryGetIntersectionSphereRadiusNV:
+    case Op::HitObjectIsLSSHitNV:
+    case Op::HitObjectIsSphereHitNV:
+    case Op::HitObjectGetLSSPositionsNV:
+    case Op::HitObjectGetLSSRadiiNV:
+    case Op::HitObjectGetSpherePositionNV:
+    case Op::HitObjectGetSphereRadiusNV:
+    case Op::HitObjectGetClusterIdNV:
+    case Op::CooperativeMatrixConvertNV:
+    case Op::CooperativeMatrixReduceNV:
+    case Op::CooperativeMatrixLoadTensorNV:
+    case Op::CooperativeMatrixStoreTensorNV:
+    case Op::CooperativeMatrixPerElementOpNV:
+    case Op::CooperativeMatrixTransposeNV:
+    case Op::CooperativeVectorLoadNV:
+    case Op::CooperativeVectorStoreNV:
+    case Op::CooperativeVectorMatrixMulAddNV:
+    case Op::CooperativeVectorMatrixMulNV:
+    case Op::CooperativeVectorOuterProductAccumulateNV:
+    case Op::CooperativeVectorReduceSumAccumulateNV:
+    case Op::GraphARM:
+    case Op::GraphConstantARM:
+    case Op::GraphEntryPointARM:
+    case Op::GraphInputARM:
+    case Op::GraphSetOutputARM:
+    case Op::GraphEndARM:
+    case Op::ArithmeticFenceEXT:
+    case Op::EnqueueNodePayloadsAMDX:
+    case Op::IsNodePayloadValidAMDX:
+    case Op::UntypedGroupAsyncCopyKHR:
+    case Op::UntypedVariableKHR:
+    case Op::UntypedAccessChainKHR:
+    case Op::UntypedInBoundsAccessChainKHR:
+    case Op::UntypedInBoundsPtrAccessChainKHR:
+    case Op::UntypedPtrAccessChainKHR:
+    case Op::UntypedArrayLengthKHR:
+    case Op::UntypedPrefetchKHR:
+    case Op::BitCastArrayQCOM:
+    case Op::CompositeConstructCoopMatQCOM:
+    case Op::CompositeExtractCoopMatQCOM:
+    case Op::ExtractSubArrayQCOM:
+    case Op::FmaKHR:
     {
       RDCERR("Unsupported extension opcode used %s", ToStr(opdata.op).c_str());
 
@@ -5093,19 +5226,15 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::ModuleProcessed:
     case Op::ExecutionModeId:
     case Op::TypeUntypedPointerKHR:
-    case Op::UntypedVariableKHR:
-    case Op::UntypedAccessChainKHR:
-    case Op::UntypedInBoundsAccessChainKHR:
-    case Op::UntypedInBoundsPtrAccessChainKHR:
-    case Op::UntypedPtrAccessChainKHR:
-    case Op::UntypedArrayLengthKHR:
-    case Op::UntypedPrefetchKHR:
     case Op::TypeNodePayloadArrayAMDX:
     case Op::ConstantStringAMDX:
     case Op::SpecConstantStringAMDX:
     case Op::TypeCooperativeVectorNV:
     case Op::TypeTensorLayoutNV:
     case Op::TypeTensorViewNV:
+    case Op::TypeGraphARM:
+    case Op::TypeHitObjectNV:
+    case Op::TypeCooperativeMatrixKHR:
     {
       RDCERR("Encountered unexpected global SPIR-V operation %s", ToStr(opdata.op).c_str());
       break;
@@ -5171,69 +5300,35 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::TypePipeStorage:
     case Op::ConstantPipeStorage:
     case Op::CreatePipeFromPipeStorage:
-    case Op::FPGARegINTEL:
-    case Op::ReadPipeBlockingINTEL:
-    case Op::WritePipeBlockingINTEL:
     case Op::ControlBarrierArriveINTEL:
     case Op::ControlBarrierWaitINTEL:
-    case Op::ArithmeticFenceEXT:
     case Op::SubgroupMatrixMultiplyAccumulateINTEL:
-    case Op::EnqueueNodePayloadsAMDX:
-    case Op::IsNodePayloadValidAMDX:
     case Op::SubgroupBlockPrefetchINTEL:
     case Op::Subgroup2DBlockLoadINTEL:
     case Op::Subgroup2DBlockLoadTransformINTEL:
     case Op::Subgroup2DBlockLoadTransposeINTEL:
     case Op::Subgroup2DBlockPrefetchINTEL:
     case Op::Subgroup2DBlockStoreINTEL:
-    case Op::CreateTensorLayoutNV:
-    case Op::CreateTensorViewNV:
-    case Op::TensorViewSetClipNV:
-    case Op::TensorViewSetDimensionNV:
-    case Op::TensorViewSetStrideNV:
-    case Op::TensorLayoutSetDimensionNV:
-    case Op::TensorLayoutSetBlockSizeNV:
-    case Op::TensorLayoutSetClampValueNV:
-    case Op::TensorLayoutSetStrideNV:
-    case Op::TensorLayoutSliceNV:
-    case Op::RayQueryGetClusterIdNV:
-    case Op::RayQueryIsSphereHitNV:
-    case Op::RayQueryIsLSSHitNV:
-    case Op::RayQueryGetIntersectionLSSHitValueNV:
-    case Op::RayQueryGetIntersectionLSSPositionsNV:
-    case Op::RayQueryGetIntersectionLSSRadiiNV:
-    case Op::RayQueryGetIntersectionSpherePositionNV:
-    case Op::RayQueryGetIntersectionSphereRadiusNV:
-    case Op::HitObjectIsLSSHitNV:
-    case Op::HitObjectIsSphereHitNV:
-    case Op::HitObjectGetLSSPositionsNV:
-    case Op::HitObjectGetLSSRadiiNV:
-    case Op::HitObjectGetSpherePositionNV:
-    case Op::HitObjectGetSphereRadiusNV:
-    case Op::HitObjectGetClusterIdNV:
-    case Op::CooperativeMatrixConvertNV:
-    case Op::CooperativeMatrixReduceNV:
-    case Op::CooperativeMatrixLoadTensorNV:
-    case Op::CooperativeMatrixStoreTensorNV:
-    case Op::CooperativeMatrixPerElementOpNV:
-    case Op::CooperativeMatrixTransposeNV:
-    case Op::CooperativeVectorLoadNV:
-    case Op::CooperativeVectorStoreNV:
-    case Op::CooperativeVectorMatrixMulAddNV:
-    case Op::CooperativeVectorMatrixMulNV:
-    case Op::CooperativeVectorOuterProductAccumulateNV:
-    case Op::CooperativeVectorReduceSumAccumulateNV:
     case Op::TypeTensorARM:
     case Op::TensorReadARM:
     case Op::TensorWriteARM:
     case Op::TensorQuerySizeARM:
-    case Op::TaskSequenceAsyncINTEL:
-    case Op::TaskSequenceCreateINTEL:
-    case Op::TaskSequenceGetINTEL:
-    case Op::TaskSequenceReleaseINTEL:
-    case Op::TypeTaskSequenceINTEL:
     case Op::BitwiseFunctionINTEL:
     case Op::RoundFToTF32INTEL:
+    case Op::SaveMemoryINTEL:
+    case Op::RestoreMemoryINTEL:
+    case Op::VariableLengthArrayINTEL:
+    case Op::UntypedVariableLengthArrayINTEL:
+    case Op::ConditionalEntryPointINTEL:
+    case Op::ConditionalCapabilityINTEL:
+    case Op::ConditionalExtensionINTEL:
+    case Op::SpecConstantArchitectureINTEL:
+    case Op::SpecConstantTargetINTEL:
+    case Op::ConvertHandleToImageINTEL:
+    case Op::ConvertHandleToSampledImageINTEL:
+    case Op::ConvertHandleToSamplerINTEL:
+    case Op::SpecConstantCapabilitiesINTEL:
+    case Op::ConditionalCopyObjectINTEL:
     {
       // these are kernel only
       RDCERR("Encountered unexpected kernel SPIR-V operation %s", ToStr(opdata.op).c_str());

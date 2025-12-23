@@ -40,6 +40,9 @@ RDOC_CONFIG(rdcstr, Vulkan_Debug_PSDebugDumpDirPath, "",
 RDOC_CONFIG(bool, Vulkan_Debug_ShaderDebugLogging, false,
             "Output verbose debug logging messages when debugging shaders.");
 
+RDOC_CONFIG(bool, Vulkan_Debug_EnableShaderDebugMT, true,
+            "Use multiple threads to run the shader debugger simulation.");
+
 // needed for old linux compilers
 namespace std
 {
@@ -64,11 +67,6 @@ enum class ShaderDebugBind
   Constants = 8,
   Count,
   MathResult = 9,
-};
-
-struct Vec3i
-{
-  int32_t x, y, z;
 };
 
 struct GatherOffsets
@@ -122,12 +120,12 @@ struct ShaderUniformParameters
   float minlod;
 };
 
-#if defined(RELEASE)
+#if ENABLED(RDOC_RELEASE)
 #define CHECK_DEVICE_THREAD()
 #else
 #define CHECK_DEVICE_THREAD() \
   RDCASSERTMSG("API Wrapper function called from non-device thread!", IsDeviceThread());
-#endif    // #if defined(RELEASE)
+#endif    // #if ENABLED(RDOC_RELEASE)
 
 class VulkanAPIWrapper : public rdcspv::DebugAPIWrapper
 {
@@ -292,6 +290,10 @@ public:
     m_pDriver->AddDebugMessage(cat, sev, src, desc);
   }
 
+  virtual GraphicsAPI GetGraphicsAPI() override { return GraphicsAPI::Vulkan; }
+
+  virtual bool SimulateThreaded() override { return Vulkan_Debug_EnableShaderDebugMT(); }
+
   virtual ResourceId GetShaderID() override { return m_ShaderID; }
 
   virtual uint64_t GetBufferLength(const ShaderBindIndex &bind) override
@@ -304,6 +306,11 @@ public:
     RDCASSERT(succeeded);
     RDCASSERTEQUAL(opResult, rdcspv::DeviceOpResult::Succeeded);
     return length;
+  }
+
+  virtual void ReadLocationValue(int32_t location, ShaderVariable &var) override
+  {
+    RDCERR("Invalid by-location read");
   }
 
   virtual void ReadBufferValue(const ShaderBindIndex &bind, uint64_t offset, uint64_t byteSize,
@@ -1261,6 +1268,13 @@ public:
             uniformParams.ddx[i] = floatComp(ddxCalc, i);
             uniformParams.ddy[i] = floatComp(ddyCalc, i);
           }
+        }
+        if((opcode == rdcspv::Op::ImageSampleProjDrefExplicitLod) ||
+           (opcode == rdcspv::Op::ImageSampleProjDrefImplicitLod))
+        {
+          RDCASSERT(useCompare);
+          float q = floatComp(uv, coords);
+          uniformParams.compare /= q;
         }
 
         break;
@@ -3561,64 +3575,6 @@ enum class SubgroupCapability : uint32_t
 static const uint32_t validMagicNumber = 12345;
 static const uint32_t NumReservedBindings = 1;
 
-// things we need to readback once per hit thread
-struct ResultDataBase
-{
-  Vec4f pos;
-
-  uint32_t prim;
-  uint32_t sample;
-  uint32_t view;
-  uint32_t valid;
-
-  float ddxDerivCheck;
-  uint32_t quadLaneIndex;
-  uint32_t laneIndex;
-  uint32_t subgroupSize;
-
-  uint32_t globalBallot[4];
-  uint32_t electBallot[4];
-  uint32_t helperBallot[4];
-
-  uint32_t numSubgroups;    // may be packed oddly so we don't assume we can calculate
-  uint32_t padding[3];
-
-  // LaneData lanes[N]
-  // each LaneData is prefixed by the subgroup struct below if needed, and then the stage struct unconditionally
-};
-
-// things we need per-lane with subgroups active, before any per-stage data
-struct SubgroupLaneData
-{
-  uint32_t elect;       // for OpGroupNonUniformElect, if we don't have ballot
-  uint32_t isActive;    // per lane active mask
-  uint32_t padding[2];
-};
-
-struct VertexLaneData
-{
-  uint32_t inst;    // allow/expect instance to vary across subgroup just in case
-  uint32_t vert;    // vertex id (either auto-generated or index)
-  uint32_t view;    // multiview view (if used)
-  uint32_t padding;
-};
-
-struct PixelLaneData
-{
-  Vec4f fragCoord;      // per-lane coord
-  uint32_t isHelper;    // per-lane helper bit
-  uint32_t quadId;    // the per-quad ID shared among all 4 threads, to differentiate between quads.
-                      // is the laneIndex of the top-left thread (with an offset, so we can see 0 as invalid)
-  uint32_t quadLaneIndex;    // the quadLaneIndex for quad-neighbours, in case we are fetching a subgroup
-  uint32_t padding;
-};
-
-struct ComputeLaneData
-{
-  uint32_t threadid[3];    // per-lane thread id (in case it's not trivial)
-  uint32_t subIdxInGroup;
-};
-
 // we use the message passing method from the quadoverdraw to swap data between quad neighbours
 // using fine derivatives. This is based on "Shader Amortization using Pixel Quad Message Passing",
 // Eric Penner, GPU Pro 2.
@@ -3841,17 +3797,17 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
 
   switch(stage)
   {
-    case ShaderStage::Vertex: structStride += sizeof(VertexLaneData); break;
-    case ShaderStage::Pixel: structStride += sizeof(PixelLaneData); break;
+    case ShaderStage::Vertex: structStride += sizeof(rdcspv::VertexLaneData); break;
+    case ShaderStage::Pixel: structStride += sizeof(rdcspv::PixelLaneData); break;
     case ShaderStage::Task:
     case ShaderStage::Mesh:
-    case ShaderStage::Compute: structStride += sizeof(ComputeLaneData); break;
+    case ShaderStage::Compute: structStride += sizeof(rdcspv::ComputeLaneData); break;
     default: break;
   }
 
   if(threadScope & rdcspv::ThreadScope::Subgroup)
   {
-    structStride += sizeof(SubgroupLaneData);
+    structStride += sizeof(rdcspv::SubgroupLaneData);
   }
 
   // simulating full subgroups with ballot ability to read other lanes, we read all lanes data
@@ -3983,7 +3939,7 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
       }
       laneValues.push_back(elect);
       structMembers.push_back(
-          {uint32Type, elect.name, offset + (uint32_t)offsetof(SubgroupLaneData, elect)});
+          {uint32Type, elect.name, offset + (uint32_t)offsetof(rdcspv::SubgroupLaneData, elect)});
 
       // we implicitly only write data for active lanes so we just set isActive to 1 always
       laneValue isActive;
@@ -3993,19 +3949,19 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
       isActive.base = editor.AddConstantImmediate<uint32_t>(1);
       isActive.flat = true;
       laneValues.push_back(isActive);
-      structMembers.push_back(
-          {uint32Type, isActive.name, offset + (uint32_t)offsetof(SubgroupLaneData, isActive)});
+      structMembers.push_back({uint32Type, isActive.name,
+                               offset + (uint32_t)offsetof(rdcspv::SubgroupLaneData, isActive)});
 
       structMembers.push_back(
-          {uint32Type, "__pad", offset + (uint32_t)offsetof(SubgroupLaneData, padding)});
+          {uint32Type, "__pad", offset + (uint32_t)offsetof(rdcspv::SubgroupLaneData, padding)});
       structMembers.push_back(
           {uint32Type, "__pad",
-           uint32_t(offset + offsetof(SubgroupLaneData, padding) + sizeof(uint32_t))});
+           uint32_t(offset + offsetof(rdcspv::SubgroupLaneData, padding) + sizeof(uint32_t))});
 
-      offset += sizeof(SubgroupLaneData);
-      RDCCOMPILE_ASSERT(
-          (sizeof(SubgroupLaneData) / sizeof(Vec4f)) * sizeof(Vec4f) == sizeof(SubgroupLaneData),
-          "SubgroupLaneData is misaligned, ensure 16-byte aligned");
+      offset += sizeof(rdcspv::SubgroupLaneData);
+      RDCCOMPILE_ASSERT((sizeof(rdcspv::SubgroupLaneData) / sizeof(Vec4f)) * sizeof(Vec4f) ==
+                            sizeof(rdcspv::SubgroupLaneData),
+                        "SubgroupLaneData is misaligned, ensure 16-byte aligned");
     }
 
     if(stage == ShaderStage::Vertex)
@@ -4019,7 +3975,7 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
       editor.SetName(inst.base, inst.name);
       laneValues.push_back(inst);
       structMembers.push_back(
-          {uint32Type, inst.name, offset + (uint32_t)offsetof(VertexLaneData, inst)});
+          {uint32Type, inst.name, offset + (uint32_t)offsetof(rdcspv::VertexLaneData, inst)});
 
       laneValue vert;
       vert.name = "__rd_vert";
@@ -4030,7 +3986,7 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
       editor.SetName(vert.base, vert.name);
       laneValues.push_back(vert);
       structMembers.push_back(
-          {uint32Type, vert.name, offset + (uint32_t)offsetof(VertexLaneData, vert)});
+          {uint32Type, vert.name, offset + (uint32_t)offsetof(rdcspv::VertexLaneData, vert)});
 
       if(useViewIndex)
       {
@@ -4043,23 +3999,23 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
         editor.SetName(view.base, view.name);
         laneValues.push_back(view);
         structMembers.push_back(
-            {uint32Type, view.name, offset + (uint32_t)offsetof(VertexLaneData, view)});
+            {uint32Type, view.name, offset + (uint32_t)offsetof(rdcspv::VertexLaneData, view)});
 
         structMembers.push_back(
-            {uint32Type, "__pad", offset + (uint32_t)offsetof(VertexLaneData, padding)});
+            {uint32Type, "__pad", offset + (uint32_t)offsetof(rdcspv::VertexLaneData, padding)});
       }
       else
       {
         structMembers.push_back(
-            {uint32Type, "__rd_view", offset + (uint32_t)offsetof(VertexLaneData, view)});
+            {uint32Type, "__rd_view", offset + (uint32_t)offsetof(rdcspv::VertexLaneData, view)});
         structMembers.push_back(
-            {uint32Type, "__pad", offset + (uint32_t)offsetof(VertexLaneData, padding)});
+            {uint32Type, "__pad", offset + (uint32_t)offsetof(rdcspv::VertexLaneData, padding)});
       }
 
-      offset += sizeof(VertexLaneData);
-      RDCCOMPILE_ASSERT(
-          (sizeof(VertexLaneData) / sizeof(Vec4f)) * sizeof(Vec4f) == sizeof(VertexLaneData),
-          "VertexLaneData is misaligned, ensure 16-byte aligned");
+      offset += sizeof(rdcspv::VertexLaneData);
+      RDCCOMPILE_ASSERT((sizeof(rdcspv::VertexLaneData) / sizeof(Vec4f)) * sizeof(Vec4f) ==
+                            sizeof(rdcspv::VertexLaneData),
+                        "VertexLaneData is misaligned, ensure 16-byte aligned");
     }
     else if(stage == ShaderStage::Pixel)
     {
@@ -4071,8 +4027,8 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
                                                   rdcspv::BuiltIn::FragCoord, float4Type);
       editor.SetName(fragCoord.base, fragCoord.name);
       laneValues.push_back(fragCoord);
-      structMembers.push_back(
-          {float4Type, fragCoord.name, offset + (uint32_t)offsetof(PixelLaneData, fragCoord)});
+      structMembers.push_back({float4Type, fragCoord.name,
+                               offset + (uint32_t)offsetof(rdcspv::PixelLaneData, fragCoord)});
 
       laneValue helper;
       helper.name = "__rd_isHelper";
@@ -4086,7 +4042,7 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
       editor.SetName(helper.base, helper.name);
       laneValues.push_back(helper);
       structMembers.push_back(
-          {uint32Type, helper.name, offset + (uint32_t)offsetof(PixelLaneData, isHelper)});
+          {uint32Type, helper.name, offset + (uint32_t)offsetof(rdcspv::PixelLaneData, isHelper)});
 
       laneValue quad;
       quad.name = "__rd_quadId";
@@ -4098,7 +4054,7 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
       editor.SetName(quad.base, quad.name);
       laneValues.push_back(quad);
       structMembers.push_back(
-          {uint32Type, quad.name, offset + (uint32_t)offsetof(PixelLaneData, quadId)});
+          {uint32Type, quad.name, offset + (uint32_t)offsetof(rdcspv::PixelLaneData, quadId)});
 
       laneValue quadLane;
       quadLane.name = "__rd_quadLane";
@@ -4107,8 +4063,8 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
       quadLane.base = editor.MakeId();
       editor.SetName(quadLane.base, quadLane.name);
       laneValues.push_back(quadLane);
-      structMembers.push_back(
-          {uint32Type, quadLane.name, offset + (uint32_t)offsetof(PixelLaneData, quadLaneIndex)});
+      structMembers.push_back({uint32Type, quadLane.name,
+                               offset + (uint32_t)offsetof(rdcspv::PixelLaneData, quadLaneIndex)});
 
       // quad properties will be handled specially
       isHelper = helper.base;
@@ -4116,12 +4072,12 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
       quadLaneIndex = quadLane.base;
 
       structMembers.push_back(
-          {uint32Type, "__pad", offset + (uint32_t)offsetof(PixelLaneData, padding)});
+          {uint32Type, "__pad", offset + (uint32_t)offsetof(rdcspv::PixelLaneData, padding)});
 
-      offset += sizeof(PixelLaneData);
-      RDCCOMPILE_ASSERT(
-          (sizeof(PixelLaneData) / sizeof(Vec4f)) * sizeof(Vec4f) == sizeof(PixelLaneData),
-          "PixelLaneData is misaligned, ensure 16-byte aligned");
+      offset += sizeof(rdcspv::PixelLaneData);
+      RDCCOMPILE_ASSERT((sizeof(rdcspv::PixelLaneData) / sizeof(Vec4f)) * sizeof(Vec4f) ==
+                            sizeof(rdcspv::PixelLaneData),
+                        "PixelLaneData is misaligned, ensure 16-byte aligned");
     }
     else if(stage == ShaderStage::Compute || stage == ShaderStage::Task || stage == ShaderStage::Mesh)
     {
@@ -4133,8 +4089,8 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
                                                  rdcspv::BuiltIn::LocalInvocationId, uint3Type);
       editor.SetName(threadid.base, threadid.name);
       laneValues.push_back(threadid);
-      structMembers.push_back(
-          {uint3Type, threadid.name, offset + (uint32_t)offsetof(ComputeLaneData, threadid)});
+      structMembers.push_back({uint3Type, threadid.name,
+                               offset + (uint32_t)offsetof(rdcspv::ComputeLaneData, threadid)});
 
       laneValue subid;
       subid.name = "__rd_subgroupid";
@@ -4144,13 +4100,13 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
                                               rdcspv::BuiltIn::SubgroupId, uint32Type);
       editor.SetName(subid.base, subid.name);
       laneValues.push_back(subid);
-      structMembers.push_back(
-          {uint32Type, subid.name, offset + (uint32_t)offsetof(ComputeLaneData, subIdxInGroup)});
+      structMembers.push_back({uint32Type, subid.name,
+                               offset + (uint32_t)offsetof(rdcspv::ComputeLaneData, subIdxInGroup)});
 
-      offset += sizeof(ComputeLaneData);
-      RDCCOMPILE_ASSERT(
-          (sizeof(ComputeLaneData) / sizeof(Vec4f)) * sizeof(Vec4f) == sizeof(ComputeLaneData),
-          "ComputeLaneData is misaligned, ensure 16-byte aligned");
+      offset += sizeof(rdcspv::ComputeLaneData);
+      RDCCOMPILE_ASSERT((sizeof(rdcspv::ComputeLaneData) / sizeof(Vec4f)) * sizeof(Vec4f) ==
+                            sizeof(rdcspv::ComputeLaneData),
+                        "ComputeLaneData is misaligned, ensure 16-byte aligned");
     }
 
     // now add input signature values
@@ -4307,6 +4263,7 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
 
   editor.SetName(destInstance, "destInstance");
   editor.SetName(destVertex, "destVertex");
+  editor.SetName(destView, "destView");
 
   rdcspv::Id ResultDataBaseType;
 
@@ -4329,23 +4286,23 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
   {
     rdcarray<rdcspv::StructMember> members;
 
-    members.push_back({float4Type, "pos", offsetof(ResultDataBase, pos)});
-    members.push_back({uint32Type, "prim", offsetof(ResultDataBase, prim)});
-    members.push_back({uint32Type, "sample", offsetof(ResultDataBase, sample)});
-    members.push_back({uint32Type, "view", offsetof(ResultDataBase, view)});
-    members.push_back({uint32Type, "valid", offsetof(ResultDataBase, valid)});
-    members.push_back({floatType, "ddxDerivCheck", offsetof(ResultDataBase, ddxDerivCheck)});
-    members.push_back({uint32Type, "quadLaneIndex", offsetof(ResultDataBase, quadLaneIndex)});
-    members.push_back({uint32Type, "laneIndex", offsetof(ResultDataBase, laneIndex)});
-    members.push_back({uint32Type, "subgroupSize", offsetof(ResultDataBase, subgroupSize)});
-    members.push_back({uint4Type, "globalBallot", offsetof(ResultDataBase, globalBallot)});
-    members.push_back({uint4Type, "electBallot", offsetof(ResultDataBase, electBallot)});
-    members.push_back({uint4Type, "helperBallot", offsetof(ResultDataBase, helperBallot)});
-    members.push_back({uint32Type, "numSubgroups", offsetof(ResultDataBase, numSubgroups)});
+    members.push_back({float4Type, "pos", offsetof(rdcspv::ResultDataBase, pos)});
+    members.push_back({uint32Type, "prim", offsetof(rdcspv::ResultDataBase, prim)});
+    members.push_back({uint32Type, "sample", offsetof(rdcspv::ResultDataBase, sample)});
+    members.push_back({uint32Type, "view", offsetof(rdcspv::ResultDataBase, view)});
+    members.push_back({uint32Type, "valid", offsetof(rdcspv::ResultDataBase, valid)});
+    members.push_back({floatType, "ddxDerivCheck", offsetof(rdcspv::ResultDataBase, ddxDerivCheck)});
+    members.push_back({uint32Type, "quadLaneIndex", offsetof(rdcspv::ResultDataBase, quadLaneIndex)});
+    members.push_back({uint32Type, "laneIndex", offsetof(rdcspv::ResultDataBase, laneIndex)});
+    members.push_back({uint32Type, "subgroupSize", offsetof(rdcspv::ResultDataBase, subgroupSize)});
+    members.push_back({uint4Type, "globalBallot", offsetof(rdcspv::ResultDataBase, globalBallot)});
+    members.push_back({uint4Type, "electBallot", offsetof(rdcspv::ResultDataBase, electBallot)});
+    members.push_back({uint4Type, "helperBallot", offsetof(rdcspv::ResultDataBase, helperBallot)});
+    members.push_back({uint32Type, "numSubgroups", offsetof(rdcspv::ResultDataBase, numSubgroups)});
 
     // uint3 padding
 
-    const uint32_t dataStart = (uint32_t)AlignUp(sizeof(ResultDataBase), sizeof(Vec4f));
+    const uint32_t dataStart = (uint32_t)AlignUp(sizeof(rdcspv::ResultDataBase), sizeof(Vec4f));
 
     RDCASSERT((structStride % sizeof(Vec4f)) == 0);
 
@@ -4362,9 +4319,9 @@ static void CreateInputFetcher(rdcarray<uint32_t> &spv,
   rdcspv::Id ResultDataRTArray =
       editor.AddType(rdcspv::OpTypeRuntimeArray(editor.MakeId(), ResultDataBaseType));
 
-  editor.AddDecoration(rdcspv::OpDecorate(ResultDataRTArray,
-                                          rdcspv::DecorationParam<rdcspv::Decoration::ArrayStride>(
-                                              structStride * numLanes + sizeof(ResultDataBase))));
+  editor.AddDecoration(rdcspv::OpDecorate(
+      ResultDataRTArray, rdcspv::DecorationParam<rdcspv::Decoration::ArrayStride>(
+                             structStride * numLanes + sizeof(rdcspv::ResultDataBase))));
 
   rdcspv::Id bufBase =
       editor.DeclareStructType("__rd_HitStorage", {
@@ -5220,16 +5177,16 @@ rdcpair<uint32_t, uint32_t> GetAlignAndOutputSize(VulkanCreationInfo::ShaderModu
   uint32_t structStride = (uint32_t)shadRefl.refl->inputSignature.size() * paramAlign;
 
   if(shadRefl.refl->stage == ShaderStage::Vertex)
-    structStride += sizeof(VertexLaneData);
+    structStride += sizeof(rdcspv::VertexLaneData);
   else if(shadRefl.refl->stage == ShaderStage::Pixel)
-    structStride += sizeof(PixelLaneData);
+    structStride += sizeof(rdcspv::PixelLaneData);
   else if(shadRefl.refl->stage == ShaderStage::Compute ||
           shadRefl.refl->stage == ShaderStage::Task || shadRefl.refl->stage == ShaderStage::Mesh)
-    structStride += sizeof(ComputeLaneData);
+    structStride += sizeof(rdcspv::ComputeLaneData);
 
   if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Subgroup)
   {
-    structStride += sizeof(SubgroupLaneData);
+    structStride += sizeof(rdcspv::SubgroupLaneData);
   }
 
   return {paramAlign, structStride};
@@ -5470,8 +5427,8 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
 
     uint32_t maxHits = 4;    // we should only ever get one hit
 
-    // struct size is ResultDataBase header plus Nx structStride for the number of threads
-    uint32_t structSize = sizeof(ResultDataBase) + structStride * numThreads;
+    // struct size is rdcspv::ResultDataBase header plus Nx structStride for the number of threads
+    uint32_t structSize = sizeof(rdcspv::ResultDataBase) + structStride * numThreads;
 
     VkDeviceSize feedbackStorageSize = maxHits * structSize + 1024;
 
@@ -5570,7 +5527,7 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
 
     base += sizeof(Vec4f);
 
-    ResultDataBase *winner = (ResultDataBase *)base;
+    rdcspv::ResultDataBase *winner = (rdcspv::ResultDataBase *)base;
 
     if(winner->valid != validMagicNumber)
     {
@@ -5587,9 +5544,9 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
     rdcspv::Debugger *debugger = new rdcspv::Debugger;
     debugger->Parse(shader.spirv.GetSPIRV());
 
-    // the per-thread data immediately follows the ResultDataBase header. Every piece of data is
-    // uniformly aligned, either 16-byte by default or 32-byte if larger components exist. The
-    // output is in input signature order.
+    // the per-thread data immediately follows the rdcspv::ResultDataBase header. Every piece of
+    // data is uniformly aligned, either 16-byte by default or 32-byte if larger components exist.
+    // The output is in input signature order.
     byte *LaneData = (byte *)(winner + 1);
 
     numThreads = 4;
@@ -5609,17 +5566,17 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
       byte *value = LaneData + t * structStride;
 
       {
-        SubgroupLaneData *subgroupData = (SubgroupLaneData *)value;
+        rdcspv::SubgroupLaneData *subgroupData = (rdcspv::SubgroupLaneData *)value;
         apiWrapper->thread_props[t][(size_t)rdcspv::ThreadProperty::Active] = subgroupData->isActive;
         apiWrapper->thread_props[t][(size_t)rdcspv::ThreadProperty::Elected] = subgroupData->elect;
         apiWrapper->thread_props[t][(size_t)rdcspv::ThreadProperty::SubgroupId] = t;
 
-        value += sizeof(SubgroupLaneData);
+        value += sizeof(rdcspv::SubgroupLaneData);
       }
 
       // read VertexLaneData
       {
-        VertexLaneData *vertData = (VertexLaneData *)value;
+        rdcspv::VertexLaneData *vertData = (rdcspv::VertexLaneData *)value;
 
         apiWrapper->thread_builtins[t][ShaderBuiltin::InstanceIndex] =
             ShaderVariable("InstanceIndex"_lit, vertData->inst, 0U, 0U, 0U);
@@ -5631,7 +5588,7 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
         if(view != ~0U)
           RDCASSERTEQUAL(vertData->view, view);
       }
-      value += sizeof(VertexLaneData);
+      value += sizeof(rdcspv::VertexLaneData);
 
       for(size_t i = 0; i < shadRefl.refl->inputSignature.size(); i++)
       {
@@ -5932,23 +5889,36 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
   // shader without being emitted from the geometry shader. For now, check if this semantic
   // will succeed in a new pixel shader with the rest of the pipe unchanged
   bool usePrimitiveID = false;
-  ResourceId gsId = state.graphics.shaderObject ? state.shaderObjects[3] : pipe.shaders[3].module;
-  if(gsId != ResourceId())
+
+  ShaderStage prevStage = ShaderStage::Geometry;
+
+  ResourceId prevId = state.graphics.shaderObject ? state.shaderObjects[(size_t)prevStage]
+                                                  : pipe.shaders[(size_t)prevStage].module;
+
+  if(prevId == ResourceId())
   {
-    const VulkanCreationInfo::ShaderEntry &gsEntry =
-        state.graphics.shaderObject ? c.m_ShaderObject[state.shaderObjects[3]].shad : pipe.shaders[3];
-    VulkanCreationInfo::ShaderModuleReflection &gsRefl =
-        c.m_ShaderModule[gsEntry.module].GetReflection(ShaderStage::Geometry, gsEntry.entryPoint,
-                                                       state.graphics.pipeline);
+    prevStage = ShaderStage::Mesh;
+    prevId = state.graphics.shaderObject ? state.shaderObjects[(size_t)prevStage]
+                                         : pipe.shaders[(size_t)prevStage].module;
+  }
+
+  if(prevId != ResourceId())
+  {
+    const VulkanCreationInfo::ShaderEntry &prevEntry =
+        state.graphics.shaderObject ? c.m_ShaderObject[state.shaderObjects[(size_t)prevStage]].shad
+                                    : pipe.shaders[(size_t)prevStage];
+    VulkanCreationInfo::ShaderModuleReflection &prevRefl =
+        c.m_ShaderModule[prevEntry.module].GetReflection(prevStage, prevEntry.entryPoint,
+                                                         state.graphics.pipeline);
 
     // check to see if the shader outputs a primitive ID
-    for(const SigParameter &e : gsRefl.refl->outputSignature)
+    for(const SigParameter &e : prevRefl.refl->outputSignature)
     {
       if(e.systemValue == ShaderBuiltin::PrimitiveIndex)
       {
         if(Vulkan_Debug_ShaderDebugLogging())
         {
-          RDCLOG("Geometry shader exports primitive ID, can use");
+          RDCLOG("Geometry/mesh shader exports primitive ID, can use");
         }
 
         usePrimitiveID = true;
@@ -5959,7 +5929,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
     if(Vulkan_Debug_ShaderDebugLogging())
     {
       if(!usePrimitiveID)
-        RDCLOG("Geometry shader doesn't export primitive ID, can't use");
+        RDCLOG("Geometry/mesh shader doesn't export primitive ID, can't use");
     }
   }
   else
@@ -6022,8 +5992,8 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
 
   uint32_t overdrawLevels = 100;    // maximum number of overdraw levels
 
-  // struct size is ResultDataBase header plus Nx structStride for the number of threads
-  uint32_t structSize = sizeof(ResultDataBase) + structStride * numThreads;
+  // struct size is rdcspv::ResultDataBase header plus Nx structStride for the number of threads
+  uint32_t structSize = sizeof(rdcspv::ResultDataBase) + structStride * numThreads;
 
   VkDeviceSize feedbackStorageSize = overdrawLevels * structSize + sizeof(Vec4f) + 1024;
 
@@ -6128,7 +6098,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
 
   base += sizeof(Vec4f);
 
-  ResultDataBase *winner = NULL;
+  rdcspv::ResultDataBase *winner = NULL;
 
   RDCLOG("Got %u hit candidates out of %u total instances", hit_count, total_count);
 
@@ -6146,7 +6116,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
 
   for(uint32_t i = 0; i < hit_count; i++)
   {
-    ResultDataBase *hit = (ResultDataBase *)(base + structSize * i);
+    rdcspv::ResultDataBase *hit = (rdcspv::ResultDataBase *)(base + structSize * i);
 
     if(hit->valid != validMagicNumber)
     {
@@ -6246,9 +6216,9 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
     rdcspv::Debugger *debugger = new rdcspv::Debugger;
     debugger->Parse(shader.spirv.GetSPIRV());
 
-    // the per-thread data immediately follows the ResultDataBase header. Every piece of data is
-    // uniformly aligned, either 16-byte by default or 32-byte if larger components exist. The
-    // output is in input signature order.
+    // the per-thread data immediately follows the rdcspv::ResultDataBase header. Every piece of
+    // data is uniformly aligned, either 16-byte by default or 32-byte if larger components exist.
+    // The output is in input signature order.
     byte *LaneData = (byte *)(winner + 1);
 
     numThreads = 4;
@@ -6269,17 +6239,17 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
 
       if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Subgroup)
       {
-        SubgroupLaneData *subgroupData = (SubgroupLaneData *)value;
+        rdcspv::SubgroupLaneData *subgroupData = (rdcspv::SubgroupLaneData *)value;
         apiWrapper->thread_props[t][(size_t)rdcspv::ThreadProperty::Active] = subgroupData->isActive;
         apiWrapper->thread_props[t][(size_t)rdcspv::ThreadProperty::Elected] = subgroupData->elect;
         apiWrapper->thread_props[t][(size_t)rdcspv::ThreadProperty::SubgroupId] = t;
 
-        value += sizeof(SubgroupLaneData);
+        value += sizeof(rdcspv::SubgroupLaneData);
       }
 
       // read PixelLaneData
       {
-        PixelLaneData *pixelData = (PixelLaneData *)value;
+        rdcspv::PixelLaneData *pixelData = (rdcspv::PixelLaneData *)value;
 
         {
           ShaderVariable &var = apiWrapper->thread_builtins[t][ShaderBuiltin::Position];
@@ -6308,7 +6278,7 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
         apiWrapper->thread_props[t][(size_t)rdcspv::ThreadProperty::QuadLane] =
             pixelData->quadLaneIndex;
       }
-      value += sizeof(PixelLaneData);
+      value += sizeof(rdcspv::PixelLaneData);
 
       for(size_t i = 0; i < shadRefl.refl->inputSignature.size(); i++)
       {
@@ -6462,15 +6432,40 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   threadDim[1] = shadRefl.refl->dispatchThreadsDimension[1];
   threadDim[2] = shadRefl.refl->dispatchThreadsDimension[2];
 
+  if((threadid[0] >= threadDim[0]) || (threadid[1] >= threadDim[1]) || (threadid[2] >= threadDim[2]))
+  {
+    RDCLOG("Invalid threadid %d,%d,%d selected from group %dx%dx%d", threadid[0], threadid[1],
+           threadid[2], threadDim[0], threadDim[1], threadDim[2]);
+    return new ShaderDebugTrace();
+  }
+  if((groupid[0] >= action->dispatchDimension[0]) || (groupid[1] >= action->dispatchDimension[1]) ||
+     (groupid[2] >= action->dispatchDimension[2]))
+  {
+    RDCLOG("Invalid groupid %d,%d,%d selected from dispatch %dx%dx%d", groupid[0], groupid[1],
+           groupid[2], action->dispatchDimension[0], action->dispatchDimension[1],
+           action->dispatchDimension[2]);
+    return new ShaderDebugTrace();
+  }
+
   SubgroupCapability subgroupCapability = SubgroupCapability::None;
   uint32_t maxSubgroupSize = 1;
   CalculateSubgroupProperties(maxSubgroupSize, subgroupCapability);
 
   uint32_t numThreads = 1;
 
-  if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Subgroup)
+  bool hasQuadScope = (shadRefl.patchData.threadScope & rdcspv::ThreadScope::Quad) ? true : false;
+  bool hasQuadDerivatives =
+      (shadRefl.patchData.derivativeMode != rdcspv::ComputeDerivativeMode::None);
+  bool hasSubgroupScoope =
+      (shadRefl.patchData.threadScope & rdcspv::ThreadScope::Subgroup) ? true : false;
+  bool hasWorkgroupScope =
+      (shadRefl.patchData.threadScope & rdcspv::ThreadScope::Workgroup) ? true : false;
+
+  if(hasQuadDerivatives || hasQuadScope)
+    numThreads = RDCMAX(numThreads, 4U);
+  if(hasSubgroupScoope)
     numThreads = RDCMAX(numThreads, maxSubgroupSize);
-  if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Workgroup)
+  if(hasWorkgroupScope)
     numThreads = RDCMAX(numThreads, threadDim[0] * threadDim[1] * threadDim[2]);
 
   apiWrapper->thread_builtins.resize(numThreads);
@@ -6486,9 +6481,44 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   global_builtins[ShaderBuiltin::GroupIndex] =
       ShaderVariable(rdcstr(), groupid[0], groupid[1], groupid[2], 0U);
 
+  const uint32_t quadIdOffset = 10000;
+  const uint32_t quadDerivMode = (uint32_t)shadRefl.patchData.derivativeMode;
+
+  uint32_t countQuadX = ~0U;
+  uint32_t countQuadY = ~0U;
+  uint32_t quadW = ~0U;
+  uint32_t quadH = ~0U;
+
+  if(hasQuadDerivatives)
+  {
+    // linear: 4x1x1
+    // quad: 2x2x1
+    const uint32_t quadWidths[3] = {~0U, 4, 2};
+    const uint32_t quadHeights[3] = {~0U, 1, 2};
+    quadW = quadWidths[quadDerivMode];
+    quadH = quadHeights[quadDerivMode];
+    countQuadX = threadDim[0] / quadW;
+    countQuadY = threadDim[1] / quadH;
+    hasQuadScope = true;
+  }
+  else if(hasQuadScope)
+  {
+    // Choose linear layout
+    quadW = 4;
+    quadH = 1;
+    countQuadX = threadDim[0] / quadW;
+    countQuadY = threadDim[1] / quadH;
+  }
+
+  if(hasQuadScope)
+  {
+    RDCASSERTEQUAL(threadDim[0], countQuadX * quadW);
+    RDCASSERTEQUAL(threadDim[1], countQuadY * quadH);
+  }
+
   // if we need to fetch subgroup data, do that now
   uint32_t laneIndex = 0;
-  if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Subgroup)
+  if(hasSubgroupScoope)
   {
     SpecData specData = {};
 
@@ -6501,8 +6531,8 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
 
     uint32_t maxHits = 4;    // we should only ever get one hit
 
-    // struct size is ResultDataBase header plus Nx structStride for the number of threads
-    uint32_t structSize = sizeof(ResultDataBase) + structStride * maxSubgroupSize;
+    // struct size is rdcspv::ResultDataBase header plus Nx structStride for the number of threads
+    uint32_t structSize = sizeof(rdcspv::ResultDataBase) + structStride * maxSubgroupSize;
 
     VkDeviceSize feedbackStorageSize = maxHits * structSize + 1024;
 
@@ -6614,7 +6644,7 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
 
     base += sizeof(Vec4f);
 
-    ResultDataBase *winner = (ResultDataBase *)base;
+    rdcspv::ResultDataBase *winner = (rdcspv::ResultDataBase *)base;
 
     if(winner->valid != validMagicNumber)
     {
@@ -6631,24 +6661,21 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
     rdcspv::Debugger *debugger = new rdcspv::Debugger;
     debugger->Parse(shader.spirv.GetSPIRV());
 
-    // the per-thread data immediately follows the ResultDataBase header. Every piece of data is
-    // uniformly aligned, either 16-byte by default or 32-byte if larger components exist. The
-    // output is in input signature order.
+    // the per-thread data immediately follows the rdcspv::ResultDataBase header. Every piece of
+    // data is uniformly aligned, either 16-byte by default or 32-byte if larger components exist.
+    // The output is in input signature order.
     byte *LaneData = (byte *)(winner + 1);
 
-    numThreads = 4;
     const uint32_t subgroupSize = winner->subgroupSize;
 
-    if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Subgroup)
-    {
-      RDCASSERTNOTEQUAL(subgroupSize, 0);
-      numThreads = RDCMAX(numThreads, subgroupSize);
-    }
+    RDCASSERTNOTEQUAL(subgroupSize, 0);
+    numThreads = RDCMAX(numThreads, subgroupSize);
 
-    if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Workgroup)
-    {
+    if(hasWorkgroupScope)
       numThreads = RDCMAX(numThreads, threadDim[0] * threadDim[1] * threadDim[2]);
-    }
+
+    if(hasQuadScope)
+      RDCASSERT(numThreads >= 4);
 
     apiWrapper->global_builtins[ShaderBuiltin::NumSubgroups] =
         ShaderVariable(rdcstr(), winner->numSubgroups, 0U, 0U, 0U);
@@ -6663,19 +6690,42 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
     {
       byte *value = LaneData + t * structStride;
 
-      SubgroupLaneData *subgroupData = (SubgroupLaneData *)value;
-      value += sizeof(SubgroupLaneData);
+      rdcspv::SubgroupLaneData *subgroupData = (rdcspv::SubgroupLaneData *)value;
+      value += sizeof(rdcspv::SubgroupLaneData);
 
-      ComputeLaneData *compData = (ComputeLaneData *)value;
-      value += sizeof(ComputeLaneData);
+      rdcspv::ComputeLaneData *compData = (rdcspv::ComputeLaneData *)value;
+      value += sizeof(rdcspv::ComputeLaneData);
 
-      // should we try to verify that the GPU assigned subgroups as we expect? this assumes tightly wrapped subgroups
       uint32_t lane = t;
 
-      if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Workgroup)
+      uint32_t quadId = ~0U;
+      uint32_t quadLaneIndex = ~0U;
+      if(hasQuadScope)
       {
-        lane = compData->threadid[2] * threadDim[0] * threadDim[1] +
-               compData->threadid[1] * threadDim[0] + compData->threadid[0];
+        uint32_t quadX = (compData->threadid[0] / quadW);
+        uint32_t quadY = (compData->threadid[1] / quadH);
+        uint32_t quadZ = compData->threadid[2];
+        quadId = quadX + (quadY * countQuadX) + (quadZ * countQuadY * countQuadX);
+        quadLaneIndex = (compData->threadid[0] % quadW) + (compData->threadid[1] % quadH) * 2;
+
+        apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::QuadLane] = quadLaneIndex;
+        apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::QuadId] =
+            quadId + quadIdOffset;
+      }
+
+      if(hasWorkgroupScope)
+      {
+        if(hasQuadScope)
+        {
+          // quad scope, derive the lane from the quad layout
+          lane = quadId * 4 + quadLaneIndex;
+        }
+        else
+        {
+          // Assume linear layout for the subgroup : tightly wrapped
+          lane = compData->threadid[2] * threadDim[0] * threadDim[1] +
+                 compData->threadid[1] * threadDim[0] + compData->threadid[0];
+        }
       }
 
       if(rdcfixedarray<uint32_t, 3>(compData->threadid) == threadid && subgroupData->isActive)
@@ -6709,24 +6759,42 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
     }
 
     // if we're simulating the whole workgroup we need to fill in the thread IDs of other threads
-    if(shadRefl.patchData.threadScope & rdcspv::ThreadScope::Workgroup)
+    if(hasWorkgroupScope)
     {
-      uint32_t i = 0;
       for(uint32_t tz = 0; tz < threadDim[2]; tz++)
       {
         for(uint32_t ty = 0; ty < threadDim[1]; ty++)
         {
           for(uint32_t tx = 0; tx < threadDim[0]; tx++)
           {
+            uint32_t quadId = ~0U;
+            uint32_t quadLaneIndex = ~0U;
+
+            uint32_t lane = ~0U;
+            if(hasQuadScope)
+            {
+              // quad scope, derive the lane from the quad layout
+              uint32_t quadX = (tx / quadW);
+              uint32_t quadY = (ty / quadH);
+              uint32_t quadZ = tz;
+              quadId = quadX + (quadY * countQuadX) + (quadZ * countQuadY * countQuadX);
+              quadLaneIndex = (tx % quadW) + (ty % quadH) * 2;
+              lane = quadId * 4 + quadLaneIndex;
+            }
+            else
+            {
+              // Assume linear layout for the subgroup : tightly wrapped
+              lane = tz * threadDim[0] * threadDim[1] + ty * threadDim[0] + tx;
+            }
             std::unordered_map<ShaderBuiltin, ShaderVariable> &thread_builtins =
-                apiWrapper->thread_builtins[i];
+                apiWrapper->thread_builtins[lane];
 
             thread_builtins[ShaderBuiltin::GroupThreadIndex] =
                 ShaderVariable(rdcstr(), tx, ty, tz, 0U);
             thread_builtins[ShaderBuiltin::GroupFlatIndex] = ShaderVariable(
                 rdcstr(), tz * threadDim[0] * threadDim[1] + ty * threadDim[0] + tx, 0U, 0U, 0U);
 
-            if(apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::Active])
+            if(apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::Active])
             {
               // assert that this is the thread we expect it to be
               RDCASSERTEQUAL(thread_builtins[ShaderBuiltin::DispatchThreadIndex].value.u32v[0],
@@ -6737,9 +6805,18 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
                              groupid[2] * threadDim[2] + tz);
 
               RDCASSERTEQUAL(thread_builtins[ShaderBuiltin::IndexInSubgroup].value.u32v[0],
-                             i % subgroupSize);
+                             lane % subgroupSize);
               RDCASSERTEQUAL(thread_builtins[ShaderBuiltin::SubgroupIndexInWorkgroup].value.u32v[0],
-                             i / subgroupSize);
+                             lane / subgroupSize);
+
+              if(hasQuadScope)
+              {
+                RDCASSERTEQUAL(
+                    apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::QuadLane],
+                    quadLaneIndex);
+                RDCASSERTEQUAL(apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::QuadId],
+                               quadId + quadIdOffset);
+              }
             }
             else
             {
@@ -6748,19 +6825,26 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
                                  groupid[1] * threadDim[1] + ty, groupid[2] * threadDim[2] + tz, 0U);
               // tightly wrap subgroups, this is likely not how the GPU actually assigns them
               thread_builtins[ShaderBuiltin::IndexInSubgroup] =
-                  ShaderVariable(rdcstr(), i % subgroupSize, 0U, 0U, 0U);
+                  ShaderVariable(rdcstr(), lane % subgroupSize, 0U, 0U, 0U);
               thread_builtins[ShaderBuiltin::SubgroupIndexInWorkgroup] =
-                  ShaderVariable(rdcstr(), i / subgroupSize, 0U, 0U, 0U);
-              apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::Active] = 1;
-              apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::SubgroupId] =
-                  i % subgroupSize;
-            }
+                  ShaderVariable(rdcstr(), lane / subgroupSize, 0U, 0U, 0U);
+              apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::Active] = 1;
+              apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::SubgroupId] =
+                  lane % subgroupSize;
 
-            i++;
+              if(hasQuadScope)
+              {
+                apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::QuadLane] =
+                    quadLaneIndex;
+                apiWrapper->thread_props[lane][(size_t)rdcspv::ThreadProperty::QuadId] = quadId;
+              }
+            }
           }
         }
       }
     }
+
+    // Each member of a quad should belong to the same subgroup. We assume this and do not validate it
 
     // Add inactive padding lanes to round up to the subgroup size
     const uint32_t numPaddingThreads = AlignUp(numThreads, subgroupSize) - numThreads;
@@ -6799,11 +6883,11 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   }
   else
   {
-    // if we have more than one thread here, that means we need to simulate the whole workgroup.
+    // if we need to simulate the whole workgroup.
     // we assume the layout of this is irrelevant and don't attempt to read it back from the GPU
     // like we do with subgroups. We lay things out in plain linear order, along X and then Y and
     // then Z, with groups iterated together.
-    if(numThreads > 1)
+    if(hasWorkgroupScope)
     {
       uint32_t i = 0;
       for(uint32_t tz = 0; tz < threadDim[2]; tz++)
@@ -6823,6 +6907,19 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
                 rdcstr(), tz * threadDim[0] * threadDim[1] + ty * threadDim[0] + tx, 0U, 0U, 0U);
             apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::Active] = 1;
 
+            if(hasQuadScope)
+            {
+              uint32_t quadX = (tx / quadW);
+              uint32_t quadY = (ty / quadH);
+              uint32_t quadZ = tz;
+              uint32_t quadId =
+                  quadIdOffset + quadX + (quadY * countQuadX) + (quadZ * countQuadY * countQuadX);
+              uint32_t quadLaneIndex = (tx % quadW) + (ty % quadH) * 2;
+
+              apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::QuadLane] = quadLaneIndex;
+              apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::QuadId] = quadId;
+            }
+
             if(rdcfixedarray<uint32_t, 3>({tx, ty, tz}) == threadid)
             {
               laneIndex = i;
@@ -6833,8 +6930,46 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
         }
       }
     }
+    else if(hasQuadScope)
+    {
+      // need to simulate the whole quad, do not readback from the GPU like we do with subgroups
+      // the quad is guaranteed to be in the same subgroup
+      // We lay things out in linear or quad order
+      RDCASSERTEQUAL(numThreads, 4U);
+      uint32_t txMin = (threadid[0] / quadW) * quadW;
+      uint32_t tyMin = (threadid[1] / quadH) * quadH;
+      uint32_t tz = threadid[2];
+      uint32_t quadZ = tz;
+      for(uint32_t i = 0; i < 4U; ++i)
+      {
+        uint32_t tx = txMin + (i % quadW);
+        uint32_t ty = tyMin + (i / quadW);
+        std::unordered_map<ShaderBuiltin, ShaderVariable> &thread_builtins =
+            apiWrapper->thread_builtins[i];
+        thread_builtins[ShaderBuiltin::DispatchThreadIndex] =
+            ShaderVariable(rdcstr(), groupid[0] * threadDim[0] + tx, groupid[1] * threadDim[1] + ty,
+                           groupid[2] * threadDim[2] + tz, 0U);
+        thread_builtins[ShaderBuiltin::GroupThreadIndex] = ShaderVariable(rdcstr(), tx, ty, tz, 0U);
+        thread_builtins[ShaderBuiltin::GroupFlatIndex] = ShaderVariable(
+            rdcstr(), tz * threadDim[0] * threadDim[1] + ty * threadDim[0] + tx, 0U, 0U, 0U);
+        apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::Active] = 1;
+
+        uint32_t quadX = (tx / quadW);
+        uint32_t quadY = (ty / quadH);
+        uint32_t quadId =
+            quadIdOffset + quadX + (quadY * countQuadX) + (quadZ * countQuadY * countQuadX);
+        uint32_t quadLaneIndex = (tx % quadW) + (ty % quadH) * 2;
+
+        apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::QuadLane] = quadLaneIndex;
+        apiWrapper->thread_props[i][(size_t)rdcspv::ThreadProperty::QuadId] = quadId;
+
+        if(rdcfixedarray<uint32_t, 3>({tx, ty, tz}) == threadid)
+          laneIndex = i;
+      }
+    }
     else
     {
+      RDCASSERTEQUAL(numThreads, 1U);
       // simple single-thread case
       apiWrapper->thread_props[0][(size_t)rdcspv::ThreadProperty::Active] = 1;
       apiWrapper->thread_props[0][(size_t)rdcspv::ThreadProperty::SubgroupId] = 0;

@@ -235,7 +235,7 @@ VKMeshDisplayPipelines VulkanDebugManager::CacheMeshDisplayPipelines(VkPipelineL
       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
       NULL,
       0,
-      false,
+      true,
       false,
       VK_POLYGON_MODE_FILL,
       VK_CULL_MODE_NONE,
@@ -411,6 +411,7 @@ VKMeshDisplayPipelines VulkanDebugManager::CacheMeshDisplayPipelines(VkPipelineL
   CHECK_VKR(m_pDriver, vkr);
 
   ds.depthTestEnable = true;
+  rs.depthClampEnable = false;
 
   vkr = vt->CreateGraphicsPipelines(Unwrap(m_Device), VK_NULL_HANDLE, 1, &pipeInfo, NULL,
                                     &cache.pipes[VKMeshDisplayPipelines::ePipe_SolidDepth]);
@@ -508,8 +509,11 @@ void VulkanReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &seco
   VkViewport viewport = {0.0f, 0.0f, (float)m_DebugWidth, (float)m_DebugHeight, 0.0f, 1.0f};
   vt->CmdSetViewport(Unwrap(cmd), 0, 1, &viewport);
 
+  float nearPlane = cfg.cam ? ((Camera *)cfg.cam)->GetNear() : 0.1f;
+  float farPlane = cfg.cam ? ((Camera *)cfg.cam)->GetFar() : 100000.0f;
+
   Matrix4f projMat =
-      Matrix4f::Perspective(90.0f, 0.1f, 100000.0f, float(m_DebugWidth) / float(m_DebugHeight));
+      Matrix4f::Perspective(90.0f, nearPlane, farPlane, float(m_DebugWidth) / float(m_DebugHeight));
   Matrix4f InvProj = projMat.Inverse();
 
   Matrix4f camMat = cfg.cam ? ((Camera *)cfg.cam)->GetMatrix() : Matrix4f::Identity();

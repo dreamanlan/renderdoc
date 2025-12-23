@@ -204,6 +204,7 @@ MeshDisplayPipelines D3D12DebugManager::CacheMeshDisplayPipelines(const MeshForm
   RDCASSERTEQUAL(hr, S_OK);
 
   pipeDesc.DepthStencilState.DepthEnable = TRUE;
+  pipeDesc.RasterizerState.DepthClipEnable = TRUE;
   pipeDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
   pipeDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
 
@@ -274,7 +275,11 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
 
   MeshVertexCBuffer vertexData;
 
-  Matrix4f projMat = Matrix4f::Perspective(90.0f, 0.1f, 100000.0f, viewport.Width / viewport.Height);
+  float nearPlane = cfg.cam ? ((Camera *)cfg.cam)->GetNear() : 0.1f;
+  float farPlane = cfg.cam ? ((Camera *)cfg.cam)->GetFar() : 100000.0f;
+
+  Matrix4f projMat =
+      Matrix4f::Perspective(90.0f, nearPlane, farPlane, viewport.Width / viewport.Height);
   Matrix4f InvProj = projMat.Inverse();
 
   Matrix4f camMat = cfg.cam ? ((Camera *)cfg.cam)->GetMatrix() : Matrix4f::Identity();

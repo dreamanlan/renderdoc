@@ -70,7 +70,7 @@ void D3D12RenderState::ResolvePendingIndirectState(WrappedID3D12Device *device)
   device->DeviceWaitForIdle();
 
   D3D12_RANGE range = {0, D3D12CommandData::m_IndirectSize};
-  byte *mapPtr = NULL;
+  const byte *mapPtr = NULL;
   CHECK_HR(device, indirectState.argsBuf->Map(0, &range, (void **)&mapPtr));
 
   if(device->HasFatalError())
@@ -79,7 +79,7 @@ void D3D12RenderState::ResolvePendingIndirectState(WrappedID3D12Device *device)
   WrappedID3D12CommandSignature *comSig = (WrappedID3D12CommandSignature *)indirectState.comSig;
 
   {
-    byte *data = mapPtr + indirectState.argsOffs;
+    const byte *data = mapPtr + indirectState.argsOffs;
 
     for(uint32_t argIdx = 0; argIdx < indirectState.argsToProcess; argIdx++)
     {
@@ -110,16 +110,12 @@ void D3D12RenderState::ResolvePendingIndirectState(WrappedID3D12Device *device)
           if(comSig->sig.graphics)
           {
             graphics.sigelems.resize_for_index(arg.Constant.RootParameterIndex);
-            graphics.sigelems[arg.Constant.RootParameterIndex].constants.resize_for_index(
-                arg.Constant.Num32BitValuesToSet + arg.Constant.DestOffsetIn32BitValues);
             graphics.sigelems[arg.Constant.RootParameterIndex].SetConstants(
                 arg.Constant.Num32BitValuesToSet, data32, arg.Constant.DestOffsetIn32BitValues);
           }
           else
           {
             compute.sigelems.resize_for_index(arg.Constant.RootParameterIndex);
-            compute.sigelems[arg.Constant.RootParameterIndex].constants.resize_for_index(
-                arg.Constant.Num32BitValuesToSet + arg.Constant.DestOffsetIn32BitValues);
             compute.sigelems[arg.Constant.RootParameterIndex].SetConstants(
                 arg.Constant.Num32BitValuesToSet, data32, arg.Constant.DestOffsetIn32BitValues);
           }
@@ -207,6 +203,7 @@ void D3D12RenderState::ResolvePendingIndirectState(WrappedID3D12Device *device)
     }
   }
 
+  range.End = 0;
   indirectState.argsBuf->Unmap(0, &range);
   indirectState.argsBuf = NULL;
   indirectState.argsOffs = 0;

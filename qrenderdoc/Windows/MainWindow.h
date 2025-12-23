@@ -169,6 +169,8 @@ private slots:
   void on_action_Inject_into_Process_triggered();
   void on_action_Resolve_Symbols_triggered();
   void on_action_Recompress_Capture_triggered();
+  void on_action_EmbedExternalFiles_triggered();
+  void on_action_RemoveExternalFiles_triggered();
   void on_action_Start_Replay_Loop_triggered();
   void on_action_Open_RGP_Profile_triggered();
   void on_action_Create_RGP_Profile_triggered();
@@ -195,6 +197,7 @@ private slots:
   void statusDoubleClicked(QMouseEvent *event);
   void switchContext();
   void contextChooser_menuShowing();
+  void updateToolsMenuOptions();
 
   void ClearRecentCaptureFiles();
   void ClearRecentCaptureSettings();

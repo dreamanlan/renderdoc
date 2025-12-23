@@ -60,7 +60,11 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
-  Matrix4f projMat = Matrix4f::Perspective(90.0f, 0.1f, 100000.0f, m_OutputWidth / m_OutputHeight);
+  float nearPlane = cfg.cam ? ((Camera *)cfg.cam)->GetNear() : 0.1f;
+  float farPlane = cfg.cam ? ((Camera *)cfg.cam)->GetFar() : 100000.0f;
+
+  Matrix4f projMat =
+      Matrix4f::Perspective(90.0f, nearPlane, farPlane, m_OutputWidth / m_OutputHeight);
 
   Matrix4f camMat = cfg.cam ? ((Camera *)cfg.cam)->GetMatrix() : Matrix4f::Identity();
 
@@ -282,7 +286,7 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
     if(cfg.visualisationMode != Visualisation::NoSolid &&
        cfg.position.topology < Topology::PatchList_1CPs)
     {
-      m_pImmediateContext->RSSetState(m_General.RasterState);
+      m_pImmediateContext->RSSetState(m_General.RasterClipState);
 
       m_pImmediateContext->IASetPrimitiveTopology(topo);
 

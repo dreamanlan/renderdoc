@@ -2353,7 +2353,7 @@ ShaderDebugTrace *D3D12Replay::DebugVertex(uint32_t eventId, uint32_t vertid, ui
 
     pipeDesc.VS.BytecodeLength = vsBlob->GetBufferSize();
     pipeDesc.VS.pShaderBytecode = vsBlob->GetBufferPointer();
-    pipeDesc.pRootSignature = pRootSignature;
+    pipeDesc.SetRootSig(pRootSignature);
 
     // disable rasterizaion
     pipeDesc.PS = {};
@@ -2969,7 +2969,7 @@ ShaderDebugTrace *D3D12Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t
   // All PSO state is the same as the event's, except for the pixel shader and root signature
   pipeDesc.PS.BytecodeLength = psBlob->GetBufferSize();
   pipeDesc.PS.pShaderBytecode = psBlob->GetBufferPointer();
-  pipeDesc.pRootSignature = pRootSignature;
+  pipeDesc.SetRootSig(pRootSignature);
 
   ID3D12PipelineState *initialPso = NULL;
   HRESULT hr = m_pDevice->CreatePipeState(pipeDesc, &initialPso);
@@ -3370,10 +3370,15 @@ ShaderDebugTrace *D3D12Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t
         }
         else
         {
-          if(invar.rows <= 1)
-            rawout = &invar.value.s32v[outElement];
-          else
+          if(invar.rows == 0)
+          {
+            RDCASSERT(input.array < invar.members.count(), input.array, invar.members.count());
             rawout = &invar.members[input.array].value.s32v[outElement];
+          }
+          else
+          {
+            rawout = &invar.value.s32v[outElement];
+          }
 
           memcpy(rawout, input.data, input.numwords * 4);
         }
@@ -3561,9 +3566,14 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
         refl.dispatchThreadsDimension[2],
     };
 
+    bool hasQuadScope = (dxbc->GetThreadScope() & DXBC::ThreadScope::Quad) ? true : false;
+    bool hasSubgroupScoope = (dxbc->GetThreadScope() & DXBC::ThreadScope::Subgroup) ? true : false;
+
     uint32_t subgroupSize = 1;
     uint32_t activeLaneIndex = ~0U;
     uint32_t numThreads = 1;
+    if(hasQuadScope)
+      numThreads = RDCMAX(numThreads, 4U);
 
     DXILDebug::D3D12APIWrapper *apiWrapper = new DXILDebug::D3D12APIWrapper(
         m_pDevice, dxbc->GetDXILByteCode(), refl, eventId, dxbc->GetReflection()->InputSig);
@@ -3572,8 +3582,40 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
     rdcarray<DXILDebug::ThreadProperties> workgroupProperties;
     rdcarray<rdcflatmap<ShaderBuiltin, ShaderVariable>> threadsBuiltins;
 
+    const uint32_t quadIdOffset = 10000;
+
+    uint32_t countQuadX = ~0U;
+    uint32_t countQuadY = ~0U;
+    uint32_t quadW = ~0U;
+    uint32_t quadH = ~0U;
+
+    if(hasQuadScope)
+    {
+      if((threadDim[1] == 1) && (threadDim[2] == 1))
+      {
+        // linear: 4x1x1
+        quadW = 4;
+        quadH = 1;
+      }
+      else
+      {
+        // quad: 2x2x1
+        quadW = 2;
+        quadH = 2;
+      }
+
+      countQuadX = threadDim[0] / quadW;
+      countQuadY = threadDim[1] / quadH;
+    }
+
+    if(hasQuadScope)
+    {
+      RDCASSERTEQUAL(threadDim[0], countQuadX * quadW);
+      RDCASSERTEQUAL(threadDim[1], countQuadY * quadH);
+    }
+
     // hard case - with subgroups we want the actual layout so read that from the GPU
-    if(dxbc->GetThreadScope() & DXBC::ThreadScope::Subgroup)
+    if(hasSubgroupScoope)
     {
       DXDebug::InputFetcherConfig cfg;
       DXDebug::InputFetcher fetcher;
@@ -3632,7 +3674,7 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
 
       pipeDesc.CS.BytecodeLength = csBlob->GetBufferSize();
       pipeDesc.CS.pShaderBytecode = csBlob->GetBufferPointer();
-      pipeDesc.pRootSignature = pRootSignature;
+      pipeDesc.SetRootSig(pRootSignature);
 
       ID3D12PipelineState *initialPso = NULL;
       HRESULT hr = m_pDevice->CreatePipeState(pipeDesc, &initialPso);
@@ -3715,6 +3757,9 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
 
       subgroupSize = buf->subgroupSize;
       numThreads = wholeWorkgroup ? threadDim[0] * threadDim[1] * threadDim[2] : subgroupSize;
+
+      if(hasQuadScope)
+        RDCASSERT(numThreads >= 4);
 
       workgroupProperties.resize(numThreads);
       threadsBuiltins.resize(numThreads);
@@ -3831,6 +3876,20 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
         const uint32_t groupFlatIndex = laneData.threadid[2] * threadDim[0] * threadDim[1] +
                                         laneData.threadid[1] * threadDim[0] + laneData.threadid[0];
 
+        uint32_t quadId = ~0U;
+        uint32_t quadLaneIndex = ~0U;
+        if(hasQuadScope)
+        {
+          uint32_t quadX = (laneData.threadid[0] / quadW);
+          uint32_t quadY = (laneData.threadid[1] / quadH);
+          uint32_t quadZ = laneData.threadid[2];
+          quadId = quadX + (quadY * countQuadX) + (quadZ * countQuadY * countQuadX);
+          quadLaneIndex = (laneData.threadid[0] % quadW) + (laneData.threadid[1] % quadH) * 2;
+
+          workgroupProperties[lane][DXILDebug::ThreadProperty::QuadLane] = quadLaneIndex;
+          workgroupProperties[lane][DXILDebug::ThreadProperty::QuadId] = quadId + quadIdOffset;
+        }
+
         workgroupProperties[lane][DXILDebug::ThreadProperty::Active] = laneData.active;
         workgroupProperties[lane][DXILDebug::ThreadProperty::SubgroupIdx] = laneData.laneIndex;
         // The simulation requires
@@ -3888,12 +3947,68 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
                 rdcstr(), tz * threadDim[0] * threadDim[1] + ty * threadDim[0] + tx, 0U, 0U, 0U);
             workgroupProperties[i][DXILDebug::ThreadProperty::Active] = 1;
 
+            if(hasQuadScope)
+            {
+              uint32_t quadX = (tx / quadW);
+              uint32_t quadY = (ty / quadH);
+              uint32_t quadZ = tz;
+              uint32_t quadId =
+                  quadIdOffset + quadX + (quadY * countQuadX) + (quadZ * countQuadY * countQuadX);
+              uint32_t quadLaneIndex = (tx % quadW) + (ty % quadH) * 2;
+
+              workgroupProperties[i][DXILDebug::ThreadProperty::QuadLane] = quadLaneIndex;
+              workgroupProperties[i][DXILDebug::ThreadProperty::QuadId] = quadId;
+            }
+
             if(rdcfixedarray<uint32_t, 3>({tx, ty, tz}) == threadid)
               activeLaneIndex = i;
 
             i++;
           }
         }
+      }
+    }
+    else if(hasQuadScope)
+    {
+      workgroupProperties.resize(numThreads);
+      threadsBuiltins.resize(numThreads);
+
+      // SV_GroupID
+      globalBuiltins[ShaderBuiltin::GroupIndex] =
+          ShaderVariable(rdcstr(), groupid[0], groupid[1], groupid[2], 0U);
+
+      // need to simulate the whole quad, do not readback from the GPU like we do with subgroups
+      // the quad is guaranteed to be in the same subgroup
+      // We lay things out in linear or quad order
+      RDCASSERTEQUAL(numThreads, 4U);
+      uint32_t txMin = (threadid[0] / quadW) * quadW;
+      uint32_t tyMin = (threadid[1] / quadH) * quadH;
+      uint32_t tz = threadid[2];
+      uint32_t quadZ = tz;
+      for(uint32_t i = 0; i < 4U; ++i)
+      {
+        uint32_t tx = txMin + (i % quadW);
+        uint32_t ty = tyMin + (i / quadW);
+        rdcflatmap<ShaderBuiltin, ShaderVariable> &thread_builtins = threadsBuiltins[i];
+        thread_builtins[ShaderBuiltin::DispatchThreadIndex] =
+            ShaderVariable(rdcstr(), groupid[0] * threadDim[0] + tx, groupid[1] * threadDim[1] + ty,
+                           groupid[2] * threadDim[2] + tz, 0U);
+        thread_builtins[ShaderBuiltin::GroupThreadIndex] = ShaderVariable(rdcstr(), tx, ty, tz, 0U);
+        thread_builtins[ShaderBuiltin::GroupFlatIndex] = ShaderVariable(
+            rdcstr(), tz * threadDim[0] * threadDim[1] + ty * threadDim[0] + tx, 0U, 0U, 0U);
+        workgroupProperties[i][DXILDebug::ThreadProperty::Active] = 1;
+
+        uint32_t quadX = (tx / quadW);
+        uint32_t quadY = (ty / quadH);
+        uint32_t quadId =
+            quadIdOffset + quadX + (quadY * countQuadX) + (quadZ * countQuadY * countQuadX);
+        uint32_t quadLaneIndex = (tx % quadW) + (ty % quadH) * 2;
+
+        workgroupProperties[i][DXILDebug::ThreadProperty::QuadLane] = quadLaneIndex;
+        workgroupProperties[i][DXILDebug::ThreadProperty::QuadId] = quadId;
+
+        if(rdcfixedarray<uint32_t, 3>({tx, ty, tz}) == threadid)
+          activeLaneIndex = i;
       }
     }
     else

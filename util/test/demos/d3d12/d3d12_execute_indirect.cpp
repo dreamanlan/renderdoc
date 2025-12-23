@@ -53,6 +53,11 @@ cbuffer rootConsts : register(b1)
    float4 rootConsts;
 }
 
+cbuffer rootConst : register(b1, space1)
+{
+   float rootConst;
+}
+
 StructuredBuffer<float4> srvtest : register(t0);
 
 RWStructuredBuffer<float4> uavtest : register(u0);
@@ -288,10 +293,12 @@ void main(uint3 gid : SV_GroupID)
          srvParam(D3D12_SHADER_VISIBILITY_VERTEX, 0, 0),
          uavParam(D3D12_SHADER_VISIBILITY_VERTEX, 0, 0),
          constParam(D3D12_SHADER_VISIBILITY_VERTEX, 0, 1, 4),
+         constParam(D3D12_SHADER_VISIBILITY_VERTEX, 1, 1, 1),
          tableParam(D3D12_SHADER_VISIBILITY_ALL, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 1, 2, 0)});
 
-    ID3D12CommandSignaturePtr patchArgSig = MakeCommandSig(
-        patchsig, {vbArg(0), cbvArg(0), srvArg(1), uavArg(2), constArg(3, 0, 1), drawArg()});
+    ID3D12CommandSignaturePtr patchArgSig =
+        MakeCommandSig(patchsig, {vbArg(0), cbvArg(0), srvArg(1), uavArg(2), constArg(3, 0, 1),
+                                  constArg(4, 0, 1), drawArg()});
 
     struct PatchArgs
     {
@@ -300,6 +307,7 @@ void main(uint3 gid : SV_GroupID)
       D3D12_GPU_VIRTUAL_ADDRESS srv;
       D3D12_GPU_VIRTUAL_ADDRESS uav;
       float constData;
+      float constData2;
       D3D12_DRAW_ARGUMENTS draw;
     } patchargs;
 
@@ -314,6 +322,7 @@ void main(uint3 gid : SV_GroupID)
     patchargs.draw.StartInstanceLocation = 0;
     patchargs.draw.StartVertexLocation = 0;
     patchargs.constData = 123.0f;
+    patchargs.constData2 = -123.0f;
 
     std::vector<char> patchArgsData;
     patchArgsData.resize(sizeof(PatchArgs));
@@ -329,6 +338,8 @@ void main(uint3 gid : SV_GroupID)
     ptr += sizeof(D3D12_GPU_VIRTUAL_ADDRESS);
     memcpy(ptr, &patchargs.constData, sizeof(float));
     ptr += sizeof(float);
+    memcpy(ptr, &patchargs.constData2, sizeof(float));
+    ptr += sizeof(float);
     memcpy(ptr, &patchargs.draw, sizeof(D3D12_DRAW_ARGUMENTS));
     ptr += sizeof(D3D12_DRAW_ARGUMENTS);
 
@@ -338,6 +349,37 @@ void main(uint3 gid : SV_GroupID)
         MakeBuffer().Upload().Size((UINT)patchArgsData.size()).Data(patchArgsData.data());
 
     ID3D12PipelineStatePtr patchpso =
+        MakePSO().RootSig(patchsig).InputLayout(layout).VS(vsblob).PS(psblob);
+
+    ID3D12CommandSignaturePtr patchArgSig2 = MakeCommandSig({}, {vbArg(0), drawArg()});
+
+    struct PatchArgs2
+    {
+      D3D12_VERTEX_BUFFER_VIEW vb;
+      D3D12_DRAW_ARGUMENTS draw;
+    } patchargs2;
+
+    patchargs2.vb.BufferLocation = vb->GetGPUVirtualAddress();
+    patchargs2.vb.SizeInBytes = sizeof(tri);
+    patchargs2.vb.StrideInBytes = sizeof(A2V);
+    patchargs2.draw.VertexCountPerInstance = 3;
+    patchargs2.draw.InstanceCount = 1;
+    patchargs2.draw.StartInstanceLocation = 0;
+    patchargs2.draw.StartVertexLocation = 0;
+
+    std::vector<char> patchArgsData2;
+    patchArgsData2.resize(sizeof(PatchArgs2));
+
+    char *ptr2 = patchArgsData2.data();
+    memcpy(ptr2, &patchargs2.vb, sizeof(D3D12_VERTEX_BUFFER_VIEW));
+    ptr2 += sizeof(D3D12_VERTEX_BUFFER_VIEW);
+    memcpy(ptr2, &patchargs2.draw, sizeof(D3D12_DRAW_ARGUMENTS));
+    ptr2 += sizeof(D3D12_DRAW_ARGUMENTS);
+
+    ID3D12ResourcePtr patchArgBuf2 =
+        MakeBuffer().Upload().Size((UINT)patchArgsData2.size()).Data(patchArgsData2.data());
+
+    ID3D12PipelineStatePtr patchpso2 =
         MakePSO().RootSig(patchsig).InputLayout(layout).VS(vsblob).PS(psblob);
 
     ID3D12CommandSignaturePtr compArgSig = MakeCommandSig(NULL, {dispatchArg()});
@@ -432,7 +474,7 @@ void main(uint3 gid : SV_GroupID)
         cmd->SetPipelineState(patchpso);
         cmd->SetGraphicsRootSignature(patchsig);
         cmd->SetDescriptorHeaps(1, &m_CBVUAVSRV.GetInterfacePtr());
-        cmd->SetGraphicsRootDescriptorTable(4, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
+        cmd->SetGraphicsRootDescriptorTable(5, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
 
         RSSetViewport(cmd, {0.0f, 0.0f, (float)screenWidth, (float)screenHeight, 0.0f, 1.0f});
         RSSetScissorRect(cmd, {0, 0, screenWidth, screenHeight});
@@ -446,6 +488,35 @@ void main(uint3 gid : SV_GroupID)
       popMarker(cmd);
 
       setMarker(cmd, "Post draw");
+
+      cmd->Close();
+      cmd = GetCommandBuffer();
+      Reset(cmd);
+      cmds.push_back(cmd);
+
+      pushMarker(cmd, "EI without Root Signature");
+      {
+        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        cmd->SetPipelineState(patchpso2);
+        cmd->SetGraphicsRootSignature(patchsig);
+        cmd->SetDescriptorHeaps(1, &m_CBVUAVSRV.GetInterfacePtr());
+        cmd->SetGraphicsRootDescriptorTable(5, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
+        cmd->SetGraphicsRootConstantBufferView(0, cbv->GetGPUVirtualAddress() + 256);
+        cmd->SetGraphicsRootShaderResourceView(1, srv->GetGPUVirtualAddress() + 256);
+        cmd->SetGraphicsRootUnorderedAccessView(2, uav->GetGPUVirtualAddress() + 256);
+
+        RSSetViewport(cmd, {0.0f, 0.0f, (float)screenWidth, (float)screenHeight, 0.0f, 1.0f});
+        RSSetScissorRect(cmd, {0, 0, screenWidth, screenHeight});
+
+        OMSetRenderTargets(cmd, {rtv}, {});
+
+        cmd->SetGraphicsRoot32BitConstants(3, 4, baseConstData, 0);
+
+        cmd->ExecuteIndirect(patchArgSig2, 1, patchArgBuf2, 0, NULL, 0);
+      }
+
+      popMarker(cmd);
 
       cmd->Close();
       cmd = GetCommandBuffer();
@@ -549,7 +620,7 @@ void main(uint3 gid : SV_GroupID)
         cmd->SetPipelineState(patchpso);
         cmd->SetGraphicsRootSignature(patchsig);
         cmd->SetDescriptorHeaps(1, &m_CBVUAVSRV.GetInterfacePtr());
-        cmd->SetGraphicsRootDescriptorTable(4, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
+        cmd->SetGraphicsRootDescriptorTable(5, m_CBVUAVSRV->GetGPUDescriptorHandleForHeapStart());
 
         RSSetViewport(cmd, {0.0f, 0.0f, (float)screenWidth, (float)screenHeight, 0.0f, 1.0f});
         RSSetScissorRect(cmd, {0, 0, screenWidth, screenHeight});

@@ -1026,6 +1026,9 @@ GLResourceRecord *WrappedOpenGL::GetContextRecord()
 
 void WrappedOpenGL::UseUnusedSupportedFunction(const char *name)
 {
+  //https://github.com/baldurk/renderdoc/issues/2726
+  if(name && !strcmp(name, "glEGLImageTargetTexture2DOES"))
+    return;
   // if this is the first time an unused function is called, remove all frame capturers immediately
   if(m_UnsupportedFunctions.empty())
   {

@@ -1027,6 +1027,11 @@ GLResourceRecord *WrappedOpenGL::GetContextRecord()
 void WrappedOpenGL::UseUnusedSupportedFunction(const char *name)
 {
   //https://github.com/baldurk/renderdoc/issues/2726
+  // glEGLImageTargetTexture2DOES is heavily used by Android external textures
+  // (SurfaceTexture / video decoders / camera). Letting it tear down the
+  // device frame capturer breaks GLES capture entirely on real apps.
+  // Bypass: we cannot capture the external image, but the call must not
+  // disable capture infrastructure for the rest of the frame.
   if(name && !strcmp(name, "glEGLImageTargetTexture2DOES"))
     return;
   // if this is the first time an unused function is called, remove all frame capturers immediately

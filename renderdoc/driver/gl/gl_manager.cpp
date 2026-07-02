@@ -69,6 +69,11 @@ void GLResourceManager::MarkFBOReferenced(GLResource res, FrameRefType ref)
 
   rdcpair<ResourceId, GLResourceRecord *> &it = m_CurrentResources[res];
 
+  // Skip attachment tracking if the FBO record is unknown (can happen after EGL
+  // context recreation on Android when the app returns from background).
+  if(it.second == NULL)
+    return;
+
   MarkResourceFrameReferenced(it.first, ref);
 
   MarkFBOAttachmentsReferenced(it.first, it.second, ref, false);
@@ -76,12 +81,20 @@ void GLResourceManager::MarkFBOReferenced(GLResource res, FrameRefType ref)
 
 void GLResourceManager::MarkFBODirtyWithWriteReference(GLResourceRecord *record)
 {
+  if(record == NULL)
+    return;
+
   MarkFBOAttachmentsReferenced(record->GetResourceID(), record, eFrameRef_ReadBeforeWrite, true);
 }
 
 void GLResourceManager::MarkFBOAttachmentsReferenced(ResourceId fboid, GLResourceRecord *record,
                                                      FrameRefType ref, bool markDirty)
 {
+  // Guard against null record (e.g. FBO not yet registered after EGL context
+  // recreation). Without this, dereferencing record below would crash.
+  if(record == NULL)
+    return;
+
   FBOCache *cache = m_FBOAttachmentsCache[fboid];
 
   if(!cache)
